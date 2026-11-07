@@ -1,0 +1,40 @@
+# 运行时数据与密钥（严禁提交）
+data/*
+!data/.gitkeep
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.jsonl
+.secret
+token
+config.json
+.env
+env.*
+*.pem
+*.key
+*.jks
+*.keystore
+
+# 大型二进制镜像（改用 Releases 分发或本地构建脚本生成）
+*.img
+*.img.gz
+*.iso
+*.iso.*
+*.tgz
+*.tar.gz
+
+# 构建产物 / 缓存
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.class
+*.dex
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
