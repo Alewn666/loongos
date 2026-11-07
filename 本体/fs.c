@@ -480,6 +480,19 @@ int fs_readfile(int ino, u8 *buf, u32 cap)
     return n;
 }
 
+int fs_readat(int ino, u32 off, u8 *buf, u32 cap)
+{
+    if (ino < 1) return -1;
+    struct inode in;
+    iget(ino, &in);
+    if (in.type != FS_T_FILE) return -1;
+    if ((in.mode & FM_PRIVATE) && !can_mutate(&in)) return FS_DENIED;
+    if (off >= in.size || cap == 0) return 0;          /* 读到末尾 / 空请求 */
+    u32 left = in.size - off;
+    if (cap > left) cap = left;
+    return fread_bytes(&in, off, buf, cap);
+}
+
 int fs_createfile(const char *path)
 {
     char tmp[128];
@@ -669,4 +682,95 @@ int fs_inode_uid(int ino)
     struct inode in;
     iget(ino, &in);
     return in.type == FS_T_NONE ? -1 : (int)in.uid;
+}
+
+/* ================= 阶段6④：shell 小工具补充 API =================
+   这些函数刻意「只改目录项 / 只改 inode 元数据」，不搬运文件数据：
+   内存盘 1MB、无堆分配器，任何整文件复制都会白白吃掉块且容易半途失败。 */
+
+int fs_inode_mtime(int ino)
+{
+    if (ino < 1 || ino >= (int)FS_NINODE) return -1;
+    struct inode in;
+    iget(ino, &in);
+    return in.type == FS_T_NONE ? -1 : (int)in.mtime;
+}
+
+int fs_inode_mode(int ino)
+{
+    if (ino < 1 || ino >= (int)FS_NINODE) return -1;
+    struct inode in;
+    iget(ino, &in);
+    return in.type == FS_T_NONE ? -1 : (int)in.mode;
+}
+
+int fs_touch(const char *path)
+{
+    int ino = fs_lookup(path);
+    if (ino < 0) return fs_createfile(path);       /* 不存在 → 建空文件（含父目录权限检查） */
+    struct inode in;
+    iget(ino, &in);
+    if (in.type == FS_T_NONE) return -1;
+    if (!can_mutate(&in)) return FS_DENIED;        /* 只有属主 / root 能刷新时间 */
+    in.mtime = tick / 10;
+    iput(ino, &in);
+    return ino;
+}
+
+/* 重命名 / 移动：目标父目录加一项指向同一个 inode，再抹掉源目录项。
+   限制（教学版边界，明说而不是偷偷做半套）：
+     - 不支持移动「目录」：那要同步改 ".." 项并维护 nlink，返回 -3 由 shell 明确报错；
+     - 目标已存在则拒绝（不覆盖）；
+     - 不跨设备（本系统只有一个 fs，天然满足）。
+   权限：源文件属主/root，且源、目标两个父目录都要可改。 */
+int fs_rename(const char *oldp, const char *newp)
+{
+    char so[128], sn[128];
+    u32 lo = fs_strlen(oldp), ln = fs_strlen(newp);
+    if (!lo || !ln || lo >= sizeof(so) || ln >= sizeof(sn)) return -1;
+    fs_memcpy(so, oldp, lo + 1);
+    fs_memcpy(sn, newp, ln + 1);
+
+    int spino, dpino, slot;
+    char sname[64], dname[64];
+    if (split_path(so, &spino, sname) < 0) return -1;
+    if (split_path(sn, &dpino, dname) < 0) return -1;
+
+    int ino = dirlookup(spino, sname, &slot);
+    if (ino < 0) return -1;                        /* 源不存在 */
+
+    struct inode in;
+    iget(ino, &in);
+    if (in.type == FS_T_DIR) return -3;            /* 不支持移动目录 */
+    if (in.type == FS_T_NONE) return -1;
+    if (!can_mutate(&in)) return FS_DENIED;
+    if (dirlookup(dpino, dname, 0) >= 0) return -1;/* 目标已存在 */
+    if (spino == dpino && fs_strcmp(sname, dname) == 0) return ino;  /* 幂等 */
+
+    struct inode sp, dp;
+    iget(spino, &sp);
+    iget(dpino, &dp);
+    if (!can_mutate(&sp) || !can_mutate(&dp)) return FS_DENIED;
+
+    if (dir_add(dpino, dname, ino) < 0) return -1; /* 先加新项；失败则源不动，不会丢文件 */
+
+    /* 抹源目录项：与 fs_unlink 同源。刻意内联而不重构那个已被 30/30 单测覆盖的
+       删除路径，避免为了复用把已验证代码一起改动。 */
+    struct inode di;
+    iget(spino, &di);
+    struct dirent de;
+    de.inum = 0;
+    fs_memset(de.name, 0, sizeof(de.name));
+    struct inode tmpi = di;
+    u32 b = bmap(&tmpi, (u32)slot * sizeof(de) / FS_BLOCK, 0);
+    di = tmpi;
+    if (b) {
+        u8 *blk = fs_scratch;
+        bread(b, blk);
+        fs_memcpy(blk + (u32)slot * sizeof(de) % FS_BLOCK, &de, sizeof(de));
+        bwrite(b, blk);
+    }
+    di.mtime = tick / 10;
+    iput(spino, &di);
+    return ino;
 }

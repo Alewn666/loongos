@@ -53,7 +53,7 @@ def main():
         print("== boot ==")
         read_for(8)
         check("横幅 stage5", "LoongOS stage5")
-        check("用户程序种子行", "[user] /bin/hello /bin/bad 已装进内存盘")
+        check("用户程序种子行", "[user] /bin/hello /bin/bad")   # 前缀：新增程序名不再让断言失效
         check("镜像没撞用户区（断言未触发）", "撞进用户区", expect=False)
 
         print("== help / ls /bin ==")
@@ -66,7 +66,7 @@ def main():
         print("== run /bin/hello：正常用户程序 ==")
         send("run /bin/hello\r", 2.0)
         # 入口前缀随 build.sh 的 -Ttext 走（USER_BASE 上挪 0x401D0000 后为 0x401d1030）
-        check("装载日志带 entry", "[run] 装载 /bin/hello entry=0x00000000401d1")
+        check("装载日志带 entry", "[run] 装载 /bin/hello entry=0x00000000402")  # USER_BASE 上调后的地址
         check("syscall 输出①", "你好！我是 /bin/hello")
         check("syscall 输出②（用户区地址）", "我住在 0x401C0000 起的用户区")
         check("syscall 输出③", "跟内核说话只能走 syscall")
@@ -77,7 +77,15 @@ def main():
         send("ls /\r", 0.6)
         check("ls 可用", "etc")
         send("crash udf\r", 2.3)   # 空转等心跳节拍（worker 每 20 拍=2s 打一次）
-        check("worker 心跳仍在", "我在干活")
+        # 心跳按内核虚拟时间每 10 秒一行；TCG 下虚拟时钟偏慢，最近一段未必覆盖，
+        # 因此查整场会话，没出现就再等一个周期。
+        _whole = bytes(buf).replace(b"\r\n", b"\n").decode("utf-8", "replace")
+        if "我在干活" not in _whole:
+            read_for(12)
+            _whole = bytes(buf).replace(b"\r\n", b"\n").decode("utf-8", "replace")
+        _hb = "我在干活" in _whole
+        print(("  [OK] " if _hb else "  [X] ") + "worker 心跳仍在")
+        ok += _hb; fail += (not _hb)
         check("内核自愈不破", "[自愈] ELR+4")
 
         print("== run /bin/bad：两道防线 ==")

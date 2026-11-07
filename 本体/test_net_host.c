@@ -41,6 +41,11 @@ void kputs(const char *s) { while (*s && g_log_n < (int)sizeof g_log - 1) g_log[
 void kputhex(u64 v) { char b[24]; int n = 0; if (!v) b[n++] = '0'; while (v) { int d = (int)(v & 15); b[n++] = d < 10 ? (char)('0' + d) : (char)('a' + d - 10); v >>= 4; } while (n) { char c[2] = { b[--n], 0 }; kputs(c); } }
 void kputdec(u32 v) { char b[16]; int n = 0; if (!v) b[n++] = '0'; while (v) { b[n++] = (char)('0' + v % 10); v /= 10; } while (n) { char c[2] = { b[--n], 0 }; kputs(c); } }
 
+/* net.c 后来加了 tcp_rx() / tcp_tick() 钩子调用；宿主单测不链 tcp.c，补空桩。
+   签名对齐 net.c:397 的 extern 声明与 tcp.c:238/351 的定义。 */
+void tcp_rx(const u8 *ip, int iplen) { (void)ip; (void)iplen; }
+void tcp_tick(void) { }
+
 static int vn_stub_present = 1;
 int  vn_init(void) { return 0; }
 int  vn_present(void) { return vn_stub_present; }
@@ -178,7 +183,7 @@ int main(void)
 {
     const u8 our_mac[6] = { 0x42, 0x4f, 0xa5, 0xf9, 0xa6, 0x62 };
     const u8 peer_mac[6] = { 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
-    const u32 nas_ip  = 0xc0a80a0du;   /* 192.168.1.100 */
+    const u32 nas_ip  = 0xc0a80a0du;   /* 192.168.10.13 */
     const u32 our_ip  = 0xc0a80a4du;   /* 192.168.10.77 */
     const u32 gw_ip   = 0xc0a80a01u;   /* 192.168.10.1 */
     const u32 mask    = 0xffffff00u;
@@ -208,14 +213,14 @@ int main(void)
     /* T2 IP 解析/格式化 */
     {
         u32 ip = 0;
-        ok(ip_parse("192.168.1.100", &ip) == 0 && ip == nas_ip, "T2 parse 192.168.1.100");
+        ok(ip_parse("192.168.10.13", &ip) == 0 && ip == nas_ip, "T2 parse 192.168.10.13");
         ok(ip_parse("0.0.0.0", &ip) == 0 && ip == 0, "T2 parse 0.0.0.0");
         ok(ip_parse("255.255.255.255", &ip) == 0 && ip == 0xffffffffu, "T2 parse 255.255.255.255");
         ok(ip_parse("256.1.1.1", &ip) != 0, "T2 拒 256.x.x.x");
         ok(ip_parse("1.2.3", &ip) != 0, "T2 拒 1.2.3（缺段）");
         ok(ip_parse("1..2.3", &ip) != 0, "T2 拒空段");
         ok(ip_parse("a.b.c.d", &ip) != 0, "T2 拒字母");
-        char b[16]; ip_fmt(nas_ip, b); ok(strcmp(b, "192.168.1.100") == 0, "T2 ip_fmt 回 192.168.1.100");
+        char b[16]; ip_fmt(nas_ip, b); ok(strcmp(b, "192.168.10.13") == 0, "T2 ip_fmt 回 192.168.10.13");
         ip_fmt(0, b); ok(strcmp(b, "0.0.0.0") == 0, "T2 ip_fmt 0.0.0.0");
         ip_fmt(0xffffffffu, b); ok(strcmp(b, "255.255.255.255") == 0, "T2 ip_fmt 255.255.255.255");
     }

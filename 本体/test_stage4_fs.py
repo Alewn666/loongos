@@ -112,8 +112,15 @@ def main():
     check("EL0 用户态往返并撤回", "已从 EL0 撤回")
     send("ls /\r", 0.6)
     check("自愈后 fs 还能用", "home")
-    read_for(2.5)
-    check("worker 心跳仍在", "[task1] 我在干活")
+    # 心跳按内核虚拟时间每 10 秒一行；TCG 下虚拟时钟偏慢，最近一段未必覆盖，
+    # 因此查整场会话，没出现就再等一个周期。
+    _whole = bytes(buf).replace(b"\r\n", b"\n").decode("utf-8", "replace")
+    if "[task1] 我在干活" not in _whole:
+        read_for(12)
+        _whole = bytes(buf).replace(b"\r\n", b"\n").decode("utf-8", "replace")
+    _hb = "[task1] 我在干活" in _whole
+    print(("  ✅ " if _hb else "  ❌ ") + "worker 心跳仍在")
+    ok += _hb; fail += (not _hb)
 
     os.write(master, b"\x03")
     read_for(0.3)

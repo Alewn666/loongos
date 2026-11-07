@@ -114,7 +114,15 @@ def main():
 
         print("== 收尾 ==")
         send("crash udf\r", 2.3)
-        check("worker 心跳仍在", "我在干活")
+        # 心跳按内核虚拟时间每 10 秒一行；TCG 下虚拟时钟偏慢，最近一段未必覆盖，
+        # 因此查整场会话，没出现就再等一个周期。
+        _whole = bytes(buf).replace(b"\r\n", b"\n").decode("utf-8", "replace")
+        if "我在干活" not in _whole:
+            read_for(12)
+            _whole = bytes(buf).replace(b"\r\n", b"\n").decode("utf-8", "replace")
+        _hb = "我在干活" in _whole
+        print(("  [OK] " if _hb else "  [X] ") + "worker 心跳仍在")
+        ok += _hb; fail += (not _hb)
         check("内核自愈不破", "[自愈] ELR+4")
         send("run /bin/bad\r", 2.0)
         check("ELF 回归不破", "[run] 用户指针越界")

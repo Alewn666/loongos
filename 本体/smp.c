@@ -130,26 +130,36 @@ __asm__(
     "  b smp_secondary_main\n"
 );
 
-/* ---------------- 从核向量表（只关心本 EL 的 IRQ 槽） ---------------- */
+/* ---------------- 从核向量表（AArch64：16 个槽，每槽 0x80 字节） ----------------
+ * 2026-11-07 修复：原版把 16 条 b 连写在前 64 字节里，误以为「第 6 条 = 0x280」。
+ * 反汇编实测 IRQ 分支落在 +0x14；而「当前 EL / SPx / IRQ」是 0x280，那里当时是
+ * nop 填充 → 从核定时期中断进不了 smp_irq_handler，tick 恒为 0、wfi 空转。
+ * 现按 boot.S 的 VEC 宏风格，每槽 .balign 128，VBAR 2KB 对齐（真机 KVM 会取整）。 */
 __asm__(
     ".text\n"
-    ".align 11\n"
+    ".balign 2048\n"
     ".global smp_vectors\n"
     "smp_vectors:\n"
-    "  b smp_ign\n"
-    "  b smp_ign\n"
-    "  b smp_ign\n"
-    "  b smp_ign\n"
-    "  b smp_ign\n"
-    "  b smp_irq_entry\n"                  /* 0x280：本 EL，SPx，IRQ */
-    "  b smp_ign\n"
-    "  b smp_ign\n"
-    "  b smp_ign\n  b smp_ign\n  b smp_ign\n  b smp_ign\n"
-    "  b smp_ign\n  b smp_ign\n  b smp_ign\n  b smp_ign\n"
-    ".align 7\n"
+    "  .balign 128\n  b smp_ign\n"          /* 0x000 当前EL SP0 Sync   */
+    "  .balign 128\n  b smp_ign\n"          /* 0x080 当前EL SP0 IRQ    */
+    "  .balign 128\n  b smp_ign\n"          /* 0x100 当前EL SP0 FIQ    */
+    "  .balign 128\n  b smp_ign\n"          /* 0x180 当前EL SP0 SError */
+    "  .balign 128\n  b smp_ign\n"          /* 0x200 当前EL SPx Sync   */
+    "  .balign 128\n  b smp_irq_entry\n"    /* 0x280 当前EL SPx IRQ ← 从核定时器 */
+    "  .balign 128\n  b smp_ign\n"          /* 0x300 当前EL SPx FIQ    */
+    "  .balign 128\n  b smp_ign\n"          /* 0x380 当前EL SPx SError */
+    "  .balign 128\n  b smp_ign\n"          /* 0x400 低EL A64 Sync     */
+    "  .balign 128\n  b smp_ign\n"          /* 0x480 低EL A64 IRQ      */
+    "  .balign 128\n  b smp_ign\n"          /* 0x500 低EL A64 FIQ      */
+    "  .balign 128\n  b smp_ign\n"          /* 0x580 低EL A64 SError   */
+    "  .balign 128\n  b smp_ign\n"          /* 0x600 低EL A32 Sync     */
+    "  .balign 128\n  b smp_ign\n"          /* 0x680 低EL A32 IRQ      */
+    "  .balign 128\n  b smp_ign\n"          /* 0x700 低EL A32 FIQ      */
+    "  .balign 128\n  b smp_ign\n"          /* 0x780 低EL A32 SError   */
+    "  .balign 128\n"
     "smp_ign:\n"
     "  eret\n"
-    ".align 7\n"
+    "  .balign 128\n"
     "smp_irq_entry:\n"
     "  sub sp, sp, #64\n"
     "  stp x0, x1, [sp, #0]\n"
@@ -165,6 +175,7 @@ __asm__(
 
 /* ---------------- GIC / 定时器 ---------------- */
 static int smp_gic_ver = 3;
+volatile int smp_no_conduit = 0;   /* 1 = 本机无可用 PSCI conduit（见 smp_start）*/
 void smp_set_gic_ver(int v) { smp_gic_ver = v; }
 
 #define GICD_BASE   0x08000000UL
@@ -260,6 +271,23 @@ extern void smp_secondary_entry(void);
 int smp_start(u64 *cpu_mask_out)
 {
     u64 mask = 0;
+    /* 2026-11-07：PSCI conduit 探测。
+       QEMU `-machine virt` 默认既无 EL3 也无 EL2，此时在 EL1 执行 smc 是 UNDEFINED，
+       原版会触发内核异常转储后返回函数 ID（≠ -1，所以 hvc 回退也不触发）→ 刷一屏异常、
+       从核 0 个。ID_AA64PFR0_EL1[15:12]=EL3、[11:8]=EL2；两者皆 0 就明确放弃并说明，
+       不再制造异常。加 -machine virt,virtualization=on（EL2 可用）即可启用多核。 */
+    {
+        u64 pfr0, cur;
+        __asm__ volatile("mrs %0, ID_AA64PFR0_EL1" : "=r"(pfr0));
+        __asm__ volatile("mrs %0, CurrentEL" : "=r"(cur));
+        int el3 = (int)((pfr0 >> 12) & 0xF);
+        int el2 = (int)((pfr0 >> 8)  & 0xF);
+        if (((cur >> 2) & 3) == 1 && !el3 && !el2) {
+            if (cpu_mask_out) *cpu_mask_out = 0;
+            smp_no_conduit = 1;
+            return 0;                 /* 交给调用方打印一行说明，不刷异常 */
+        }
+    }
     __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(smp_ttbr0));
     __asm__ volatile("mrs %0, tcr_el1"   : "=r"(smp_tcr));
     __asm__ volatile("mrs %0, mair_el1"  : "=r"(smp_mair));

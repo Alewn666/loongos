@@ -130,11 +130,15 @@ def main():
         STEP[0] = len(buf)
         LAST[0] = ""
         read_for(2.5)
-        tail = (bytes(buf)[STEP[0]:].replace(b"\r\n", b"\n")
-                .replace(b"\r\n", b"\n").decode("utf-8", "replace"))
-        hb = "[task1] 我在干活" in tail
-        print(("  [OK] " if hb else "  [X] ") + "worker 心跳活着")
-        ok += hb; fail += (not hb)
+        # 心跳按内核虚拟时间每 10 秒一行；TCG 下虚拟时钟偏慢，最近一段未必覆盖，
+        # 因此查整场会话，没出现就再等一个周期。
+        _whole = bytes(buf).replace(b"\r\n", b"\n").decode("utf-8", "replace")
+        if "[task1] 我在干活" not in _whole:
+            read_for(12)
+            _whole = bytes(buf).replace(b"\r\n", b"\n").decode("utf-8", "replace")
+        _hb = "[task1] 我在干活" in _whole
+        print(("  [OK] " if _hb else "  [X] ") + "worker 心跳活着")
+        ok += _hb; fail += (not _hb)
 
         print(f"\n== 结果: {ok} 过 / {fail} 挂 ==")
         return 1 if fail else 0

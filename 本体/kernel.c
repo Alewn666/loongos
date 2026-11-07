@@ -119,8 +119,10 @@ static int  redir_len  = -1;         /* 缓冲内字节数；-1=本次没有输�
 static int  redir_of   = 0;          /* 超 2KB 被截断过 */
 static char redir_path[128];         /* 输出目标（已规范化绝对路径） */
 static char redir_buf[2048];
-static char stdin_buf[2048];         /* 输入重定向：< 文件内容整份读进来 */
-static int  redir_in_len = -1;       /* < 文件字节数；-1=没有输入重定向（只有 write 能吃） */
+static char stdin_buf[2048];         /* 输入重定向 / 管道：上游内容整份读进来 */
+static int  redir_in_len = -1;       /* 输入字节数；-1=没有输入（< 只有 write 能吃） */
+static int  pipe_capture = 0;        /* 管道左段：输出只进缓冲，不落盘 */
+static int  pipe_stage   = 0;        /* 当前 dispatch 是管道右段（stdin 来自管道） */
 
 /* ================= 帧缓冲（GOP）文字输出 =================
  * 为什么需要：用户真机实测——虚拟机窗口显示的是 UEFI 图形控制台(GOP)，
@@ -331,6 +333,112 @@ static void fb_putc(char c)
     else fb_draw_cp('?');
 }
 
+
+/* ---------------- B4：fw_cfg / ramfb 自建显示底座（裸 ELF 启动） ----------------
+ * 旧路径：UEFI stub 把 GOP framebuffer 通过 x0 传 bootinfo；`-kernel` 裸 ELF
+ *         启动时 x0=0，fb_init() 直接返回 → fb=0 w=0 h=0，屏幕全黑。
+ * 新路径（QEMU 8.2 实测）：fw_cfg 寄存器在 ARM virt 上是
+ *         0x09020000 fwcfg.data(8B) / 0x09020008 fwcfg.ctl(2B, 大端 selector)
+ *         / 0x09020010 fwcfg.dma；目录条目固定 64B：size(4)/select(2)/reserved(2)/name(56)。
+ *         "etc/ramfb" 是 guest-write-only 文件：guest 写入 28B 的 RAMFBCfg（全大端）
+ *         后，QEMU 回调把指定 RAM 挂成显示 surface。
+ * 全程只读目录 + 只写这一个 fw_cfg 文件；已有合法 UEFI bootinfo 时不覆盖。 */
+#define FWC_DATA 0x09020000UL
+#define FWC_CTL  0x09020008UL
+#define FWC_DMA  0x09020010UL
+#define FB_PHYS  0x41000000UL     /* 128MB RAM 内的空闲段：内核止于 0x4020xxxx，USER 区止于 0x40400000 */
+#define FB_W     800
+#define FB_H     600
+#define FB_STRIDE (FB_W * 4)     /* 字节 */
+
+static void fwc_sel(u16 v)
+{
+    /* ctl region 是 DEVICE_BIG_ENDIAN：CPU 写字节交换后的值，QEMU 按 BE 解释回原 selector */
+    *(volatile u16 *)FWC_CTL = (u16)((v >> 8) | (v << 8));
+}
+static u8  fwc_byte(void) { return *(volatile u8 *)FWC_DATA; }
+static u32 be32_(const u8 *p) { return ((u32)p[0]<<24)|((u32)p[1]<<16)|((u32)p[2]<<8)|p[3]; }
+static u16 be16_(const u8 *p) { return (u16)(((u16)p[0]<<8)|p[1]); }
+static void put_be32(u8 *p, u32 v)
+{
+    p[0]=(u8)(v>>24); p[1]=(u8)(v>>16); p[2]=(u8)(v>>8); p[3]=(u8)v;
+}
+static void put_be64(u8 *p, u64 v)
+{
+    for (int i=0;i<8;i++) p[i] = (u8)(v >> (56 - 8*i));
+}
+static u32 bswap32_(u32 v)
+{
+    return ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) |
+           ((v >> 8) & 0xFF00u) | ((v >> 24) & 0xFFu);
+}
+
+/* QEMU v2.4+ 起 fw_cfg 的 PIO/MMIO 单字节写被移除（fw_cfg_write() 是空函数），
+   写 "etc/ramfb" 必须走 DMA：在 guest RAM 里放一份 FWCfgDmaAccess（control/length/
+   address，全大端），再把描述符物理地址写进 fwcfg.dma 触发传输，QEMU 才会调用
+   ramfb 的 write_cb 建立 display surface。 */
+static u8 fwc_cfg_buf[28] __attribute__((aligned(8)));
+static u8 fwc_dma_desc[16] __attribute__((aligned(8)));
+
+static void fwc_dma_write(u16 sel, const u8 *cfg, u32 len)
+{
+    for (u32 i=0;i<len;i++) fwc_cfg_buf[i] = cfg[i];
+    u32 control = ((u32)sel << 16) | 0x08u /* SELECT */ | 0x10u /* WRITE */;
+    put_be32(fwc_dma_desc + 0, control);
+    put_be32(fwc_dma_desc + 4, len);
+    put_be64(fwc_dma_desc + 8, (u64)(unsigned long)fwc_cfg_buf);
+
+    u64 desc = (u64)(unsigned long)fwc_dma_desc;
+    u32 hi = (u32)(desc >> 32), lo = (u32)desc;
+    /* dma region 是 DEVICE_BIG_ENDIAN：写两次 32 位，高半在 +0、低半在 +4（触发传输）。
+       两种字节序都发一遍，兼容不同 QEMU 构建的 endianness，失败的一次只会被 QEMU
+       标记为 DMA error，不会破坏已建立的 surface。 */
+    *(volatile u32 *)(FWC_DMA + 0) = bswap32_(hi);
+    *(volatile u32 *)(FWC_DMA + 4) = bswap32_(lo);
+    *(volatile u32 *)(FWC_DMA + 0) = hi;
+    *(volatile u32 *)(FWC_DMA + 4) = lo;
+}
+
+static struct bootinfo ramfb_bi;
+
+/* 返回 0 = 已配置好 ramfb 并合成 bootinfo；-1 = 本机没有 ramfb，保持原状 */
+static int fwc_ramfb_setup(void)
+{
+    u8 name[64], hdr[8];
+    fwc_sel(0x0019);                       /* FW_CFG_FILE_DIR */
+    u8 c[4]; for (int i=0;i<4;i++) c[i]=fwc_byte();
+    u32 n = be32_(c);
+    if (n == 0 || n > 256) return -1;
+    u16 sel = 0; u32 sz = 0;
+    for (u32 e=0; e<n; e++) {
+        for (int k=0;k<8;k++) hdr[k]=fwc_byte();
+        for (int k=0;k<56;k++) { u8 ch = fwc_byte(); if (k < 63) name[k] = (char)ch; }
+        name[56] = 0;
+        if (fs_strcmp((char *)name, "etc/ramfb") == 0) { sel = be16_(hdr+4); sz = be32_(hdr); }
+    }
+    if (!sel || sz < 28) return -1;
+
+    /* 构造 RAMFBCfg（全大端）：addr / fourcc('XR24'=DRM_FORMAT_XRGB8888) /
+       flags(0) / width / height / stride(字节)。写满 28B 触发 QEMU write_cb。 */
+    u8 cfg[28];
+    u64 a = FB_PHYS;
+    for (int i=0;i<8;i++) cfg[i] = (u8)(a >> (56 - 8*i));
+    put_be32(cfg + 8,  0x34325258u);      /* 'XR24' */
+    put_be32(cfg + 12, 0);                /* flags */
+    put_be32(cfg + 16, FB_W);
+    put_be32(cfg + 20, FB_H);
+    put_be32(cfg + 24, FB_STRIDE);
+    fwc_dma_write(sel, cfg, 28);       /* DMA 触发 QEMU 的 ramfb write_cb */
+
+    ramfb_bi.magic = BOOTINFO_MAGIC;
+    ramfb_bi.width = FB_W; ramfb_bi.height = FB_H;
+    ramfb_bi.stride = FB_STRIDE / 4;      /* 内核 fb_stride 用像素数 */
+    ramfb_bi.bpp = 32; ramfb_bi.pixfmt = 0;
+    ramfb_bi.base = FB_PHYS; ramfb_bi.size = (u64)FB_STRIDE * FB_H;
+    ramfb_bi.img_addr = 0; ramfb_bi.img_size = 0;
+    return 0;
+}
+
 static void fb_init(void)
 {
     if (!g_bi || g_bi->magic != BOOTINFO_MAGIC) return;
@@ -475,8 +583,13 @@ void kputdec(u32 v)        { uart_putdec(v); }
 /* ---------------- GIC + 串口中断 初始化 ---------------- */
 static void gic_init(void)
 {
-    u32 arch_lo = (GICD_PIDR2_V2 >> 4) & 0xF;        /* 0x2=GICv2, 0x3=GICv3 */
-    u32 arch_hi = (GICD_PIDR2_V3 >> 4) & 0xF;
+    /* 先读 GICv2 偏移（0xFE8）：GICv2 上直接给出 0x2；GICv3 上该偏移读出 0。
+       只有 v2 偏移没命中才去读 GICv3 专属的 0xFFE8 —— GICv2 上那个地址
+       并没有实现，会触发数据中止（旧版靠自愈兜住，每次开机刷一屏异常转储）。*/
+    u32 arch_lo = (GICD_PIDR2_V2 >> 4) & 0xF;        /* 0x2=GICv2 */
+    u32 arch_hi = 0;
+    if (arch_lo != 2)
+        arch_hi = (GICD_PIDR2_V3 >> 4) & 0xF;        /* 0x3=GICv3 */
     gic_ver = (arch_hi == 3 || arch_lo == 3) ? 3 : 2;
     smp_set_gic_ver((int)gic_ver);      /* 告诉 smp.c：从核也按这个版本初始化 */
 
@@ -1114,7 +1227,13 @@ static void svc_dispatch(struct regs *f)
         /* POSIX 风格 write(fd,buf,len)：只支持 fd=1/2（串口） */
         {
             u64 fd = f->x[0], p = f->x[1], len = f->x[2];
-            if (fd != 1 && fd != 2) { f->x[0] = (u64)-1; return; }
+            if (fd != 1 && fd != 2) {
+                /* USER_BASE 上调后，老接口 write(内核地址,len) 会被当成本分支的
+                   非法 fd；补回越界指针诊断日志，否则坏程序只静默拿到 -1。*/
+                uart_puts("\n[run] 用户指针越界，拒绝: p="); uart_puthex(fd);
+                uart_puts("\n");
+                f->x[0] = (u64)-1; return;
+            }
             if (p < USER_BASE || p + len < p || p + len > USER_END || len > 65536) {
                 f->x[0] = (u64)-1; return;
             }
@@ -1566,6 +1685,12 @@ static void cmd_mmu(char *a);
 static void cmd_tasks(char *a);
 static void cmd_el0(char *a);
 static void cmd_help(char *a);
+static void cmd_touch(char *a);
+static void cmd_mv(char *a);
+static void cmd_stat(char *a);
+static void cmd_wc(char *a);
+static void cmd_grep(char *a);
+static void cmd_head(char *a);
 
 struct cmdent { const char *name; void (*fn)(char *); };
 /* ================= kernel bench：内核态微基准 =================
@@ -1891,8 +2016,19 @@ static const struct cmdent CMDS[] = {
     { "el0",   cmd_el0   }, { "help",  cmd_help  }, { "bench", cmd_bench },
     { "disks", cmd_disks }, { "disktest", cmd_disktest }, { "install", cmd_install }, { "scsi", cmd_scsi },
     { "net", cmd_net }, { "ifconfig", cmd_ifconfig }, { "ping", cmd_ping }, { "tcp", cmd_tcp }, { "cpu", cmd_cpu },
+    { "touch", cmd_touch }, { "mv", cmd_mv }, { "stat", cmd_stat },
+    { "wc", cmd_wc }, { "grep", cmd_grep }, { "head", cmd_head },
     { 0, 0 }
 };
+
+/* 管道右段允许消费 stdin 的命令。< 输入重定向仍维持「只有 write 能吃」的老规则
+   （测试依赖报错文案），管道则放开这几个纯文本过滤器。 */
+static int is_stdin_consumer(const char *w)
+{
+    return fs_strcmp(w, "write") == 0 || fs_strcmp(w, "cat")  == 0 ||
+           fs_strcmp(w, "wc")    == 0 || fs_strcmp(w, "grep") == 0 ||
+           fs_strcmp(w, "head")  == 0;
+}
 
 /* 阶段5④：把 "cmd args > 出文件 < 入文件" 拆开。
    规则：> 和 < 必须是独立的词、各只能出现一次、后面必须紧跟路径；
@@ -1938,6 +2074,7 @@ static int redir_parse(const char *line, char *cmdout, int ccap,
 static void redir_finish(void)
 {
     redir_on = 0;
+    if (pipe_capture) return;         /* 管道左段：缓冲留给 dispatch_line 搬运，不落盘 */
     if (redir_len < 0) return;
     int n = redir_len;
     redir_len = -1;
@@ -1968,16 +2105,29 @@ static void dispatch(char *s)
     }
     if (!*cmd) return;
 
-    /* 输入重定向：先把 < 文件整份读进 stdin_buf（目前只有 write 消费它） */
-    redir_in_len = -1;
+    /* 输入重定向：先把 < 文件整份读进 stdin_buf（目前只有 write 消费它）。
+       管道右段的 stdin 由 dispatch_line 预先填好，这里不能清掉。 */
+    if (!pipe_stage) redir_in_len = -1;
     if (inp[0]) {
         char rp[128];
         if (path_resolve(inp, rp, sizeof rp) < 0) { uart_puts("路径太长\n"); return; }
         int ino = fs_lookup(rp);
         if (ino < 0)  { uart_puts("没有这个文件: "); uart_puts(rp); uart_puts("\n"); return; }
-        int n = fs_readfile(ino, (u8 *)stdin_buf, sizeof stdin_buf);
+        int n = 0;
+        /* 分块填满 stdin_buf（含 NUL 位），超过 2047 字节就明确报错，不静默截断 */
+        while (n < (int)sizeof stdin_buf - 1) {
+            int k = fs_readat(ino, (u32)n, (u8 *)stdin_buf + n,
+                              (u32)(sizeof stdin_buf - 1 - (u32)n));
+            if (k < 0) { n = k; break; }
+            if (k == 0) break;
+            n += k;
+        }
+        if (n == FS_DENIED) { uart_puts("权限不够：私密文件，只有属主和 root 能读\n"); return; }
         if (n < 0)   { uart_puts("读不了（是目录？私密？）: "); uart_puts(rp); uart_puts("\n"); return; }
-        if (n == (int)sizeof stdin_buf) { uart_puts("输入文件太大（上限 2047 字节）\n"); return; }
+        if (n == (int)sizeof stdin_buf - 1) {
+            int more = fs_readat(ino, (u32)n, (u8 *)stdin_buf, 1);
+            if (more > 0) { uart_puts("输入文件太大（上限 2047 字节）\n"); return; }
+        }
         redir_in_len = n;
     }
 
@@ -1993,9 +2143,15 @@ static void dispatch(char *s)
     }
 
     /* ⚠️ 输入支持检查必须在拆词之后、拿 cmdw（首词）比 —— 拿整行比 "write" 永远不等 */
-    if (redir_in_len >= 0 && fs_strcmp(cmdw, "write") != 0) {
+    if (redir_in_len >= 0 && !pipe_stage && fs_strcmp(cmdw, "write") != 0) {
         uart_puts("『"); uart_puts(cmdw);
         uart_puts("』不支持输入重定向（< 目前只有 write 能吃：write 目标 < 源）\n");
+        redir_in_len = -1;
+        return;
+    }
+    if (redir_in_len >= 0 && pipe_stage && !is_stdin_consumer(cmdw)) {
+        uart_puts("『"); uart_puts(cmdw);
+        uart_puts("』不是管道消费者（cat / wc / grep / head / write）\n");
         redir_in_len = -1;
         return;
     }
@@ -2018,23 +2174,89 @@ static void dispatch(char *s)
     uart_puts("未知命令: "); uart_puts(cmdw); uart_puts("（help 看清单）\n");
 }
 
+/* ---------------- 阶段6④：单级管道  a | b ----------------
+   做法复用现成的「uart_putc 唯一总闸 + redir_buf」：
+     左段：开闸把输出收进 redir_buf，redir_finish 因 pipe_capture 只收闸不落盘；
+     搬运：丢掉 uart_puts 为每个 \n 追加的 \r，把干净文本放进 stdin_buf；
+     右段：cat / wc / grep / head / write 从 stdin_buf 消费，可再接 > 写文件。
+   明确边界（写进 help，不偷偷做半套）：只支持单级；左段不能带 > / <；
+   左段若是 run/crash 这类不返回的命令，管道不成立。 */
+static void dispatch_line(char *s)
+{
+    char *bar = 0;
+    for (char *p = s; *p; p++) if (*p == '|') { bar = p; break; }
+    if (!bar) { dispatch(s); return; }
+    for (char *p = bar + 1; *p; p++) if (*p == '|') {
+        uart_puts("管道语法错：目前只支持单级 a | b\n"); return;
+    }
+    *bar = 0;
+    char *right = bar + 1;
+    while (*right == ' ') right++;
+    char *left = s;
+    while (*left == ' ') left++;
+    { int l = (int)fs_strlen(left); while (l > 0 && left[l - 1] == ' ') left[--l] = 0; }
+    if (!*left || !*right) { uart_puts("管道语法错：| 两边都要有命令\n"); return; }
+    for (char *p = left; *p; p++) if (*p == '>' || *p == '<') {
+        uart_puts("管道语法错：| 左段不能再带 > / <\n"); return;
+    }
+
+    /* 左段：捕获输出 */
+    redir_path[0] = 0;
+    redir_len = 0; redir_of = 0; redir_on = 1; pipe_capture = 1;
+    dispatch(left);
+    pipe_capture = 0; redir_on = 0;
+    int n = redir_len < 0 ? 0 : redir_len;
+    redir_len = -1;
+
+    /* 搬运：去掉 \r，保留 \n */
+    int m = 0;
+    for (int i = 0; i < n && m < (int)sizeof(stdin_buf) - 1; i++) {
+        if (redir_buf[i] == '\r') continue;
+        stdin_buf[m++] = redir_buf[i];
+    }
+    stdin_buf[m] = 0;
+    redir_in_len = m;
+
+    /* 右段：消费 */
+    pipe_stage = 1;
+    dispatch(right);
+    pipe_stage = 0;
+    redir_in_len = -1;
+    if (redir_of) uart_puts("（管道输出超 2048 字节，已截断）\n");
+}
+
 static void on_char(char c)
 {
+    unsigned char uc = (unsigned char)c;
     if (c == '\r' || c == '\n') {
         uart_puts("\n");
         line[linelen] = 0;
         linelen = 0;
-        dispatch(line);
+        dispatch_line(line);
         uart_puts("> ");
         return;
     }
     if (c == '\b' || c == 127) {
-        if (linelen > 0) { linelen--; uart_puts("\b \b"); }
+        if (linelen > 0) {
+            /* UTF-8 退格要按「字符」删：末尾若是续字节(10xxxxxx)，一路回退到起始字节，
+               否则会在行缓冲里留下半个汉字，之后拼出的序列全是坏的。
+               上限 4 字节，坏序列最多删 4 个，不会一路吃到行首。 */
+            int n = 1;
+            while (n < 4 && n < linelen &&
+                   ((unsigned char)line[linelen - n] & 0xC0) == 0x80) n++;
+            linelen -= n;
+            for (int i = 0; i < n; i++) uart_puts("\b \b");
+        }
         return;
     }
-    if (c >= 32 && c < 127 && linelen < (int)sizeof(line) - 1) {
-        line[linelen++] = c;
-        uart_putc(c);
+    /* 可打印 ASCII 与所有 UTF-8 字节（>=0x80）都收。
+       之前只放 c<127，中文的 3 个字节全被丢掉 → 输入中文只剩 ASCII 尾巴。
+       fb_putc 自带 UTF-8 组码逻辑，回显到帧缓冲也能正确成字。 */
+    if ((uc >= 32 && uc < 127) || uc >= 0x80) {
+        if (linelen < (int)sizeof(line) - 1) {
+            line[linelen++] = (char)uc;
+            uart_putc((char)uc);
+        }
     }
 }
 
@@ -2131,17 +2353,33 @@ static void cmd_ls(char *a)
 static void cmd_cat(char *a)
 {
     char rp[128];
+    if (redir_in_len >= 0 && pipe_stage && (!a || !*a)) {
+        /* 管道末端：cat 把 stdin 原样回显 */
+        for (int i = 0; i < redir_in_len; i++) uart_putc(stdin_buf[i]);
+        if (redir_in_len == 0 || stdin_buf[redir_in_len - 1] != '\n') uart_puts("\n");
+        return;
+    }
     if (!a || !*a) { uart_puts("用法: cat <路径>\n"); return; }
     if (path_resolve(a, rp, sizeof rp) < 0) { uart_puts("路径太长\n"); return; }
     int ino = fs_lookup(rp);
     if (ino < 0) { uart_puts("没有这个路径: "); uart_puts(rp); uart_puts("\n"); return; }
     if (fs_isdir(ino)) { uart_puts(a); uart_puts(" 是目录，不能 cat\n"); return; }
-    u8 buf[1024];
-    int n = fs_readfile(ino, buf, sizeof(buf) - 1);
-    if (n == FS_DENIED) { uart_puts("权限不够：私密文件，只有属主和 root 能看\n"); return; }
-    if (n < 0) { uart_puts("读失败\n"); return; }
-    for (int i = 0; i < n; i++) uart_putc((char)buf[i]);
-    if (n == 0 || buf[n - 1] != '\n') uart_puts("\n");
+    /* 分块读：旧版一次性读 1023 字节，任何 >1KB 的文件都读不全（help 重定向到
+       文件后就把后半段说明吞了）。fs_readat 按偏移取，循环到文件末尾。 */
+    u8 buf[512];
+    u32 off = 0;
+    int last = 0, total = 0;
+    for (;;) {
+        int n = fs_readat(ino, off, buf, sizeof(buf));
+        if (n == FS_DENIED) { uart_puts("权限不够：私密文件，只有属主和 root 能看\n"); return; }
+        if (n < 0)  { uart_puts("读失败\n"); return; }
+        if (n == 0) break;
+        for (int i = 0; i < n; i++) uart_putc((char)buf[i]);
+        last = buf[n - 1];
+        off += (u32)n;
+        total += n;
+    }
+    if (total == 0 || last != '\n') uart_puts("\n");
 }
 static void cmd_write(char *a)
 {
@@ -2267,6 +2505,104 @@ static void cmd_crash(char *a)
 static void cmd_mmu(char *a)    { (void)a; mmu_status(); }
 static void cmd_tasks(char *a)  { (void)a; show_tasks(); }
 static void cmd_el0(char *a)    { (void)a; enter_el0(); }
+/* ---------------- 阶段6④：shell 小工具 ---------------- */
+static void cmd_touch(char *a)
+{
+    if (!a || !*a) { uart_puts("用法: touch <路径>\n"); return; }
+    char rp[128];
+    if (path_resolve(a, rp, sizeof rp) < 0) { uart_puts("路径太长\n"); return; }
+    int r = fs_touch(rp);
+    if (r == FS_DENIED) { uart_puts("权限不够：不是你的文件，root 才能刷新时间\n"); return; }
+    if (r < 0) { uart_puts("建不了（父目录缺？盘满？）: "); uart_puts(rp); uart_puts("\n"); return; }
+    uart_puts("已 touch "); uart_puts(rp); uart_puts("\n");
+}
+
+static void cmd_mv(char *a)
+{
+    char *p = a;
+    char *s1 = next_word(&p), *s2 = next_word(&p);
+    if (!s1 || !s2) { uart_puts("用法: mv <源> <目标>\n"); return; }
+    char r1[128], r2[128];
+    if (path_resolve(s1, r1, sizeof r1) < 0 || path_resolve(s2, r2, sizeof r2) < 0) {
+        uart_puts("路径太长\n"); return;
+    }
+    int r = fs_rename(r1, r2);
+    if (r == -3)      { uart_puts("暂不支持移动目录（只改目录项，不维护 .. 与 nlink）\n"); return; }
+    if (r == FS_DENIED) { uart_puts("权限不够：源文件属主 / 两个父目录都要能改\n"); return; }
+    if (r < 0)        { uart_puts("移动失败（源不存在？目标已存在？盘满？）\n"); return; }
+    uart_puts("已移动 "); uart_puts(r1); uart_puts(" -> "); uart_puts(r2); uart_puts("\n");
+}
+
+static void cmd_stat(char *a)
+{
+    if (!a || !*a) { uart_puts("用法: stat <路径>\n"); return; }
+    char rp[128];
+    if (path_resolve(a, rp, sizeof rp) < 0) { uart_puts("路径太长\n"); return; }
+    int ino = fs_lookup(rp);
+    if (ino < 0) { uart_puts("没有这个路径: "); uart_puts(rp); uart_puts("\n"); return; }
+    int ty = fs_filetype(ino), sz = fs_filesize(ino);
+    int uid = fs_inode_uid(ino), mt = fs_inode_mtime(ino), md = fs_inode_mode(ino);
+    uart_puts("路径: "); uart_puts(rp); uart_puts("\n");
+    uart_puts("inode: "); uart_putdec((u32)ino);
+    uart_puts("  类型: ");
+    uart_puts(ty == FS_T_DIR ? "目录" : (ty == FS_T_FILE ? "普通文件" : "未知"));
+    uart_puts("  大小: "); uart_putdec((u32)(sz < 0 ? 0 : sz)); uart_puts(" 字节\n");
+    uart_puts("属主 uid: "); uart_putdec((u32)(uid < 0 ? 0 : uid));
+    uart_puts("  私密: "); uart_puts((md > 0 && (md & FM_PRIVATE)) ? "是" : "否");
+    uart_puts("  mtime: "); uart_putdec((u32)(mt < 0 ? 0 : mt)); uart_puts(" 秒\n");
+}
+
+/* ---- 管道右段：stdin 消费者（只读 stdin_buf，不碰 fs）---- */
+static void cmd_wc(char *a)
+{
+    (void)a;
+    if (redir_in_len < 0) { uart_puts("用法: <命令> | wc\n"); return; }
+    int lines = 0;
+    for (int i = 0; i < redir_in_len; i++) if (stdin_buf[i] == '\n') lines++;
+    if (redir_in_len > 0 && stdin_buf[redir_in_len - 1] != '\n') lines++;
+    uart_putdec((u32)lines); uart_puts(" 行  ");
+    uart_putdec((u32)redir_in_len); uart_puts(" 字节\n");
+}
+
+static void cmd_grep(char *a)
+{
+    if (!a || !*a) { uart_puts("用法: <命令> | grep <词>\n"); return; }
+    if (redir_in_len < 0) { uart_puts("grep 需要管道输入\n"); return; }
+    int kl = (int)fs_strlen(a), i = 0;
+    while (i < redir_in_len) {
+        int s = i;
+        while (i < redir_in_len && stdin_buf[i] != '\n') i++;
+        int len = i - s, found = 0;
+        for (int j = 0; j + kl <= len; j++) {
+            int k = 0;
+            while (k < kl && stdin_buf[s + j + k] == a[k]) k++;
+            if (k == kl) { found = 1; break; }
+        }
+        if (found) {
+            for (int j = 0; j < len; j++) uart_putc(stdin_buf[s + j]);
+            uart_puts("\n");
+        }
+        if (i < redir_in_len) i++;
+    }
+}
+
+static void cmd_head(char *a)
+{
+    int n = 10;
+    if (a && *a) {
+        n = 0;
+        for (char *p = a; *p >= '0' && *p <= '9'; p++) n = n * 10 + (*p - '0');
+        if (n <= 0) n = 10;
+    }
+    if (redir_in_len < 0) { uart_puts("用法: <命令> | head [行数]\n"); return; }
+    int lines = 0, i = 0;
+    while (i < redir_in_len && lines < n) {
+        while (i < redir_in_len && stdin_buf[i] != '\n') { uart_putc(stdin_buf[i]); i++; }
+        if (i < redir_in_len) { uart_puts("\n"); i++; }
+        lines++;
+    }
+}
+
 static void cmd_help(char *a)
 {
     (void)a;
@@ -2280,6 +2616,11 @@ static void cmd_help(char *a)
         "  mkdir <路径>         建目录\n"
         "  rm <路径>            删文件或空目录\n"
         "  df                   内存盘用量\n"
+        "  touch <路径>         建空文件；已存在则刷新修改时间\n"
+        "  mv <源> <目标>       改名 / 移动文件（不支持目录）\n"
+        "  stat <路径>          看 inode / 类型 / 大小 / 属主 / 时间\n"
+        "  管道: a | b          单级；右段可用 cat / wc / grep <词> / head [n] / write\n"
+        "        ls /etc | wc | cat    （左段不能带 > <，右段可再接 > 写文件）\n"
         "  whoami               当前身份\n"
         "  su [用户]            切换用户（要口令；root 免）——默认 root/demo\n"
         "  run <路径> [参数…]   跑用户程序（如 run /bin/cat、run /bin/args hello world）\n"
@@ -2327,7 +2668,14 @@ static void __attribute__((noinline)) el1_landing(void)
 void kernel_main(unsigned long bootinfo)
 {
     g_bi = (struct bootinfo *)bootinfo;   /* stub 通过 x0 传进来 */
-    fb_init();                            /* 有 GOP 就把字也画到屏幕上 */
+    /* B4：裸 ELF 启动 x0=0 时，通过 QEMU fw_cfg 自建 ramfb 显示底座 */
+    if (!g_bi || g_bi->magic != BOOTINFO_MAGIC) {
+        if (fwc_ramfb_setup() == 0) {
+            g_bi = &ramfb_bi;
+            uart_puts("[fb  ] fwcfg ramfb 已配置 800x600\n");
+        }
+    }
+    fb_init();                            /* 有 GOP/ramfb 就把字也画到屏幕上 */
     uart_puts("[boot] bi="); uart_puthex((u64)bootinfo);
     if (g_bi) {
         uart_puts(" magic="); uart_puthex(g_bi->magic);
@@ -2352,11 +2700,24 @@ void kernel_main(unsigned long bootinfo)
     smp_online[0] = 1;
     {
         unsigned long mask = 0;
-        /* ⚠️ 2026-10-31：从核 GIC/定时器中断还没打通（IRQ 挂起但进不了处理程序 →
-           wfi 立刻返回 → 从核 100% 空转）。在修好之前默认不启动从核，
-           免得白白烧掉一个核心。要复现问题就把下面这行的 0 改成 1。 */
+        /* 2026-11-07 实测结论（QEMU 8.2，TCG）：仍默认关闭从核，但原因已查清并部分修复。
+           - PSCI conduit：默认 `-machine virt` 在 EL1 且 EL3/EL2 都不可用时 smc 是
+             UNDEFINED，旧版会刷一屏异常转储；smp.c 现在先探测 ID_AA64PFR0_EL1，
+             无可用 conduit 就优雅返回 0。加 `virtualization=on` 即可拉起 cpu1 并在线。
+           - 从核向量表：原版 16 条 b 挤在前 64 字节，IRQ 槽（应在 0x280）实际落在
+             +0x14；已按 128B 槽距重排（见 smp.c）。
+           - 仍未解决：从核定时期中断进不了处理程序，wfi 计数 2.5 秒内涨 5000 万+
+             （满速空转烧核）。因此默认不启用；要实验加 -DSMP_ENABLE 且 QEMU 加
+             `virtualization=on`，仅供调试，不要当"多核可用"。 */
+#ifdef SMP_ENABLE
+        extern volatile int smp_no_conduit;
+        int n = smp_start(&mask);
+        if (smp_no_conduit)
+            uart_puts("[smp ] 本机无 PSCI conduit（EL1 且 EL3/EL2 不可用），跳过从核\n");
+#else
         int n = 0;
-        if (0) n = smp_start(&mask);
+        (void)mask;                  /* 默认关闭，见上 */
+#endif
         uart_puts("[smp ] PSCI 拉起从核 "); uart_putdec((u32)n); uart_puts(" 个");
         if (n > 0) {
             uart_puts("（");

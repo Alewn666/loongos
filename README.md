@@ -16,12 +16,12 @@
 | 子系统 | 实现位置 | 状态 |
 | --- | --- | --- |
 | 启动与页表 | `boot.S` / `uefi_stub.c` / `linker.ld` / `BOOTAA64.EFI` | UEFI 引导 + 自研 PE stub |
-| 中断与调度 | `kernel.c` / `smp.c` | GICv2/v3 运行时探测（读 PIDR2，兼容 KVM）、10Hz tick、抢占式多任务、多核 SMP |
-| 显示 | `kernel.c` / `font8x16.h` / `font_cjk.h` | GOP 帧缓冲，8×16 英文 + 16×16 中文点阵 |
+| 中断与调度 | `kernel.c` / `smp.c` | GICv2/v3 运行时探测（读 PIDR2）、10Hz tick、抢占式多任务；SMP 代码已具备但**默认关闭**（见「诚实的边界」） |
+| 显示 | `kernel.c` / `font8x16.h` / `font_cjk.h` | 8×16 英文 + 16×16 中文点阵；UEFI GOP **或** QEMU ramfb（裸 ELF 启动经 fw_cfg DMA 自建 800×600 显示底座） |
 | 输入 | `usb_kbd.c` | xHCI 枚举 + USB HID boot 键盘报告解析 |
 | 文件系统 | `fs.c` | 自带 fs，内存盘 / 磁盘持久化 |
 | 用户程序 | `kernel.c` / `user/*.c` | ELF 加载与 `run`；`write` / `open` / `read` / `close` / `lseek` / `exit` 等系统调用（`svc #0`）；`hello` `cat` `args` `bad` `hang` 五个样例 |
-| 存储 | `virtio_blk.c` / `virtio_blk_legacy.c` / `virtio_scsi.c` | virtio 块设备与 SCSI 适配 |
+| 存储 | `virtio_blk.c` / `virtio_blk_legacy.c` / `virtio_scsi.c` | virtio-blk modern/legacy 双路径，挂盘后重启文件仍在；virtio-scsi transitional 因 64 位 BAR 风险主动放弃 |
 | 网络 | `virtio_net.c` / `net.c` / `tcp.c` | virtio-net + TCP 协议栈 |
 | 加密 | `crypto.c` / `test_crypto.c` | 登录口令校验与哈希 |
 | 安装 | `build_iso.sh` / `build_image.sh` | 生成可写入硬盘的 ISO 与磁盘镜像 |
@@ -32,12 +32,18 @@
 
 ```bash
 cd 本体
-sh build.sh                # 需要 aarch64-linux-gnu- 工具链
-sh run.sh                  # QEMU virt (gic-version=2, cortex-a57, 128MB)
+sh build.sh                # 需要 aarch64-linux-gnu- 工具链；内含 BSS 余量守卫
+sh run.sh                  # 最简：纯串口，QEMU virt (gic-version=2, cortex-a57, 128MB)
                            # 退出：Ctrl+A 松开，再按 X
+
+sh make_disk.sh disk.img 8 # 生成带 LoongOS 数据分区(0x99)的 8MB 磁盘镜像
+sh run_full.sh             # 满配：virtio-blk 磁盘 + ramfb 图形 + virtio-net 网卡
+                           # VNC 客户端连 127.0.0.1:5901 看 800x600 屏幕
 ```
 
-启动后先看到内核 banner，出现 `login:` 输入 `root`，进入 `#` 就是它自己的 shell 了。`help` 列出全部内置命令，`ls /`、`cat`、重定向、`&` 后台作业都可以试。
+启动后先看到横幅 `灵珑系统 | LoongOS stage5 - 用户与权限`，出现 `> ` 提示符即可敲命令（默认 root 身份）。`help` 列出全部内置命令：`ls /`、`cat`、`write`、`touch` / `mv` / `stat`、管道 `|`（可接 `wc` / `grep` / `head`）、重定向 `>` 与 `<`、`su demo` 切换用户（口令见 `docs`）都可以试。中文可以直接从串口输入并写入文件。
+
+满配启动时，空白数据分区会首次自动格式化并挂载（日志里有 `MOUNTED-DISK`），之后写进 `/home` 的文件关机再开仍在；`ping 10.0.2.2 3` 前先敲 `net` 让 DHCP 拿地址。
 
 ## 在安卓手机上跑（附运行说明）
 
@@ -69,11 +75,13 @@ HAL     framebuffer(已有) │ USB xHCI(已有) │ timer(已有)
 
 ```bash
 cd 本体
-python3 test_stage4_fs.py          # 文件系统
-python3 test_stage5_qemu.py        # QEMU 启动
-python3 test_stage5b_elf.py        # ELF 用户程序
-python3 test_stage5c_cwd.py        # 工作目录
-python3 test_stage5d_redirect.py   # 重定向
+python3 test_stage4_fs.py          # 文件系统            28/28
+python3 test_stage5_qemu.py        # QEMU 启动            35/35
+python3 test_stage5b_elf.py        # ELF 用户程序         33/33
+python3 test_stage5c_cwd.py        # 工作目录             20/20
+python3 test_stage5d_redirect.py   # 重定向               31/31
+cc -Wall -Wextra -Werror test_wm_host.c -o /tmp/t && /tmp/t   # 图形纯函数 36/36
+cc -Wall -Wextra test_net_host.c -o /tmp/n && /tmp/n           # 网络协议栈 52/52
 python3 test_kbd.py                # USB 键盘
 python3 test_scsi_install.py       # SCSI / 安装
 python3 test_iso_boot.py           # ISO 引导
@@ -90,7 +98,9 @@ loongos/
 │   ├── usb_kbd.c virtio_*.c uefi_stub.c
 │   ├── font8x16.h font_cjk.h linker.ld auth_cred.h
 │   ├── user/             # 用户态 ELF 样例程序
-│   ├── build.sh build_iso.sh build_image.sh build_pe.py run.sh
+│   ├── build.sh build_iso.sh build_image.sh build_pe.py
+│   ├── run.sh run_full.sh make_disk.sh   # 最简 / 满配启动 / 磁盘镜像
+│   ├── gfx.h test_wm_host.c       # 图形纯函数层与宿主单测（桌面路线 P1）
 │   ├── test_stage*.py test_kbd.py test_scsi*.py bench_boot.py
 │   ├── LOONGOS_*_TODO.md  # 各阶段任务清单（内核演进档案）
 │   └── docs/             # 桌面架构、检查与修复记录
@@ -100,7 +110,9 @@ loongos/
 ## 诚实的边界
 
 - 用户态目前提供 `write` / `open` / `read` / `close` / `lseek` / `exit` 等系统调用，还没有堆分配器，内存全是静态 BSS；EL0 有 30 秒看门狗防止用户程序卡死内核。
-- 图形界面、鼠标、窗口系统仍在路线图阶段；当前交互是帧缓冲 + 串口/USB 键盘。
+- **多核 SMP 默认关闭，不是「已支持多核」**：QEMU 加 `-machine virt,virtualization=on` 时 PSCI 能拉起 `cpu1` 并在线，但从核定时期中断进不了处理程序，`wfi` 会满速空转烧核（实测 2.5 秒涨 5000 万+ 次）。本轮已修好从核向量表的 128B 槽距（原 IRQ 槽错落在 `+0x14` 而非 `0x280`）与 PSCI conduit 探测（无 EL3/EL2 时优雅跳过，不再刷异常转储）；剩下的是 GIC CPU interface 打通。`-DSMP_ENABLE` 仅供调试。
+- 图形目前是**帧缓冲文字终端**（800×600，中文可显示），不是窗口系统；鼠标、窗口管理、绘图抽象、应用框架仍在路线图。`gfx.h` 是零风险第一步：裁剪 / 命中 / z 序 / 脏矩形抽成纯函数，36 项宿主单测全绿，不占内核 BSS。
+- **磁盘别用 `virtio-scsi-pci` 测**：驱动对 transitional 设备主动放弃（真机 PCIe 上改写 64 位 BAR 会 external abort，代码里有 2026-10-25 实测记录）。QEMU 用 `-device virtio-blk-pci` 即走 virtio-blk 路径，8MB 盘能读写、能格式化、能持久挂载。
 - 目标平台是 QEMU `virt` 与标准 UEFI aarch64，未适配具体实体 ARM 板卡的板级驱动。
 - 仓库里的 `BOOTAA64.EFI`、`kernel.elf` 与若干 `.o` 是构建产物，便于直接体验；源码以 `build.sh` 为准。
 

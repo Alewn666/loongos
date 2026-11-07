@@ -68,6 +68,7 @@ int  fs_lookup(const char *path);                   /* 绝对路径 → inode �
 int  fs_isdir(int ino);
 void fs_list(int ino, void (*cb)(const struct dirent *, int ino, void *), void *arg);
 int  fs_readfile(int ino, u8 *buf, u32 cap);        /* 读整个文件，返回字节数；-1 失败 */
+int  fs_readat(int ino, u32 off, u8 *buf, u32 cap); /* 从 off 读，返回实际字节数；-1 失败 / FS_DENIED */
 int  fs_createfile(const char *path);               /* 建普通文件；已存在/父目录缺 → -1 */
 int  fs_mkdir(const char *path);                    /* 建目录 */
 int  fs_setfile(int ino, const u8 *buf, u32 len);   /* 截断重写；0 成功 */
@@ -75,6 +76,12 @@ int  fs_unlink(const char *path);                   /* 删文件或空目录；0
 void fs_statfs(u32 *used, u32 *total);              /* 位图统计 */
 int  fs_filetype(int ino);                          /* FS_T_*（查不到 -1） */
 int  fs_filesize(int ino);                          /* 字节数（查不到 -1） */
+
+/* —— 阶段6④：shell 小工具用的补充 API —— */
+int  fs_touch(const char *path);                    /* 不存在建空文件；存在则刷新 mtime */
+int  fs_rename(const char *oldp, const char *newp);/* 改目录项（inode 号不变，不做数据搬运） */
+int  fs_inode_mtime(int ino);                       /* mtime（秒，开机起算）；查不到 -1 */
+int  fs_inode_mode(int ino);                        /* FM_* 位；查不到 -1 */
 
 /* —— 阶段5：身份与权限 ——
  * 规则（教学版 DAC）：

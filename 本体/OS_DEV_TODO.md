@@ -51,7 +51,42 @@ FS_MAGIC `"MYOS"`→`"LOOS"`、头文件保护 `MYOS_FS_H`→`LOONGOS_FS_H`、�
   `-kernel` 直载回归 31/0 未受影响。⚠️ 当前仍是内存盘，真正装盘要等阶段 6。
       回归 35/33/28/20/9 全绿；坑：redir_parse 方向变量复用、dispatch 拿整行比首词、
       el1_landing 抛栈帧致 redir_finish 不跑（qemu -d int 定位）；管道留待后续）
-- [ ] 更多命令（touch/mv/stat）视时间加
+- [x] **更多命令 + 管道（2026-11-07 补齐）**——`touch` / `mv` / `stat` / `wc` / `grep` / `head`
+      与单级管道 `cmd | cmd`（左段输出捕获 → 右段从 stdin 读），`mv` 用新增的 `fs_rename`
+      只改目录项不搬数据（inode 号不变已验证）。顺带修了 `cmd_cat` 只能读 1KB 的真问题：
+      新增 `fs_readat(ino, off, buf, cap)` 分块读，任何长度文件都能完整回读。QEMU 实测
+      `write /home/a.txt 灵珑中文ABC` 写入 15 字节、`ls /etc | wc` 得 5 行 58 字节、
+      `| grep 灵珑` 中文子串匹配正常。
+- [x] **2026-11-07「全都要」一轮（A → C → B）**——逐项结果见仓库根 `docs/` 与交付报告：
+  - **A1 BSS 守卫**：`build.sh` 编译后核对 `__bss_end < USER_BASE`、`-Ttext` 位置与
+    `[USER_BASE,USER_END)` 约束，余量显性化（当前 **35.7 KB**）。加图形缓冲前先过这道闸。
+  - **A2 见上**（命令与管道）。
+  - **C 图形纯函数层**：`gfx.h`（全 `static inline`、无全局、调用方提供固定容量数组）+
+    `test_wm_host.c`，宿主 gcc `-Werror` **36/36**。为零占 BSS 的窗口管理打底。
+  - **B1 中文输入**：`on_char` 放行 UTF-8 续字节（原来只收 ASCII，`中文ABC` 被吞成 `ABC`）。
+  - **B2 磁盘**：**这是启动配置问题，不是驱动 bug**。上一轮满配测试挂的是
+    `virtio-scsi-pci`，驱动对 transitional 设备主动放弃（64 位 BAR external abort 保护）；
+    换 `-device virtio-blk-pci` 后 8MB 盘直接就绪，`disks` / `disktest` 写读一致。
+    配 `make_disk.sh` 生成的 0x99 分区镜像：首次启动自动格式化并 `MOUNTED-DISK`，
+    二次启动回读到断电前写的文件——持久化闭环成立（本仓 2026-10-25 阶段6③ 已记录，
+    本轮只是把「该怎么启动」钉死）。
+  - **B3 多核（部分修复，仍默认关闭）**：修了 `smp.c` 从核向量表（16 槽 × 0x80，
+    IRQ 槽归位 `0x280`）与 PSCI conduit 探测（EL1 无 EL3/EL2 时优雅返回，不刷异常转储）。
+    `-machine virt,virtualization=on` 下 `cpu1` 能在线，但定时器中断仍进不了处理程序，
+    `wfi` 满速空转 → **不能当多核可用**。`-DSMP_ENABLE` 仅供调试。
+  - **B4 帧缓冲（打通）**：裸 ELF 启动 x0=0、没有 UEFI GOP 的老问题，改走 QEMU
+    `fw_cfg` 的 `etc/ramfb`。要点：ARM virt 的寄存器是 `data@0x09020000` /
+    `ctl@0x09020008`(BE) / `dma@0x09020010`；目录条目固定 64B；**QEMU v2.4+ 起单字节
+    MMIO 写被移除，必须用 DMA 描述符**（`FWCfgDmaAccess`：control/length/address 全大端，
+    control=`(sel<<16)|0x08|0x10`）触发 `ramfb` 的 write_cb。内核自选 `0x41000000` 起
+    空闲 RAM 作 framebuffer，写 800×600×32bpp 配置，合成 bootinfo 交给 `fb_init()`。
+    QEMU `-device ramfb -vnc :1` 下 `bench` 显示 `fb=0x41000000 w=800 h=600 u64ok=1`，
+    截图中 `fb 清屏/滚动/画 1000 字符` 基准与中文 shell 输出都真实可见。
+    `mmu_init()` 原有的「按 `g_bi->base` 映射 2MB PROT_FB_BLK」会自动接管，
+    **不要再额外调 `fill_pt`**（它走 L3 且索引只取 2MB 内偏移，会污染内核映射）。
+  - 复现：`sh make_disk.sh disk.img 8 && sh run_full.sh`；VNC 连 `127.0.0.1:5901` 看画面。
+  - 回归：宿主单测 36/36 + 52/52，五套端到端 **147/147**，`sh build.sh` 0 警告 0 错误。
+- [ ] **阶段 6④：用户态**——用户程序从 fs 加载进 EL0 跑（下一步）
 - [x] **阶段 6③：数据持久化（2026-10-25 打通）**——virtio-blk 驱动（modern virtio-pci）+ fs 挂磁盘分区（bread/bwrite 走 virtio）+ `install` 装盘 + **重启后文件还在**（test_install.py 三段全过）
 - [ ] **阶段 6④：用户态**——用户程序从 fs 加载进 EL0 跑（下一步）
 
