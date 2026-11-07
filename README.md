@@ -5,9 +5,9 @@
 ![Release](https://img.shields.io/github/v/release/Alewn666/loongos?label=release)
 ![QEMU](https://img.shields.io/badge/%E8%BF%90%E8%A1%8C-QEMU%20virt%20%7C%20%E6%89%8B%E6%9C%BA-6DA9C7)
 
-> 一个从 `boot.S` 第一行开始手写的 64 位 ARM 操作系统：没有借用现成内核，自己实现中断、调度、文件系统、ELF 加载、USB 键盘、virtio 磁盘/网卡和 TCP，最后能在 QEMU 里开机、登录、敲命令、存文件——甚至装进安卓手机跑。
+> 一个从 `boot.S` 第一行开始手写的 64 位 ARM 操作系统：没有借用现成内核，自己实现 GIC 中断（v2/v3 运行时探测）、调度、文件系统、ELF 加载、USB 键盘、virtio 磁盘/网卡和 TCP，最后能在 QEMU 里开机、登录、敲命令、存文件——甚至装进安卓手机跑。
 
-这不是 Linux 发行版，也不是教学用的玩具 demo。它是一套完整可启动的裸机内核：UEFI 从 `BOOTAA64.EFI` 接手，汇编入口建好页表跳进 `kernel.c`，之后 GIC 中断、10Hz 时钟节拍、抢占调度、帧缓冲中英文点阵、xHCI USB HID 键盘、自带文件系统、用户态 ELF 程序，全部由仓库里的 C 和汇编代码提供。
+这不是 Linux 发行版，也不是教学用的玩具 demo。它是一套完整可启动的裸机内核：UEFI 从 `BOOTAA64.EFI` 接手，汇编入口建好页表跳进 `kernel.c`，之后 GICv2/v3 自适应中断、10Hz 时钟节拍、抢占调度、帧缓冲中英文点阵、xHCI USB HID 键盘、自带文件系统、用户态 ELF 程序，全部由仓库里的 C 和汇编代码提供。
 
 `loongos` 与 [linglum-linux](https://github.com/Alewn666/linglum-linux) 是同一个「灵珑系统」的两条技术路线：那条用 Linux 内核 + BusyBox，这条连内核一起自己写，互不替代。
 
@@ -16,11 +16,11 @@
 | 子系统 | 实现位置 | 状态 |
 | --- | --- | --- |
 | 启动与页表 | `boot.S` / `uefi_stub.c` / `linker.ld` / `BOOTAA64.EFI` | UEFI 引导 + 自研 PE stub |
-| 中断与调度 | `kernel.c` / `smp.c` | GICv2、10Hz tick、抢占式多任务 |
+| 中断与调度 | `kernel.c` / `smp.c` | GICv2/v3 运行时探测（读 PIDR2，兼容 KVM）、10Hz tick、抢占式多任务、多核 SMP |
 | 显示 | `kernel.c` / `font8x16.h` / `font_cjk.h` | GOP 帧缓冲，8×16 英文 + 16×16 中文点阵 |
 | 输入 | `usb_kbd.c` | xHCI 枚举 + USB HID boot 键盘报告解析 |
 | 文件系统 | `fs.c` | 自带 fs，内存盘 / 磁盘持久化 |
-| 用户程序 | `kernel.c` / `user/*.c` | ELF 加载与 `run`，`hello` `cat` `args` `bad` `hang` 五个样例 |
+| 用户程序 | `kernel.c` / `user/*.c` | ELF 加载与 `run`；`write` / `open` / `read` / `close` / `lseek` / `exit` 等系统调用（`svc #0`）；`hello` `cat` `args` `bad` `hang` 五个样例 |
 | 存储 | `virtio_blk.c` / `virtio_blk_legacy.c` / `virtio_scsi.c` | virtio 块设备与 SCSI 适配 |
 | 网络 | `virtio_net.c` / `net.c` / `tcp.c` | virtio-net + TCP 协议栈 |
 | 加密 | `crypto.c` / `test_crypto.c` | 登录口令校验与哈希 |
@@ -39,17 +39,15 @@ sh run.sh                  # QEMU virt (gic-version=2, cortex-a57, 128MB)
 
 启动后先看到内核 banner，出现 `login:` 输入 `root`，进入 `#` 就是它自己的 shell 了。`help` 列出全部内置命令，`ls /`、`cat`、重定向、`&` 后台作业都可以试。
 
-## 在安卓手机上跑
+## 在安卓手机上跑（附运行说明）
 
-手机有引导锁、也没有裸机驱动，所以 `手机版/` 走的是 Termux + QEMU aarch64 虚拟机这条路，效果是真的开机、真的敲命令、真的存文件：
+手机有引导锁、也没有裸机驱动，所以走的是 Termux + QEMU aarch64 虚拟机这条路：在 Termux 里装 `qemu-system-aarch64-headless`，把打包好的系统目录放进去，用 `start.sh` 启动，就能看到它真的开机、真的敲命令、真的存文件。
 
 ```bash
 pkg install -y qemu-system-aarch64-headless tar
-cd ~/storage/downloads && tar xzf loongos-phone.tar.gz && cd loongos-phone
-sh start.sh
 ```
 
-详细步骤见 [手机版/说明.md](手机版/说明.md)，记得给 Termux 关掉电池优化。
+> ⚠️ `手机版/` 里只有 [说明.md](手机版/说明.md) 和一份修复记录——**运行所需的 `loongos-phone` 包（含 `start.sh`、`kernel.elf` 等）是构建产物，未纳入公开仓库**。请先按 `本体/build.sh` 构建内核，再照说明文档组装手机包；文档里记有演示登录账号。记得给 Termux 关掉电池优化。
 
 ## 桌面系统的路线
 
@@ -101,7 +99,7 @@ loongos/
 
 ## 诚实的边界
 
-- 目前的用户程序只有 `write` / `exit` 两个系统调用，还没有堆分配器，内存全是静态 BSS。
+- 用户态目前提供 `write` / `open` / `read` / `close` / `lseek` / `exit` 等系统调用，还没有堆分配器，内存全是静态 BSS；EL0 有 30 秒看门狗防止用户程序卡死内核。
 - 图形界面、鼠标、窗口系统仍在路线图阶段；当前交互是帧缓冲 + 串口/USB 键盘。
 - 目标平台是 QEMU `virt` 与标准 UEFI aarch64，未适配具体实体 ARM 板卡的板级驱动。
 - 仓库里的 `BOOTAA64.EFI`、`kernel.elf` 与若干 `.o` 是构建产物，便于直接体验；源码以 `build.sh` 为准。
@@ -109,7 +107,7 @@ loongos/
 ## 文档索引
 
 - [手机版/说明.md](手机版/说明.md) — 在安卓手机上从安装到敲命令
-- [本体/docs/桌面系统_架构与路线.md](本体/docs/桌面系统_架构与路线.md) — 图形化架构与分期清单
+- [本体/docs/桌面系统_架构与路线.md](本体/docs/桌面系统_架构与路线.md) — 图形化架构与分期清单（写于较早阶段，其中「只有 write/exit 两个系统调用」的现状描述已过时）
 - `LOONGOS_*_TODO.md` 与 `docs/检查与修复记录*.md` — 各阶段的设计取舍与排障实录
 
 ## 许可证
