@@ -19,7 +19,8 @@
 | 中断与调度 | `kernel.c` / `smp.c` | GICv2/v3 运行时探测（读 PIDR2）、10Hz tick、抢占式多任务；SMP 代码已具备但**默认关闭**（见「诚实的边界」） |
 | 显示 | `kernel.c` / `font8x16.h` / `font_cjk.h` / `gfx.c` | 8×16 英文 + 16×16 中文点阵；UEFI GOP **或** QEMU ramfb（裸 ELF 启动经 fw_cfg DMA 自建 800×600 显示底座）；渐变壁纸、顶栏、任务栏时钟、脏矩形重画 |
 | 输入 | `usb_kbd.c` | xHCI **多设备** HID：boot 键盘(8B) + 相对鼠标(4B) + 绝对平板(6B) 可同挂一个控制器；报告层识别 Ctrl+Shift+F1 |
-| 图形桌面 | `gfx.c` / `gfx.h` / `gfx_draw.h` / `desktop.c` | 裁剪 / 命中 / z 序 / 脏矩形纯函数层 + 5 窗口、鼠标指针、点击提焦点、拖标题栏、点 × 关闭、任务栏切换；**开始菜单 10 项**、安装系统向导（二次确认，10 秒超时自动撤销） |
+| 图形桌面 | `gfx.c` / `gfx.h` / `gfx_draw.h` / `desktop.c` | 裁剪 / 命中 / z 序 / 脏矩形纯函数层 + 5 窗口、鼠标指针、点击提焦点、拖标题栏、点 × 关闭、任务栏切换；**开始菜单 11 项**、安装系统向导（二次确认，10 秒超时自动撤销） |
+| 鼠标校准 | `kernel.c` / `desktop.c` | VNC 客户端送坐标带固定偏移时，`开始菜单 → 鼠标校准` 点靶心自动补偿；`mousecal` 命令查询/手设/清零，偏移存 `/etc/mousecal`，装盘重启仍生效 |
 | 图形终端 | `gfxterm.c` | 窗口内可跑**全部** shell 命令（含 `install yes`）；`uart_putc` 输出捕获进 12KB 历史缓冲，中英混排、UTF-8 输入、退格、滚轮翻页 |
 | 文件系统 | `fs.c` | 自带 fs，内存盘 / 磁盘持久化 |
 | 用户程序 | `kernel.c` / `user/*.c` | ELF 加载与 `run`；`write` / `open` / `read` / `close` / `lseek` / `exit` 等系统调用（`svc #0`）；`hello` `cat` `args` `bad` `hang` 五个样例 |
@@ -55,6 +56,8 @@ sh run_full.sh             # 满配：virtio-blk 磁盘 + ramfb 图形 + virtio-
 仓库按 `.gitignore` 不存 `*.iso`，最新可安装镜像在 [Releases](https://github.com/Alewn666/loongos/releases) 分发（附 `loongos.iso.md5`）。ISO 内含 UEFI 引导卷、`payload.img` 与 `kernel.elf`，用 `-cdrom loongos.iso` 从 AAVMF 启动后敲 `install yes` 即可装盘。
 
 > 在 NAS 虚拟机里安装时，目标盘请挂 **VirtIO Block / VirtIO SCSI / NVMe** 之一；如果 `install` 报 `FAIL no-disk` 且 `scsi` 输出 `rc=1 present=0`，说明 VM 没挂内核认得的硬盘，或挂的是 SATA/AHCI。
+>
+> ⚠️ **旧 ISO 会导致装不上**：早期版本只扫 bus0 上的一级桥，日志特征是 `扫描总线数=2 / 没找到 virtio-scsi 设备`；新版已改为多级桥 BFS（真机同构拓扑实测 `扫描总线数=5`、识别桥后 bus4 的控制器）。如果 VM 的 CD-ROM 还指向旧的 `loongos-kvmfix.iso`，请改成本页的 `loongos.iso`——QEMU 已打开的文件句柄即使文件被删仍有效，会让人误以为「已经在跑新系统」。
 
 ## 在安卓手机上跑（附运行说明）
 
@@ -79,7 +82,8 @@ HAL     framebuffer(GOP/ramfb) │ USB xHCI │ 10Hz timer
 ```
 
 - **P1 ✅**：渐变壁纸 + 顶栏 + 任务栏时钟、中英混排、脏矩形、开机默认进桌面、无 GOP 优雅降级。
-- **P2 ✅**：三设备同挂枚举、鼠标指针、点击 / 拖拽 / 关闭 / z 序、开始菜单 10 项、安装向导、图形终端跑全部命令、退出键改为**仅 Ctrl+Shift+F1**。
+- **P2 ✅**：三设备同挂枚举、鼠标指针、点击 / 拖拽 / 关闭 / z 序、开始菜单 11 项、安装向导、图形终端跑全部命令、退出键改为**仅 Ctrl+Shift+F1**。
+- **P2.1 ✅**：鼠标固定偏移校准（点靶心自动补偿 + `mousecal` 命令 + 持久化）、绝对/相对坐标源互斥、virtio-scsi 放宽 ID 与失败自诊断。
 - **P3+ 待做**：文件管理器、文本编辑器、窗口缩放与最小化、右键菜单、更换字库（见「诚实的边界」）。
 
 实测截图见 [docs/screenshots/](本体/docs/screenshots/)，逐轮设计与排障记录见 `LOONGOS_DESKTOP_TODO.md` 与 `docs/检查与修复记录.md`。
@@ -104,6 +108,7 @@ bash test_uefi.sh                  # UEFI 5 拓扑：scsi 桥 / NVMe / virtio-rn
 python3 test_nvme_install.py       # NVMe 装盘 → MOUNTED-DISK → 重启文件仍在  ALL PASS
 python3 test_desktop_p2.py         # 桌面 P2 端到端 8/8：QMP 注入鼠标点击/拖拽、
                                    # Ctrl+Shift+F1，screendump 抓图比对
+python3 test_mousecal.py           # 鼠标校准：串口命令/持久化 + 图形点靶心对齐
 bash test_drivers.sh               # 直启 TCG 抓设备识别
 ```
 
@@ -137,6 +142,7 @@ loongos/
 - **字库有已知缺陷**：`font_cjk.h` 里 `·`(U+00B7) 字形本身是两条竖线，部分框形字（口/回/窗）缺底横——是 885 个字形的历史数据问题，尚未整体更换；桌面文案已避开这些字。
 - **桌面与鼠标只在 TCG 下实测**：沙箱无 `/dev/kvm`，`test_desktop_p2.py` 8/8 全在 QEMU TCG 完成；真机是 KVM，装机后建议确认一次「进桌面 → 鼠标拖拽 → Ctrl+Shift+F1 → install/net」。
 - 输入是轮询式事件处理，没有触摸 / 多点触控 / 手势；窗口缩放、最小化、右键菜单仍在 P3 清单里。
+- **网页 VNC 的鼠标固定偏移**来自客户端画布留白 / 缩放没扣，内核改不了 VNC：`开始菜单 → 鼠标校准` 点一次靶心即可补偿，`mousecal` 命令可查询 / 手设 / 清零。偏移存 `/etc/mousecal`，未装盘（内存盘）时重启会丢。
 - 目标平台是 QEMU `virt` 与标准 UEFI aarch64，未适配具体实体 ARM 板卡的板级驱动。
 - 仓库里的 `BOOTAA64.EFI`、`kernel.elf` 与若干 `.o` 是构建产物，便于直接体验；源码以 `build.sh` 为准，新增编译产物不再纳入版本控制（见 `.gitignore`）。
 

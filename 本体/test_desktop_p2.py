@@ -219,8 +219,9 @@ def main():
         check("鼠标点「开始」弹出菜单", d_menu > 0.05,
               "菜单区域差异=%.3f" % d_menu)
 
-        # 4) 点菜单「命令清单」(第 5 行：y=282+8+4*26+11≈405)
-        q.click(110, 405)
+        # 4) 点菜单「命令清单」(第 5 行：菜单 11 项，MENU_H=302，
+        #    menu_rect.y=600-42-302=256 → y=256+8+4*26+11≈379)
+        q.click(110, 379)
         q.shot("03_help_in_term")
         d_help = diff_ratio(os.path.join(SHOTS, "02_menu_open.png"),
                             os.path.join(SHOTS, "03_help_in_term.png"))

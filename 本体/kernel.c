@@ -534,6 +534,22 @@ static volatile int G_btn_abs, G_btn_rel;   /* 绝对/相对设备各自的按�
 static volatile int G_mbtn;                  /* 合并结果 = abs | rel */
 static volatile int G_exit_req;
 
+/* ---- 鼠标校准（2026-11-08 真机反馈：VNC 客户端送坐标带固定偏移）----------------
+ * 现象：真机网页 VNC 里，桌面画出来的光标与用户看到的物理鼠标始终差固定一段像素。
+ * 原因在客户端（画布留白 / 边框 / 缩放没扣），内核改不了 VNC，但可以补偿：
+ *   G_moff_x/y 是从「内核收到的坐标」里减掉的常量偏移，由桌面校准向导或
+ *   `mousecal <dx> <dy>` 设置，写进 /etc/mousecal，装盘后重启仍生效。
+ * G_raw_ax/ay 保留最近一次平板原始坐标（0..32767），供排障时确认映射链。
+ * G_abs_tick 用于让绝对平板优先：相对鼠标只在「近期没有绝对报告」时才更新坐标，
+ * 否则两个设备轮流覆盖 G_mx/G_my，光标会漂。 */
+/* 全局节拍（定义在下方调度器；这里用于判断「近期是否收到绝对报告」） */
+extern volatile u64 tick;
+
+static volatile int G_moff_x, G_moff_y;
+static volatile int G_raw_ax, G_raw_ay;
+static volatile u64 G_abs_tick;
+static volatile int G_abs_seen;
+
 static void mouse_clamp(int *x, int *y)
 {
     int w = fb_w ? (int)fb_w : 800, h = fb_h ? (int)fb_h : 600;
@@ -545,9 +561,14 @@ static void mouse_clamp(int *x, int *y)
 
 void mouse_feed_rel(int dx, int dy, int btn, int wheel)
 {
-    int x = G_mx + dx, y = G_my + dy;
-    mouse_clamp(&x, &y);
-    G_mx = x; G_my = y;
+    /* 绝对平板在场时，相对鼠标的坐标增量会与平板轮流覆盖 G_mx/G_my，光标乱跳。
+       真机 VNC 走绝对模式，相对设备只贡献按钮/滚轮；只有「2 秒内没有任何绝对报告」
+       （即确实没有平板、用户只用相对鼠标）才让它更新坐标。 */
+    if (!G_abs_seen || tick - G_abs_tick > 20) {
+        int x = G_mx + dx, y = G_my + dy;
+        mouse_clamp(&x, &y);
+        G_mx = x; G_my = y;
+    }
     G_btn_rel = btn & 7;
     G_mbtn = G_btn_abs | G_btn_rel;
     G_mwheel += wheel;
@@ -557,10 +578,12 @@ void mouse_feed_rel(int dx, int dy, int btn, int wheel)
 void mouse_feed_abs(int ax, int ay, int btn, int wheel)
 {
     int w = fb_w ? (int)fb_w : 800, h = fb_h ? (int)fb_h : 600;
-    int x = (int)(((long)ax * (w - 1)) / 32767);
-    int y = (int)(((long)ay * (h - 1)) / 32767);
+    G_raw_ax = ax; G_raw_ay = ay;
+    int x = (int)(((long)ax * (w - 1)) / 32767) - G_moff_x;
+    int y = (int)(((long)ay * (h - 1)) / 32767) - G_moff_y;
     mouse_clamp(&x, &y);
     G_mx = x; G_my = y;
+    G_abs_seen = 1; G_abs_tick = tick;
     G_btn_abs = btn & 7;
     G_mbtn = G_btn_abs | G_btn_rel;
     G_mwheel += wheel;
@@ -580,12 +603,82 @@ int mouse_get(int *x, int *y, int *btn, int *wheel)
     return 1;
 }
 
-/* 桌面启动时把指针放到屏幕中央（无鼠标事件也有个可见光标） */
+/* 桌面启动时把指针放到屏幕中央（无鼠标事件也有个可见光标）。
+   注意：不清校准偏移 G_moff_*，那是要跨桌面会话保留的用户设置。 */
 void mouse_reset(int x, int y)
 {
     G_mx = x; G_my = y;
     G_btn_abs = 0; G_btn_rel = 0; G_mbtn = 0;
     G_mwheel = 0; G_mdirty = 0;
+}
+
+/* ---- 鼠标校准：持久化到 /etc/mousecal（纯文本 "dx dy\n"） ------------------- */
+#define MOUSECAL_PATH "/etc/mousecal"
+
+static int parse_signed(const char **pp, int *out)
+{
+    const char *p = *pp;
+    while (*p == ' ' || *p == '\t') p++;
+    int neg = 0;
+    if (*p == '-') { neg = 1; p++; }
+    else if (*p == '+') p++;
+    if (*p < '0' || *p > '9') return -1;
+    int v = 0;
+    while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
+    *out = neg ? -v : v;
+    *pp = p;
+    return 0;
+}
+
+static int app_signed(char *b, int pos, int v)
+{
+    if (v < 0) { b[pos++] = '-'; v = -v; }
+    char t[12]; int n = 0;
+    if (!v) t[n++] = '0';
+    while (v) { t[n++] = (char)('0' + v % 10); v /= 10; }
+    while (n) b[pos++] = t[--n];
+    return pos;
+}
+
+/* fs 就绪后调用一次；文件不存在或内容非法就保持 0 偏移 */
+void mouse_cal_load(void)
+{
+    int ino = fs_lookup(MOUSECAL_PATH);
+    if (ino < 0) return;
+    u8 b[32];
+    int n = fs_readfile(ino, b, 31);
+    if (n <= 0) return;
+    b[n] = 0;
+    const char *p = (const char *)b;
+    int dx, dy;
+    if (parse_signed(&p, &dx) == 0 && parse_signed(&p, &dy) == 0) {
+        G_moff_x = dx; G_moff_y = dy;
+    }
+}
+
+void mouse_cal_set(int dx, int dy)
+{
+    G_moff_x = dx; G_moff_y = dy;
+    char b[32];
+    int n = app_signed(b, 0, dx);
+    b[n++] = ' ';
+    n = app_signed(b, n, dy);
+    b[n++] = '\n';
+    int ino = fs_lookup(MOUSECAL_PATH);
+    if (ino < 0) ino = fs_createfile(MOUSECAL_PATH);
+    if (ino >= 0) fs_setfile(ino, (const u8 *)b, (u32)n);
+}
+
+void mouse_cal_get(int *dx, int *dy)
+{
+    if (dx) *dx = G_moff_x;
+    if (dy) *dy = G_moff_y;
+}
+
+void mouse_raw(int *ax, int *ay)
+{
+    if (ax) *ax = G_raw_ax;
+    if (ay) *ay = G_raw_ay;
 }
 
 /* Ctrl+Shift+F1：usb_kbd.c 在报告层识别后只置标志，不塞字符 ring */
@@ -2083,7 +2176,11 @@ static void cmd_disktest(char *a)
         → 在我们的分区上用本内核自己的文件系统格式化（不需要 Linux、不需要 FAT 写入代码）。 */
 static void cmd_install(char *args)
 {
-    if (!vb_present()) { uart_puts("[install] FAIL no-disk\n"); return; }
+    if (!vb_present()) {
+        uart_puts("[install] FAIL no-disk\n");
+        uart_puts("[install] 敲 scsi 看 PCI 设备清单；若显示旧版「扫描总线数=2」，说明在跑旧 ISO，请换最新 loongos.iso\n");
+        return;
+    }
     if (!g_bi || g_bi->magic != BOOTINFO_MAGIC || !g_bi->img_addr || !g_bi->img_size) {
         uart_puts("[install] FAIL no-esp-payload\n");
         return;
@@ -2309,6 +2406,41 @@ cnt_done:
 /* 桌面 P1/P2：开机默认进桌面；从终端敲 desktop 可再次进入（Ctrl+Shift+F1 返回终端）。 */
 static void cmd_desktop(char *a) { (void)a; desktop_run(); }
 
+/* 鼠标校准：查询当前偏移 / 手动设置 / 清零。图形界面里还有点靶心自动校准。 */
+static void put_sdec(int v)
+{
+    if (v < 0) { uart_puts("-"); uart_putdec((u32)(-v)); }
+    else uart_putdec((u32)v);
+}
+
+static void cmd_mousecal(char *a)
+{
+    if (a && fs_strcmp(a, "reset") == 0) {
+        mouse_cal_set(0, 0);
+        uart_puts("[mousecal] 偏移已清零\n");
+        return;
+    }
+    if (a && *a) {
+        const char *p = a;
+        int dx, dy;
+        if (parse_signed(&p, &dx) == 0 && parse_signed(&p, &dy) == 0) {
+            mouse_cal_set(dx, dy);
+            uart_puts("[mousecal] 已设置并保存到 /etc/mousecal\n");
+            return;
+        }
+        uart_puts("[mousecal] 参数看不懂，用法见下\n");
+    }
+    int dx, dy, ax, ay;
+    mouse_cal_get(&dx, &dy);
+    mouse_raw(&ax, &ay);
+    uart_puts("[mousecal] 当前偏移 dx="); put_sdec(dx);
+    uart_puts(" dy="); put_sdec(dy); uart_puts("\n");
+    uart_puts("[mousecal] 最近平板原始坐标 ax="); uart_putdec((u32)ax);
+    uart_puts(" ay="); uart_putdec((u32)ay); uart_puts(" (0..32767)\n");
+    uart_puts("[mousecal] 用法: mousecal / mousecal <dx> <dy> / mousecal reset\n");
+    uart_puts("           或桌面「开始菜单 → 鼠标校准」点靶心自动校准\n");
+}
+
 static const struct cmdent CMDS[] = {
     { "ls",    cmd_ls    }, { "cat",   cmd_cat   }, { "write", cmd_write },
     { "mkdir", cmd_mkdir }, { "rm",    cmd_rm    }, { "df",    cmd_df    },
@@ -2320,7 +2452,7 @@ static const struct cmdent CMDS[] = {
     { "net", cmd_net }, { "ifconfig", cmd_ifconfig }, { "ping", cmd_ping }, { "tcp", cmd_tcp }, { "cpu", cmd_cpu },
     { "touch", cmd_touch }, { "mv", cmd_mv }, { "stat", cmd_stat },
     { "wc", cmd_wc }, { "grep", cmd_grep }, { "head", cmd_head },
-    { "desktop", cmd_desktop },
+    { "desktop", cmd_desktop }, { "mousecal", cmd_mousecal },
     { 0, 0 }
 };
 
@@ -2944,6 +3076,7 @@ static void cmd_help(char *a)
         "  tcp get <ip> <端口>  建 TCP 连接并读最多 3 秒（80 自动发 GET）\n"
         "  cpu                  看多核：哪几颗在线 / 计数是否在涨\n"
         "  desktop             进图形桌面（开机默认；Ctrl+Shift+F1 返回终端）\n"
+        "  mousecal            看/设鼠标偏移（桌面开始菜单可点靶心自动校准）\n"
         "  help                 本清单\n");
 }
 
@@ -3180,6 +3313,9 @@ void kernel_main(unsigned long bootinfo)
 #ifdef BENCH_AT_BOOT
     cmd_bench(0);                 /* 测量构建：开机自动跑一遍基准，不依赖键盘输入 */
 #endif
+    /* 恢复上次保存的鼠标校准偏移（/etc/mousecal，装盘后重启仍生效） */
+    mouse_cal_load();
+
     /* 桌面 P1/P2：开机默认直接进图形桌面。
        先把当前帧缓冲参数交给绘图层；串口 shell 仍是调试/回归通道 —— 桌面期间
        只要串口有输入就自动让位（字符不丢，见 desktop.c）；键盘主动退出只有

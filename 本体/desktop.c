@@ -43,6 +43,8 @@ extern volatile u64 tick;
 extern int  mouse_get(int *x, int *y, int *btn, int *wheel);
 extern void mouse_reset(int x, int y);
 extern int  desktop_exit_requested(void);
+extern void mouse_cal_set(int dx, int dy);
+extern void mouse_cal_get(int *dx, int *dy);
 
 /* ---- 配色 ---- */
 #define C_WALL_A    GFX_RGB(16, 30, 52)
@@ -102,9 +104,12 @@ static int G_drag_dx, G_drag_dy;
 static int G_menu_on;
 static int G_install_armed;
 static u64 G_arm_tick;
+static int G_cal_on;                    /* 鼠标校准覆盖层是否显示 */
+static int G_cal_done;                  /* 已算出偏移，等待用户点一下返回 */
+static char G_cal_msg[64];              /* 校准结果（ASCII，字库必定有） */
 
 /* ---- 按钮 ---- */
-enum { ACT_EXEC, ACT_FOCUS, ACT_INSTALL, ACT_CLEAR, ACT_CLOSE, ACT_SCROLL };
+enum { ACT_EXEC, ACT_FOCUS, ACT_INSTALL, ACT_CLEAR, ACT_CLOSE, ACT_SCROLL, ACT_CAL };
 #define BT_MENU  (-1)
 struct btn {
     int owner;                          /* BT_MENU 或窗口索引 */
@@ -117,7 +122,7 @@ struct btn {
 
 #define MENU_W   220
 #define MENU_ROW 26
-#define MENU_N   10
+#define MENU_N   11
 #define MENU_H   (8 + MENU_N * MENU_ROW + 8)
 
 static const struct btn G_btns[] = {
@@ -132,6 +137,7 @@ static const struct btn G_btns[] = {
     { BT_MENU,   8,   8 + 7*MENU_ROW, 204, 22, "网络状态",   ACT_EXEC,    0, "ifconfig" },
     { BT_MENU,   8,   8 + 8*MENU_ROW, 204, 22, "磁盘用量",   ACT_EXEC,    0, "df" },
     { BT_MENU,   8,   8 + 9*MENU_ROW, 204, 22, "清空终端",   ACT_CLEAR,   0, 0 },
+    { BT_MENU,   8,   8 +10*MENU_ROW, 204, 22, "鼠标校准",   ACT_CAL,     0, 0 },
     /* 安装系统窗口内 */
     { W_INSTALL, 14,  88, 162, 26, "检查磁盘",   ACT_EXEC,    0, "disks" },
     { W_INSTALL, 14, 122, 162, 26, "一键安装",   ACT_INSTALL, 0, 0 },
@@ -165,6 +171,18 @@ static void fmt_time(char *b, u64 sec)
     b[i++] = ':';
     fmt2(b + i, s); i += 2;
     b[i] = 0;
+}
+/* 带符号十进制（校准偏移可能为负），返回写入长度 */
+static int fmt_signed(char *p, int v)
+{
+    int n = 0;
+    if (v < 0) { p[n++] = '-'; v = -v; }
+    else p[n++] = '+';
+    char t[12]; int m = 0;
+    if (!v) t[m++] = '0';
+    while (v) { t[m++] = (char)('0' + v % 10); v /= 10; }
+    while (m) p[n++] = t[--m];
+    return n;
 }
 static struct gfx_rect full_screen(void)
 {
@@ -326,6 +344,13 @@ static void do_action(const struct btn *b)
         gfxterm_init();                     /* 重新初始化 = 清空历史 */
         focus_win(W_TERM);
         break;
+    case ACT_CAL:
+        G_cal_on = 1;
+        G_cal_done = 0;
+        G_cal_msg[0] = 0;
+        G_menu_on = 0;
+        gfx_damage(full_screen());
+        break;
     default: break;
     }
 }
@@ -334,6 +359,36 @@ static void do_action(const struct btn *b)
 static void handle_press(void)
 {
     int x = G_mx, y = G_my;
+
+    /* 校准覆盖层优先：用户把「真实鼠标」移到正中靶心后点下，
+       收到的坐标与靶心的差就是固定偏移，立刻保存并退出校准。 */
+    if (G_cal_on) {
+        /* 第二次点击：带着结果显示返回桌面 */
+        if (G_cal_done) {
+            G_cal_on = 0; G_cal_done = 0;
+            gfx_damage(full_screen());
+            return;
+        }
+        int cx = gfx_width() / 2, cy = gfx_height() / 2;
+        int dx = x - cx, dy = y - cy;
+        mouse_cal_set(dx, dy);
+        char b[64]; int n = 0;
+        const char *p = "mousecal: dx=";
+        while (*p) b[n++] = *p++;
+        n += fmt_signed(b + n, dx);
+        p = " dy=";
+        while (*p) b[n++] = *p++;
+        n += fmt_signed(b + n, dy);
+        p = " (saved)";
+        while (*p) b[n++] = *p++;
+        b[n] = 0;
+        for (int i = 0; i <= n && i < (int)sizeof G_cal_msg; i++)
+            G_cal_msg[i] = b[i];
+        G_cal_done = 1;
+        G_mx = cx; G_my = cy;             /* 立刻把光标放回靶心，反馈对齐 */
+        gfx_damage(full_screen());
+        return;
+    }
 
     /* 1. 任务栏：开始按钮 */
     if (gfx_hit(start_rect(), x, y)) {
@@ -594,9 +649,39 @@ static void draw_cursor(void)
     }
 }
 
+/* 鼠标校准覆盖层：靶心固定在屏幕正中，用户按「真实鼠标」（VNC 本地指针）
+   去点它，内核用收到的坐标减靶心得到固定偏移并写进 /etc/mousecal。
+   仍画出内核认为的光标位置，方便直观看到补偿前后差多少。 */
+static void draw_calibrate(void)
+{
+    int w = gfx_width(), h = gfx_height();
+    int cx = w / 2, cy = h / 2;
+    gfx_fill((struct gfx_rect){0, 0, w, h}, C_TOPBAR);
+    const char *t1 = "鼠标校准";
+    gfx_text((w - gfx_text_w(t1)) / 2, 56, t1, C_WHITE, C_TRANSP);
+    const char *t2 = "用鼠标点击正中红色靶心";
+    gfx_text((w - gfx_text_w(t2)) / 2, 88, t2, C_ACCENT, C_TRANSP);
+    const char *t3 = "光标与真实鼠标差多少 会自动补偿并保存";
+    gfx_text((w - gfx_text_w(t3)) / 2, 110, t3, C_WIN_DIM, C_TRANSP);
+    const char *t4 = G_cal_done ? "已保存 再点一下返回桌面"
+                                : "点任意位置完成 | Ctrl Shift F1 放弃";
+    gfx_text((w - gfx_text_w(t4)) / 2, 132, t4,
+             G_cal_done ? C_ACCENT : C_WIN_DIM, C_TRANSP);
+    /* 十字准线 + 三层靶心 */
+    gfx_fill((struct gfx_rect){cx - 1, cy - 70, 2, 140}, C_WHITE);
+    gfx_fill((struct gfx_rect){cx - 70, cy - 1, 140, 2}, C_WHITE);
+    gfx_fill((struct gfx_rect){cx - 16, cy - 16, 32, 32}, C_RED);
+    gfx_fill((struct gfx_rect){cx - 10, cy - 10, 20, 20}, C_WHITE);
+    gfx_fill((struct gfx_rect){cx - 4,  cy - 4,  8,  8},  C_RED);
+    if (G_cal_msg[0])
+        gfx_text((w - gfx_text_w(G_cal_msg)) / 2, h - 90, G_cal_msg, C_ACCENT, C_TRANSP);
+    draw_cursor();
+}
+
 static void redraw(struct gfx_rect r)
 {
     (void)r;
+    if (G_cal_on) { draw_calibrate(); return; }
     draw_wallpaper();
     draw_topbar();
     draw_windows();
@@ -615,6 +700,8 @@ void desktop_run(void)
 
     gfx_take_screen();                 /* uart_putc 不再把日志镜像到帧缓冲 */
     gfx_set_redraw(redraw);
+    G_cal_on = 0;                      /* 每次进桌面都不停留在校准层 */
+    G_cal_done = 0;
     if (!G_inited) {
         wins_init();
         mouse_reset(gfx_width() / 2, gfx_height() / 2);

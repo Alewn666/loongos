@@ -42,7 +42,12 @@ extern void pci_enum(void);         /* 通用 PCI 枚举（裸机自举分配总
 #define PCI_CMD_BME     (1u << 2)
 
 #define VIRTIO_VENDOR        0x1AF4
-#define VIRTIO_SCSI_TRANS    0x1004      /* transitional（virtio-scsi） */
+/* QEMU 8.2.2 hw/virtio/virtio-pci.c：transitional 用 pci_ids.h 里的
+   PCI_DEVICE_ID_VIRTIO_SCSI，modern 用 0x1040 + VIRTIO_ID_SCSI(=8)。
+   部分固件/libvirt 组合还会报 0x1008（按 virtio device id 编号的 transitional），
+   一并认下，避免「设备明明在却因 ID 不匹配而 present=0」。 */
+#define VIRTIO_SCSI_TRANS    0x1004      /* transitional（QEMU pci_ids.h） */
+#define VIRTIO_SCSI_TRANS2   0x1008      /* transitional（virtio device id 编号） */
 #define VIRTIO_SCSI_MODERN   0x1048      /* modern only */
 
 #define VIRTIO_PCI_CAP_COMMON_CFG 1
@@ -409,11 +414,32 @@ int vs_init(void)
                 u32 id = cfg_rd(b, d, f, PCI_VENDOR);
                 if ((id & 0xffff) != VIRTIO_VENDOR) continue;
                 u32 did = (id >> 16) & 0xffff;
-                if (did != VIRTIO_SCSI_TRANS && did != VIRTIO_SCSI_MODERN) continue;
+                if (did != VIRTIO_SCSI_TRANS && did != VIRTIO_SCSI_TRANS2 &&
+                    did != VIRTIO_SCSI_MODERN) continue;
                 bus = b; dev = d; fn = f;
                 break;
             }
-    if (bus < 0) { kputs("[scsi] 没找到 virtio-scsi 设备(1af4:1004/1048)\n"); return -1; }
+    if (bus < 0) {
+        kputs("[scsi] 没找到 virtio-scsi 设备(1af4:1004/1008/1048)\n");
+        /* 失败时把所有已发现设备打出来：真机上用户敲 `scsi` 就能看到
+           到底是「设备根本没枚举到」还是「ID/桥窗口不对」，不用再猜。
+           图形终端会捕获这些输出。 */
+        kputs("[scsi] PCI 清单 b:d.f id=vendor:device cls=baseclass\n");
+        for (int bi = 0; bi < nb; bi++)
+            for (int d = 0; d < 32; d++)
+                for (int f = 0; f < 8; f++) {
+                    int b = buses[bi];
+                    u32 v = cfg_rd(b, d, f, PCI_VENDOR);
+                    if ((v & 0xffff) == 0xffff) continue;
+                    u32 cl = cfg_rd(b, d, f, 0x08);
+                    kputs("[scsi]  "); kputdec((u32)b); kputs(":");
+                    kputdec((u32)d); kputs("."); kputdec((u32)f);
+                    kputs(" id="); kputhex((u64)v);
+                    kputs(" cls="); kputhex((u64)(cl >> 24));
+                    kputs("\n");
+                }
+        return -1;
+    }
     vs_dbg_bdf = bus * 10000 + dev * 100 + fn;
     vs_dbg_id = cfg_rd(bus, dev, fn, PCI_VENDOR);
     for (int i = 0; i < 6; i++) vs_dbg_raw[i] = cfg_rd(bus, dev, fn, PCI_BAR0 + i * 4);
