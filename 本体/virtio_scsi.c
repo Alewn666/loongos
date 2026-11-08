@@ -29,6 +29,7 @@ extern void kputs(const char *s);
 extern void kputhex(u64 v);
 extern void kputdec(u32 v);
 extern void kputhex2(u8 v);
+extern void pci_enum(void);         /* 通用 PCI 枚举（裸机自举分配总线号/BAR/桥窗口） */
 
 /* ---------------- PCI ---------------- */
 #define PCI_ECAM_BASE   0x4010000000ULL
@@ -202,11 +203,21 @@ static volatile u16  *vs_lused_idx;
 
 static int vs_legacy_init(int bus, int dev, int fn)
 {
-    u32 bar1 = cfg_rd(bus, dev, fn, PCI_BAR0 + 4);
-    if (bar1 & 1u) return -1;                 /* 不是内存 BAR */
-    u64 base = (u64)(bar1 & ~0xfu);
+    /* ⚠️ legacy 接口仅在「BAR0 是 32 位内存 BAR」时才被调用（调用方已判定）。
+       AArch64 上 QEMU 的 virtio-pci 把 legacy 放在 BAR0 的 I/O 端口条，端口 I/O 不可用，
+       所以本架构下 legacy 基本不走；保留此路径仅作兜底。基址一律取 BAR0。 */
+    u32 bar0 = cfg_rd(bus, dev, fn, PCI_BAR0);
+    if (bar0 & 1u) return -1;                 /* 不是内存 BAR（I/O 条不可用） */
+    u64 base = (u64)(bar0 & ~0xfu);
     if (!base) return -2;
+    /* 自行开启 MSE(内存空间)+BME(总线主控/DMA)：legacy 路径必须自己开，不能依赖 UEFI 残留。 */
+    {
+        u32 cmd = cfg_rd(bus, dev, fn, PCI_CMD);
+        cfg_wr(bus, dev, fn, PCI_CMD, cmd | PCI_CMD_MSE | PCI_CMD_BME);
+    }
     wr8(base + L_STATUS, 0); sbar();
+    /* legacy 复位异步：等到 status 清 0 再继续 */
+    { int t = 0; u8 s; do { s = rd8(base + L_STATUS); t++; } while (s != 0 && t < 1000000); }
     wr8(base + L_STATUS, 1); sbar();          /* ACK */
     wr8(base + L_STATUS, 3); sbar();          /* ACK|DRIVER */
     wr32(base + L_GUEST_FEAT, 0);             /* 不要任何特性（legacy 最小集） */
@@ -214,10 +225,14 @@ static int vs_legacy_init(int bus, int dev, int fn)
     sbar();
     u16 num = rd16(base + L_QUEUE_NUM);
     if (!num) return -3;
+    /* ⚠️ legacy 协议没有「设置队列大小」：设备用自己报告的 QUEUE_NUM 解析整个 virtqueue 布局
+       （描述符表/可用环/已用环偏移都依赖 N）。必须用设备真实深度，绝不能截断：否则可用环偏移
+       与设备解析错位 → 设备永远看不到新缓冲 → 命令永不完成（r=4 超时）。 */
+    if (num > 128) return -3;                 /* 超出缓冲/数组能力（vs_lq 装得下 128） */
     for (u32 i = 0; i < sizeof(vs_lq); i++) vs_lq[i] = 0;
-    u16 qn = num > 64 ? 64 : num;             /* 我们只用 64 深度 */
+    u16 qn = num;                             /* 用设备真实深度，保证与设备布局一致 */
     vs_ldesc      = (struct vdesc *)vs_lq;
-    vs_lavail_idx = (volatile u16 *)(vs_lq + qn * 16 + 2);
+    vs_lavail_idx = (volatile u16 *)(vs_lq + (u32)qn * 16 + 2);
     vs_lused_idx  = (volatile u16 *)(vs_lq + 4096 + 2);
     wr32(base + L_QUEUE_PFN, (u32)((u64)vs_lq >> 12));
     sbar();
@@ -226,7 +241,7 @@ static int vs_legacy_init(int bus, int dev, int fn)
     sbar();
     if (rd8(base + L_STATUS) == 0) return -5;
     vs_lbase = base; vs_lqnum = qn; vs_legacy = 1;
-    kputs("[scsi] legacy 模式就绪（BAR1="); kputhex(base);
+    kputs("[scsi] legacy 模式就绪（BAR0="); kputhex(base);
     kputs(" qn="); kputdec(qn); kputs("）\n");
     return 0;
 }
@@ -342,21 +357,48 @@ static int vs_cmd(const u8 *cdb, void *data, u32 data_len, int for_write, u32 *o
 /* ---------------- 初始化 ---------------- */
 int vs_init(void)
 {
+    pci_enum();                     /* 确保总线号/BAR/桥窗口已就绪（固件没配则自举分配） */
     vs_ok = 0;
-    /* ⚠️ 不要盲扫 bus 0..7：ECAM 别名只覆盖**真实存在**的总线，越界读会 external abort
-       （实测 FAR_EL1=0x4010300010 = ECAM 里 bus3 偏移；异常被自愈吞掉 → 每几秒刷一次）。
-       正确做法：先读 bus0 上的 PCIe 桥(root port)，从桥的 secondary-bus(0x19) 拿到真实总线号。 */
-    int buses[8];
-    int nb = 0;
-    buses[nb++] = 0;
-    for (int d = 0; d < 32 && nb < 8; d++) {
-        u32 v = cfg_rd(0, d, 0, PCI_VENDOR);
-        if ((v & 0xffff) == 0xffff) continue;
-        u32 cls = cfg_rd(0, d, 0, 0x08) >> 24;          /* class code: 0x06 = bridge */
-        if (cls != 0x06) continue;
-        u32 sec = (cfg_rd(0, d, 0, 0x18) >> 8) & 0xff;  /* secondary bus number */
-        if (sec && sec < 0x100 && nb < 8) buses[nb++] = (int)sec;
+    /* ⚠️ 多级 PCIe 桥遍历（2026-11-08 修复真机找不到盘的根因）：
+       飞牛/libvirt 的虚拟机里 virtio-scsi 控制器挂在根端口 → 交换机 → 下行端口之后，
+       控制器实际在 secondary bus 4（BDF 形如 03:00.0 的桥把下游引到 bus 4）。
+       只扫 bus0 上的一级桥、取它们的 secondary 会**漏掉多级桥链** —— 早先实现正是卡在这，
+       真机「扫描总线数=2」却始终找不到 1af4:1048。
+
+       正确做法：从 bus0 起步做 BFS，每发现一条桥就把它下游的 secondary 总线入队，
+       直到没有新总线；再逐总线扫 virtio-scsi 设备。visited[] 保证不重复、不超过 ECAM 上限，
+       绝不盲扫不存在的总线（否则 external abort 被自愈吞掉 → 屏幕反复刷异常）。
+       思路同 U-Boot drivers/pci/pci-uclass.c 的 pci_get_next_bus() 递归枚举，
+       以及 Linux drivers/pci/probe.c 的 pci_scan_child_bus()。 */
+    int buses[64];
+    static int visited[256];
+    static int vs_next_bus;
+    vs_next_bus = 1;
+    for (int i = 0; i < 256; i++) visited[i] = 0;
+    int head = 0, tail = 0;
+    buses[tail++] = 0; visited[0] = 1;
+    while (head < tail) {
+        int b = buses[head++];
+        for (int d = 0; d < 32; d++) {
+            u32 v = cfg_rd(b, d, 0, PCI_VENDOR);
+            if ((v & 0xffff) == 0xffff) continue;
+            u32 cls = cfg_rd(b, d, 0, 0x08) >> 24;          /* base class: 0x06 = bridge */
+            if (cls != 0x06) continue;                       /* PCI/PCIe 桥（含 root port、switch） */
+            u32 sec = (cfg_rd(b, d, 0, 0x18) >> 8) & 0xff;   /* secondary bus number */
+            /* ⚠️ 固件没分配总线号（裸 ELF 直启 / 部分固件）时自己分配：
+               不写 secondary 桥就不转发该总线的配置周期，下游设备永远不可达。
+               已分配（UEFI 启动）则原样保留，绝不乱改。 */
+            if (!sec) {
+                sec = (u32)vs_next_bus++;
+                if (sec < 0x100)
+                    cfg_wr(b, d, 0, 0x18,
+                           ((u32)b & 0xffu) | ((u32)sec << 8) | (0xFFu << 16));  /* primary=b, secondary=sec, subordinate=0xFF */
+            }
+            if (sec >= 0x100) continue;
+            if (!visited[sec] && tail < 64) { visited[sec] = 1; buses[tail++] = (int)sec; }
+        }
     }
+    int nb = tail;
     kputs("[scsi] 扫描总线数="); kputdec((u32)nb); kputs("\n");
 
     int bus = -1, dev = -1, fn = -1;
@@ -383,17 +425,20 @@ int vs_init(void)
        但 BAR4 是 64 位 BAR —— 只写低半、高半仍留 0x40，设备实际落在 0x40_10210000，
        与我们算的地址不一致 → 访问落到无人应答的地址，触发 external abort（FAR_EL1=0x4010300010）。
        正确做法：只读固件已分配好的值，64 位 BAR 按 bit[2:1]==0b10 合并 BARn/BARn+1。 */
-    /* 优先走 legacy 接口：transitional 设备(1af4:1004)都有，且完全避开现代接口的 64 位 BAR
-       （飞牛 PCIe 虚拟机里那个 BAR 访问会 external abort）。失败才回落到现代接口。 */
+    /* 接口选择（2026-11-08 实测纠正）：QEMU 的 virtio-pci transitional 把 **legacy 接口放在
+       BAR0 的 I/O 端口 BAR**（实测 BAR0=0x1，bit0=1=IO）。AArch64 没有 x86 式 IN/OUT，端口 I/O
+       不可用 → legacy 基本走不通。旧代码曾误用 BAR1(0x10080000 内存条)当 legacy 基址，读到巧合值
+       qn=64「假成功」，命令永远超时。因此**优先走 modern 接口**（BAR4 64 位内存，落点 0x8000000000+，
+       内核 MMU 已把该高位 PCIe 窗口按 Device 映射，可直访）。仅当 BAR0 是内存 BAR 才兜底试 legacy。 */
     {
-        u32 did2 = (cfg_rd(bus, dev, fn, PCI_VENDOR) >> 16) & 0xffff;
-        int lr = vs_legacy_init(bus, dev, fn);
-        kputs("[scsi] legacy init r="); kputdec((u32)(lr < 0 ? -lr : lr));
-        kputs(" type="); kputdec(did2); kputs("\n");
-        if (lr == 0) { vs_ok = 1; goto scan; }
-        if (did2 == VIRTIO_SCSI_TRANS) {          /* transitional：现代 BAR 不可用，别去碰它 */
-            kputs("[scsi] transitional 设备且 legacy 不可用 → 放弃（不碰 64 位 BAR）\n");
-            return -9;
+        u32 bar0 = cfg_rd(bus, dev, fn, PCI_BAR0);
+        int is_mem = !(bar0 & 1u);
+        if (is_mem) {
+            int lr = vs_legacy_init(bus, dev, fn);
+            kputs("[scsi] legacy init r="); kputdec((u32)(lr < 0 ? -lr : lr)); kputs("\n");
+            if (lr == 0) { vs_ok = 1; goto scan; }
+        } else {
+            kputs("[scsi] BAR0=IO 条（legacy 不可用于 AArch64）→ 走 modern\n");
         }
     }
 

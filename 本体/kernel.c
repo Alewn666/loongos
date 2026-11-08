@@ -14,10 +14,17 @@
 #include "crypto.h" /* SHA-256 + 迭代哈希（口令校验） */
 #include "auth_cred.h" /* 默认账号凭据：盐/迭代数/预计算哈希（内核镜像零明文口令） */
 #include "usb_kbd.h"/* 阶段6①：xHCI + USB HID 键盘 */
+#include "desktop.h"/* 桌面 P1：开机默认进图形桌面 */
 
 typedef unsigned long u64;
 typedef unsigned int  u32;
 typedef unsigned char u8;
+
+/* gfx.c 绘图层：kernel.c 只用到这两个（完整接口见 gfx_draw.h，供 desktop.c） */
+extern void gfx_init(void *fb, int w, int h, int stride);
+extern int  gfx_screen_owned(void);
+/* 桌面 P2：图形终端把 uart_putc 的每一字节收进自己的历史缓冲（未启用时立即返回） */
+extern void gfxterm_putc(char c);
 
 /* ---------------- PL011 串口（QEMU virt @ 0x09000000, IRQ 33） ---------------- */
 #define UART0_BASE 0x09000000UL
@@ -28,6 +35,23 @@ typedef unsigned char u8;
 #define UART_FBRD  (*(volatile u32 *)(UART0_BASE + 0x28))
 #define UART_LCRH  (*(volatile u32 *)(UART0_BASE + 0x2C))
 #define UART_CR    (*(volatile u32 *)(UART0_BASE + 0x30))
+
+/* 2026-11-07 真机根因修复：PL011 是 MMIO 设备，GCC 会把
+   while(UART_FR & TXFF){} UART_DR = c; 循环强度削减成带写回寻址的
+   str wN, [xM], #24 —— KVM stage-2 下 ISV=0（无法解码指令），
+   直接给 guest 注入 data abort；TCG 不走这套所以一直测不出来。
+   所有 PL011 访问必须走内联汇编的固定 [x] 寻址，从根上禁止写回。
+   与 usb_kbd.c 的 rd32/wr32 是同一套方案。 */
+static __inline__ u32 io_rd32(u64 a)
+{
+    u32 v;
+    __asm__ volatile("ldr %w0, [%1]" : "=r"(v) : "r"(a) : "memory");
+    return v;
+}
+static __inline__ void io_wr32(u64 a, u32 v)
+{
+    __asm__ volatile("str %w1, [%0]" :: "r"(a), "r"(v) : "memory");
+}
 
 /* ---- 阶段6③：virtio-blk（virtio_blk.c） ---- */
 extern int  vb_init(void);
@@ -41,6 +65,14 @@ extern u64  vb_capacity_bytes(void);
 extern u64  vb_capacity_sectors(void);
 extern int  vb_read(u64 lba, void *buf, u32 nsec);
 extern int  vb_write(u64 lba, const void *buf, u32 nsec);
+/* 阶段9③：NVMe 原生磁盘驱动（参考 U-Boot drivers/nvme.c / Linux drivers/nvme/host/pci.c） */
+extern int  nv_init(void);
+extern int  nv_present(void);
+extern u64  nv_capacity_bytes(void);
+/* 阶段9③：virtio-rng 真熵源（参考 Linux drivers/char/hw_random/virtio-rng.c / U-Boot） */
+extern int  rng_init(void);
+extern int  rng_present(void);
+extern int  rng_get(void *buf, u32 len);
 extern int  fs_format_disk(u64 part_lba, u32 nblocks);
 extern int  fs_mount_disk(u64 part_lba, u32 nblocks);
 extern int  fs_is_disk(void);
@@ -454,14 +486,160 @@ static void fb_init(void)
     fb_clear_all();
 }
 
+/* ---- 桌面 P1：字库 / 控制台桥（供 gfx.c、desktop.c 调用） ----------------
+ * gfx.c 要画中英混排，但 font_cjk.h 只能在内核里有**一份**（885 字形 ≈ 32KB）。
+ * 这里只返回位图指针、不拷贝。row_bytes：ASCII = 1（8 像素/行），CJK = 2（16 像素/行）。
+ * gfx.c 的 glyph() 按 bmp[r*row_bytes + c/8] 取字节、bit(7-(c&7)) 取像素，
+ * 与 fb_draw_cp() 的画法逐位一致。 */
+int fb_query_glyph(u32 cp, const u8 **bmp, int *w, int *h, int *row_bytes)
+{
+    if (cp < 128) {
+        unsigned char ch = (unsigned char)cp;
+        if (ch < FONT_FIRST || ch >= FONT_FIRST + FONT_COUNT) ch = '?';
+        *bmp = font8x16[ch - FONT_FIRST];
+        *w = FONT_W; *h = FONT_H; *row_bytes = 1;
+        return 0;
+    }
+    const cjk_glyph *g = cjk_find(cp);
+    if (!g) return -1;                       /* 缺字：gfx.c 画成空框 */
+    *bmp = g->bmp;
+    *w = CJK_W; *h = CJK_H; *row_bytes = 2;
+    return 0;
+}
+
+/* 桌面进/出时把帧缓冲恢复成文字控制台：清屏 + 光标归位 + 丢掉半个 UTF-8 状态 */
+void fb_console_reset(void)
+{
+    if (!fb_mem) return;
+    fb_x = FB_MX; fb_y = FB_MY;
+    fb_u8need = 0; fb_u8cp = 0;
+    fb_clear_all();
+}
+
+/* ---- 桌面 P2：鼠标指针状态 / 退出桌面组合键 --------------------------------
+ * usb_kbd.c 解析出 HID 报告后调用下面两个 feed；desktop.c 每轮用 mouse_get()
+ * 取一次快照（坐标 + 按键 + 滚轮增量），取完自动清 dirty。
+ * 绝对平板的坐标是 0..32767（QEMU_INPUT_ABS_MAX），这里线性映射到屏幕。
+ *
+ * ⚠️ 坐标可以「谁最后报谁生效」，但**按钮不行**（2026-11-08 P2 实测踩到）：
+ * 真机 VM 同时挂 usb-tablet（绝对）与 usb-mouse（相对）。QEMU 的
+ * qemu_input_event_send_impl() 每个事件只发给一个 handler：ABS 只能给 tablet，
+ * BTN 则给链表里第一个含 BTN mask 的（相对鼠标）。于是「按下」由相对鼠标报
+ * btn=1，紧接着移动由 tablet 报 btn=0 —— 旧的 `G_mbtn = btn` 会把按下位冲掉，
+ * 表现为点击有反应但拖拽永远不生效（drag 恒 -1）。
+ * 修法：两个来源各存一份按钮位，合并取按位或；任一设备按住即视为按住，
+ * 只有两者都松开才清零。down/up 由 QEMU 成对发给同一设备，不会卡住。 */
+static volatile int G_mx, G_my, G_mwheel, G_mdirty;
+static volatile int G_btn_abs, G_btn_rel;   /* 绝对/相对设备各自的按钮位 */
+static volatile int G_mbtn;                  /* 合并结果 = abs | rel */
+static volatile int G_exit_req;
+
+static void mouse_clamp(int *x, int *y)
+{
+    int w = fb_w ? (int)fb_w : 800, h = fb_h ? (int)fb_h : 600;
+    if (*x < 0) *x = 0;
+    if (*y < 0) *y = 0;
+    if (*x > w - 1) *x = w - 1;
+    if (*y > h - 1) *y = h - 1;
+}
+
+void mouse_feed_rel(int dx, int dy, int btn, int wheel)
+{
+    int x = G_mx + dx, y = G_my + dy;
+    mouse_clamp(&x, &y);
+    G_mx = x; G_my = y;
+    G_btn_rel = btn & 7;
+    G_mbtn = G_btn_abs | G_btn_rel;
+    G_mwheel += wheel;
+    G_mdirty = 1;
+}
+
+void mouse_feed_abs(int ax, int ay, int btn, int wheel)
+{
+    int w = fb_w ? (int)fb_w : 800, h = fb_h ? (int)fb_h : 600;
+    int x = (int)(((long)ax * (w - 1)) / 32767);
+    int y = (int)(((long)ay * (h - 1)) / 32767);
+    mouse_clamp(&x, &y);
+    G_mx = x; G_my = y;
+    G_btn_abs = btn & 7;
+    G_mbtn = G_btn_abs | G_btn_rel;
+    G_mwheel += wheel;
+    G_mdirty = 1;
+}
+
+/* desktop.c 调用：返回 1 表示这一轮指针状态有变化 */
+int mouse_get(int *x, int *y, int *btn, int *wheel)
+{
+    if (!G_mdirty) return 0;
+    if (x) *x = G_mx;
+    if (y) *y = G_my;
+    if (btn) *btn = G_mbtn;
+    if (wheel) *wheel = G_mwheel;
+    G_mwheel = 0;
+    G_mdirty = 0;
+    return 1;
+}
+
+/* 桌面启动时把指针放到屏幕中央（无鼠标事件也有个可见光标） */
+void mouse_reset(int x, int y)
+{
+    G_mx = x; G_my = y;
+    G_btn_abs = 0; G_btn_rel = 0; G_mbtn = 0;
+    G_mwheel = 0; G_mdirty = 0;
+}
+
+/* Ctrl+Shift+F1：usb_kbd.c 在报告层识别后只置标志，不塞字符 ring */
+void desktop_hotkey_exit(void) { G_exit_req = 1; }
+int  desktop_exit_requested(void)
+{
+    int r = G_exit_req;
+    G_exit_req = 0;
+    return r;
+}
+
 /* ---------------- 串口输出（忙等轮询发，中断里也能安全用） ---------------- */
 /* 【实验记录 2026-10-25】曾试着把 PL011 分频改成 921600（IBRD=1,FBRD=40）想加速文本输出，
    实测**无效**：QEMU 的 PL011 不按分频节流（首行 396→396、shell 469 vs 339ms 反而更慢，
    属于噪声）。39us/字节是 emulation 的固有速率 → 已撤回，避免真机终端波特率不匹配。
    若以后要提速，方向是「TX 环形缓冲 + TX 中断」，让屏幕出字不被串口等待阻塞。 */
 
+/* 异常转储期间只走串口：fb_putc 滚屏会对 GOP 帧缓冲做大块 memcpy，
+   在 KVM / 非 QEMU-virt 的显存布局下容易触发嵌套 data abort，
+   表现为异常打印到 "ESR_EL1 =" 就重入、后面全空白并无限刷屏（2026-11-07 飞牛实测）。 */
+static volatile int exc_uart_only = 0;
+
+/* 2026-11-07 飞牛真机（aarch64 + KVM）诊断输出层：
+   完全不依赖栈数组、.rodata 查表、GOP 帧缓冲、控制台锁与输出重定向，
+   只做 PL011 轮询字节输出。异常现场与启动探针都走这里，
+   保证即使 C 常规输出路径本身踩到坏地址，也能把 ESR/FAR/ELR 吐出来。 */
+static volatile int exc_depth = 0;
+
+static void raw_putc(char c)
+{
+    while (io_rd32(UART0_BASE + 0x18) & FR_TXFF) { }
+    io_wr32(UART0_BASE + 0x00, (u32)c);
+}
+static void raw_str(const char *s)
+{
+    while (*s) {
+        if (*s == '\n') raw_putc('\r');
+        raw_putc(*s++);
+    }
+}
+static void raw_hex(u64 v)
+{
+    raw_putc('0'); raw_putc('x');
+    for (int i = 0; i < 16; i++) {
+        int n = (int)((v >> (60 - 4 * i)) & 0xF);
+        raw_putc((char)(n < 10 ? '0' + n : 'a' + n - 10));
+    }
+}
+
 static void uart_putc(char c)
 {
+    /* 桌面 P2：图形终端历史。放在 redir_on 判断**之前**，这样重定向到文件的
+       命令输出也能在图形终端里看到（相当于终端回显），不影响串口与落盘。 */
+    gfxterm_putc(c);
     if (redir_on) {                  /* 阶段5④：重定向期间收进缓冲，不发串口 */
         if (redir_len < (int)sizeof(redir_buf) - 1)
             redir_buf[redir_len++] = c;
@@ -476,9 +654,11 @@ static void uart_putc(char c)
     extern void spin_lock(volatile int *);
     extern void spin_unlock(volatile int *);
     if (smp_locks_on) spin_lock(&console_lock);   /* MMU 前是 Device 内存，不能用 ldaxr/stxr */
-    while (UART_FR & FR_TXFF) { }
-    UART_DR = (u32)c;
-    fb_putc(c);                      /* 同一份输出也画到 GOP 帧缓冲 */
+    while (io_rd32(UART0_BASE + 0x18) & FR_TXFF) { }
+    io_wr32(UART0_BASE + 0x00, (u32)c);
+    /* 异常转储期间、以及桌面接管屏幕期间，都不把串口日志镜像到帧缓冲：
+       前者避免嵌套 data abort，后者避免文字滚屏把桌面画面冲掉。串口照常输出。 */
+    if (!exc_uart_only && !gfx_screen_owned()) fb_putc(c);
     if (smp_locks_on) spin_unlock(&console_lock);
 }
 static void uart_puts(const char *s)
@@ -489,30 +669,35 @@ static void uart_puts(const char *s)
         uart_putc(*s++);
     }
 }
+/* 2026-11-07 真机修复：原实现在栈上构造 char buf[19] 再 uart_puts(buf)，
+   飞牛 KVM 下这一步触发 data abort（[boot] bi= 之后立刻崩），
+   异常处理器再调 uart_puthex 又崩 → 无限重入刷屏。
+   改为纯逐字符输出：不用栈缓冲、不用 .rodata 查表、不用运行时除法。 */
 static void uart_puthex(u64 v)
 {
-    char buf[19];
-    buf[0] = '0'; buf[1] = 'x';
+    uart_putc('0'); uart_putc('x');
     for (int i = 0; i < 16; i++) {
         int nib = (int)((v >> (60 - 4 * i)) & 0xF);
-        buf[2 + i] = (char)(nib < 10 ? '0' + nib : 'a' + nib - 10);
+        uart_putc((char)(nib < 10 ? '0' + nib : 'a' + nib - 10));
     }
-    buf[18] = 0;
-    uart_puts(buf);
 }
 static void uart_puthex2(u8 v)
 {
-    const char *H = "0123456789abcdef";
-    uart_putc(H[v >> 4]);
-    uart_putc(H[v & 15]);
+    int h = (int)(v >> 4), l = (int)(v & 15);
+    uart_putc((char)(h < 10 ? '0' + h : 'a' + h - 10));
+    uart_putc((char)(l < 10 ? '0' + l : 'a' + l - 10));
 }
 static void uart_putdec(u32 v)
 {
-    char buf[12];
-    int i = 0;
     if (v == 0) { uart_putc('0'); return; }
-    while (v) { buf[i++] = (char)('0' + v % 10); v /= 10; }
-    while (i) uart_putc(buf[--i]);
+    u32 p = 1000000000u;
+    int started = 0;
+    while (p) {
+        int d = 0;
+        while (v >= p) { v -= p; d++; }
+        if (d || started) { uart_putc((char)('0' + d)); started = 1; }
+        p /= 10;                 /* 常数除法：编译器用乘法逆元，不依赖 libgcc */
+    }
 }
 
 /* 后台心跳专用输出：只写串口、不画 GOP 帧缓冲。
@@ -520,8 +705,8 @@ static void uart_putdec(u32 v)
    把 shell 挤出可视区；串口侧保留（自动化测试/调试靠它判断调度活着）。 */
 static void hb_putc(char c)
 {
-    while (UART_FR & FR_TXFF) { }
-    UART_DR = (u32)c;
+    while (io_rd32(UART0_BASE + 0x18) & FR_TXFF) { }
+    io_wr32(UART0_BASE + 0x00, (u32)c);
 }
 static void hb_puts(const char *s)
 {
@@ -546,20 +731,41 @@ static void hb_puthex(u64 v)
 /* ---------------- 接收环形缓冲（中断塞字节，主循环取） ---------------- */
 #define RING_SZ 64
 static volatile char ring[RING_SZ];
+/* 来源标记（桌面 P1）：0 = UART 串口控制台，1 = USB 键盘。
+   UART 中断和 usb_kbd_poll() 都往同一个 ring 塞字节（见 kbd_feed 注释），
+   桌面循环据此只消费键盘字符；一旦队首是串口字符就退出桌面且**不消费**它，
+   把字符完整留给 shell_loop()。这样「开机默认进桌面」不会吞掉自动化回归
+   脚本从串口喂进来的任何一条命令，全套测试脚本无需改动。 */
+static volatile u8  ring_src[RING_SZ];
 static volatile u32 ring_head = 0, ring_tail = 0;
 
-static void ring_push(char c)
+static void ring_push(char c, u8 src)
 {
     u32 next = (ring_head + 1) % RING_SZ;
     if (next == ring_tail)
         return;                       /* 满则丢弃，简单粗暴 */
     ring[ring_head] = c;
+    ring_src[ring_head] = src;
     ring_head = next;
 }
 static int ring_pop(char *out)
 {
     if (ring_tail == ring_head)
         return 0;
+    *out = ring[ring_tail];
+    ring_tail = (ring_tail + 1) % RING_SZ;
+    return 1;
+}
+
+/* ---- 桌面 P1：输入分流桥（供 desktop.c 调用） ----
+   peek 只看不取：队首是串口字符时桌面立即让位，字符原样留给 shell。 */
+int desktop_ring_peek_uart(void)
+{
+    return (ring_tail != ring_head) && (ring_src[ring_tail] == 0);
+}
+int desktop_ring_pop_kbd(char *out)
+{
+    if (ring_tail == ring_head || ring_src[ring_tail] != 1) return 0;
     *out = ring[ring_tail];
     ring_tail = (ring_tail + 1) % RING_SZ;
     return 1;
@@ -573,7 +779,7 @@ void kbd_feed(char c)
     u64 daif;
     __asm__ volatile("mrs %0, daif" : "=r"(daif));
     __asm__ volatile("msr daifset, #2");      /* 关 IRQ */
-    ring_push(c);
+    ring_push(c, 1);                          /* 1 = USB 键盘 */
     __asm__ volatile("msr daif, %0" :: "r"(daif));
 }
 void kputs(const char *s)  { uart_puts(s); }
@@ -620,7 +826,7 @@ static void gic_init(void)
         GICC_CTLR = 1;                               /* 开 CPU 接口 */
     }
 
-    UART_IMSC = IMSC_RXIM;                           /* 只开 RX 掩码（赋值，勿 |=） */
+    io_wr32(UART0_BASE + 0x38, IMSC_RXIM);          /* 只开 RX 掩码（赋值，勿 |=） */
     __asm__ volatile("msr daifclr, #2");             /* 开 CPU 中断（IRQ） */
 }
 
@@ -666,18 +872,17 @@ static void gic_init(void)
 #define PROT_DEV_BLK  (PROT_DEV  & ~PTE_TABLE)
 #define PROT_RAM_BLK  (PROT_RAM  & ~PTE_TABLE)
 
-/* —— 阶段5②：用户程序区（内核 2MB 区的顶部 0x401C0000-0x401FFFFF，恒等映射） ——
-   放内核 2MB 区里是因为 l3_kern 只细分这一块，用户页直接复用 fill_l3；
-   起点必须在 __bss_end 之后（fs_disk 内存盘 1MB 就在 bss 里，起点放 0x40100000 撞过；
-   2026-10-24 加 CJK 字库后 __bss_end 涨到 0x401C1010，把 USER_BASE 从 0x401C0000
-   提到 0x401D0000 才腾出空间——加字库/大数组后要重新看 __bss_end！
-   2026-10-30 加网卡驱动 + 网络栈后 __bss_end 涨到 0x401E6400，USER_BASE 提到 0x401F0000），
-   下面 mmu_init 有断言兜底；镜像再长就把 USER_BASE 往上挪（上限 0x40200000）。
+/* —— 阶段5②：用户程序区（0x40210000-0x403FFFFF，恒等映射） ——
+   历史：起点几次上移都是因为 .bss 变胖（字库/网络栈），见 docs/检查与修复记录.md。
+   2026-11-08：NVMe 驱动需要 5 个 4KB 页对齐的队列/DMA 页（共 20KB 连续对齐区），
+   而 0x40200000 处只剩 4080B 余量，放不下 → USER_BASE 再上移 64KB 到 0x40210000，
+   给内核 .bss 让出 0x40200000-0x4020FFFF；用户区仍有约 1.94MB，ELF 与 fork 都够用。
+   ⚠️ 副作用：内核 .bss 会跨过 0x40200000 这个 2MB 块边界，因此 fill_pt 改为
+   「按地址属于哪个 2MB 块」选 l3_kern / l3_user，不再按 USER_BASE 判断（见下）。
    代码段=EL0 可执行可读（PXN，EL1 不执行用户代码）；data/栈=EL0 可读写（UXN） */
-#define USER_BASE 0x40200000UL       /* 2026-10-30：用户区独立成 0x40200000-0x403FFFFF 的整个 2MB 块，
-                                        有自己的 L3（l3_user），不再跟内核抢那个 2MB 块的顶部 64KB。
-                                        这是给 fork/exec 做地址空间的地基：以后每个进程换自己的 L3 即可。
-                                        内核 __bss_end 只增不减，永远别再让它顶到 USER_BASE 上。 */
+#define USER_BASE 0x40210000UL       /* 用户区 0x40210000-0x403FFFFF，独立 L3（l3_user）。
+                                        内核 .bss 可延伸到 0x40200000 起的那几页（PROT_RAM，EL1 专用），
+                                        用户区权限只从 USER_BASE 起覆盖，互不干扰。 */
 #define USER_END  0x40400000UL
 #define EL0_STACK_RESERVE 4096UL  /* 用户段不得进入的顶部保留区：EL0 栈从 USER_END 向下用这么多 */
 /* 参数区：栈保留区下面一块，内核装载时写好 argc/argv/字符串，用户程序按固定 VA 读 */
@@ -691,6 +896,7 @@ extern u64 __text_start[], __text_end[];
 extern u64 __el0text_start[], __el0text_end[];
 extern u64 __rodata_start[], __rodata_end[];
 extern u64 __data_start[], __bss_end[];
+extern u64 __nvmedma_start[], __nvmedma_end[];   /* NVMe DMA 区（linker.ld 的 .nvmedma 段，排在栈之后） */
 extern u64 _stack_top[];
 
 /* 页表（4KB 对齐，放在 .bss 里，随内核一起被映射为 RW） */
@@ -699,7 +905,8 @@ __attribute__((aligned(4096))) static u64 l1_table[512];  /* 管 512×1GB */
 __attribute__((aligned(4096))) static u64 l2_dev[512];    /* 第0个GB：设备 */
 __attribute__((aligned(4096))) static u64 l2_ram[512];    /* 第1个GB：RAM 0x40000000+ */
 __attribute__((aligned(4096))) static u64 l3_kern[512];   /* 内核所在 2MB：细分成 4KB 页 */
-__attribute__((aligned(4096))) static u64 l3_user[512];   /* 用户区 0x40200000-0x403FFFFF 的 L3（fork 时整页复制这个表就换地址空间） */
+__attribute__((aligned(4096))) static u64 l3_user[512];   /* 第二个 2MB 块(0x40200000-0x403FFFFF)的 L3：低 16 页给内核 .bss/栈(PROT_RAM)，
+                                                            其余给用户区(0x40210000 起，PROT_USERRW)。整表复制即换地址空间 */
 __attribute__((aligned(4096))) static u64 l2_pcie_hi[512];/* 第257个GB：PCIe ECAM(0x4010000000) */
 __attribute__((aligned(4096))) static u64 l1_hi[512];     /* 阶段6②：64 位 MMIO 窗口（L0[1] → 0x8000000000 起 256GB） */
 
@@ -712,14 +919,23 @@ __attribute__((aligned(4096))) static u8 el0_stack[4096];
 /* 把 [start,end) 的 4KB 页填进 L3（VA=PA 恒等）
    ⚠️ 起止必须各自对齐到页：__data_start 之类是 0x...4c0 这种值，
    直接 `a | prot` 会把 PA 低 12 位拼进描述符 → AP 位被污染成只读 → MMU 一开全线写故障 */
-/* 按地址落到对应的 L3：内核 2MB 块用 l3_kern，用户 2MB 块用 l3_user */
+/* 按「物理落在哪个 2MB 块」选 L3 表（与 USER_BASE 无关！）：
+     l2_ram[0] -> l3_kern  管 0x40000000-0x401FFFFF
+     l2_ram[1] -> l3_user  管 0x40200000-0x403FFFFF
+   ⚠️ 2026-11-08：为给 NVMe 队列腾 4KB 对齐空间，内核 .bss 已跨过 0x40200000 延伸进
+   第二个 2MB 块（低 16 页）。那段是内核镜像，由 fill_pt(__data_start,__bss_end,PROT_RAM)
+   映射成 EL1 专用；用户区权限另由 fill_pt(USER_BASE,USER_END,PROT_USERRW) 只覆盖
+   0x40210000 起，两者页索引不重叠。若仍按 USER_BASE 分界，0x40200000 那段会被错写进
+   l3_kern（索引回绕覆盖 0x40000xxx 的映射）→ 开机即 data abort。 */
 static void fill_pt(u64 start, u64 end, u64 prot)
 {
     start &= ~(SZ_4K - 1);
     end = (end + SZ_4K - 1) & ~(SZ_4K - 1);
     for (u64 a = start; a < end; a += SZ_4K) {
-        if (a >= USER_BASE && a < USER_END) l3_user[(a & (SZ_2M - 1)) >> 12] = a | prot;
-        else                                l3_kern[(a & (SZ_2M - 1)) >> 12] = a | prot;
+        if (a >= 0x40200000UL && a < 0x40400000UL)
+            l3_user[(a & (SZ_2M - 1)) >> 12] = a | prot;
+        else
+            l3_kern[(a & (SZ_2M - 1)) >> 12] = a | prot;
     }
 }
 
@@ -790,6 +1006,10 @@ static void mmu_init(void)
     fill_pt((u64)__el0text_start,  (u64)__el0text_end,  PROT_EL0TX);
     fill_pt((u64)__rodata_start,   (u64)__rodata_end,   PROT_RODATA);
     fill_pt((u64)__data_start,     (u64)__bss_end,      PROT_RAM);
+    /* NVMe DMA 区（linker.ld 的 .nvmedma 段，在 .bss/内核栈之后）
+     * ⚠️ 这段不在 [__data_start,__bss_end) 里，必须单独映射，否则 DMA 缓冲
+     *    访问时 page fault。段内全是内核私有数据 → PROT_RAM（EL1 可读写）。 */
+    fill_pt((u64)__nvmedma_start,   (u64)__nvmedma_end,  PROT_RAM);
     /* --- 帧缓冲：按 2MB 块补映射（Device 属性；内核所在的首块跳过） --- */
     if (g_bi && g_bi->magic == BOOTINFO_MAGIC && g_bi->base && g_bi->size) {
         u64 s0 = g_bi->base & ~(SZ_2M - 1);
@@ -811,8 +1031,11 @@ static void mmu_init(void)
             PTE_AP_KRW_URW | PTE_PXN | PTE_UXN | PTE_ATTR_NORM);
 
     /* 阶段5②：用户程序区整段先给 EL0 可读写（loader 再把代码段改成可执行）。
-       顺手断言内核镜像没长进用户区——静态数组一多最容易撞上 */
-    if ((u64)__bss_end > USER_BASE) {
+       顺手断言内核镜像没长进用户区——静态数组一多最容易撞上。
+       ⚠️ 2026-11-08：判据从 __bss_end 改成 __nvmedma_end —— NVMe 的 DMA 区
+          (.nvmedma 段) 排在 .bss 和内核栈**之后**，是内核占用的真实上界，
+          只看 __bss_end 会漏掉它。 */
+    if ((u64)__nvmedma_end > USER_BASE) {
         uart_puts("[!!!] 内核镜像撞进用户区 USER_BASE="); uart_puthex(USER_BASE); uart_puts("，停机\n");
         for (;;)
             __asm__ volatile("wfe");
@@ -963,8 +1186,8 @@ struct regs *handle_irq(struct regs *f)
     if (id == 1023)                    /* 伪中断 */
         return f;
     if (id == UART0_IRQ) {
-        while (!(UART_FR & FR_RXFE))   /* 把串口 FIFO 里积压的全收走 */
-            ring_push((char)(UART_DR & 0xFF));
+        while (!(io_rd32(UART0_BASE + 0x18) & FR_RXFE))   /* 把串口 FIFO 里积压的全收走 */
+            ring_push((char)(io_rd32(UART0_BASE + 0x00) & 0xFF), 0);  /* 0 = 串口控制台 */
     } else if (id == TIMER_IRQ) {
         timer_rearm();                 /* 重装计数 = 清挂起 */
         tick++;
@@ -1381,26 +1604,78 @@ void handle_sync(struct regs *f)
         return;
     }
 
+    /* 连续同址异常熔断：防止「自愈 → 再踩 → 再打印」把屏幕刷爆 */
+    static u64 last_far = 0, last_elr = 0;
+    static u32 repeat = 0;
+    if (f->far == last_far && f->elr == last_elr) repeat++;
+    else { last_far = f->far; last_elr = f->elr; repeat = 0; }
+    if (repeat >= 6) {
+        uart_puts("\n[熔断] 同一地址连续 6 次异常，停止自愈以免刷屏\n");
+        for (;;) __asm__ volatile("wfe");
+    }
+
+    /* 防重入：异常处理期间再次异常（例如转储本身踩到坏地址）时，
+       用最小输出层打印现场并停机，杜绝「自愈→再踩→再打印」无限刷屏。 */
+    if (exc_depth) {
+        raw_str("\n[嵌套异常] 异常处理器重入，停机保留现场\n  ESR=");
+        raw_hex(f->esr); raw_str(" FAR="); raw_hex(f->far);
+        raw_str(" ELR="); raw_hex(f->elr);
+        raw_str(" EC=");  raw_hex(ec); raw_str("\n");
+        for (;;) __asm__ volatile("wfe");
+    }
+    exc_depth = 1;
+
+    /* 先用最小输出层把原始现场打出来：后续转储若再踩坏地址也不丢信息 */
+    raw_str("[fault] ESR="); raw_hex(f->esr);
+    raw_str(" FAR=");        raw_hex(f->far);
+    raw_str(" ELR=");        raw_hex(f->elr);
+    raw_str(" EC=");         raw_hex(ec);
+    raw_str(" ISV=");        raw_putc((char)('0' + (int)((f->esr >> 24) & 1)));
+    raw_str("\n");
+
+    /* 转储只走串口，避开 GOP 帧缓冲滚屏引发的嵌套中止 */
+    exc_uart_only = 1;
+
     uart_puts("\n\n*** 内核异常: ");
     uart_puts(ec_name(ec));
     if (ec == 0x20 || ec == 0x24)          /* 0x20/0x24 = 低 EL 来的取指/数据中止 */
         uart_puts(" [来自 EL0]");
     uart_puts(" ***\n");
     uart_puts("ESR_EL1 = "); uart_puthex(f->esr);
-    uart_puts("  (EC=0x");  uart_puthex(ec); uart_puts(")\n");
+    uart_puts("  (EC=0x");  uart_puthex2((u8)ec); uart_puts(")\n");
+    uart_puts("  ISV="); uart_putc((char)('0' + (int)((f->esr >> 24) & 1)));
+    if ((f->esr >> 24) & 1) uart_puts(" (指令信息可用)\n");
+    else                     uart_puts(" (NISV: 无指令信息, KVM stage-2 常见)\n");
     uart_puts("FAR_EL1 = "); uart_puthex(f->far);
     uart_puts("   ELR_EL1 = "); uart_puthex(f->elr);
     uart_puts("   SPSR = "); uart_puthex(f->spsr); uart_puts("\n");
 
     uart_puts("现场寄存器:\n");
     for (int i = 0; i < 30; i += 2) {
-        uart_puts("  x"); uart_puthex(i);   uart_puts("="); uart_puthex(f->x[i]);
-        uart_puts("  x"); uart_puthex(i+1); uart_puts("="); uart_puthex(f->x[i+1]);
+        uart_puts("  x"); uart_putdec((u32)i);   uart_puts("="); uart_puthex(f->x[i]);
+        uart_puts("  x"); uart_putdec((u32)(i+1)); uart_puts("="); uart_puthex(f->x[i+1]);
         uart_puts("\n");
     }
     uart_puts("  x30="); uart_puthex(f->x[30]); uart_puts("\n");
 
-    if (ec == 0x00 || ec == 0x24 || ec == 0x25 || ec == 0x3C) {
+    exc_uart_only = 0;   /* 转储结束，恢复图形输出（停机分支不返回） */
+    exc_depth = 0;       /* 允许下一次异常正常转储 */
+
+    /* ISV=0 的 NISV 中止：ESR 解不出肇事指令，ELR+4 是盲跳，
+       正是 KVM 上「打印→自愈→再踩」刷屏的根源 → 停机保留现场。
+       ⚠️ 例外（2026-11-08）：.el0text 里的 EL0 演示有一条**故意**的
+       `ldr x2, [x2]`（读 0x40080000 内核 text）用来演示「异常→自愈→继续」。
+       在 TCG 下它同样报 ISV=0 / EC=0x24，但肇事指令是段内固定的 4 字节指令，
+       ELR+4 是精确跳过、不是盲跳，应当允许自愈；否则一敲 `el0` 整个内核就停机。
+       判据取得极窄：**只有 ELR 落在 .el0text 段内才豁免**。
+         - KVM 真正的 NISV(MMIO 后索引) 来自 EL1 内核 .text → 仍停机；
+         - 用户程序跑飞在更前面的 user_running 分支已被「杀掉回 shell」，走不到这；
+         - 其余 ISV=0 中止行为完全不变。 */
+    int in_el0_text = (f->elr >= (u64)__el0text_start && f->elr < (u64)__el0text_end);
+    if (!in_el0_text && ((f->esr >> 24) & 1) == 0 && (ec == 0x24 || ec == 0x25)) {
+        uart_puts("[停机] NISV/stage-2 数据中止：不能 ELR+4 盲跳，停机保留现场\n");
+        for (;;) __asm__ volatile("wfe");
+    } else if (ec == 0x00 || ec == 0x24 || ec == 0x25 || ec == 0x3C) {
         f->elr += 4;                      /* 肇事指令都是 4 字节，跳过它 */
         uart_puts("[自愈] ELR+4 跳过肇事指令，继续活着\n> ");
     } else {
@@ -1691,6 +1966,7 @@ static void cmd_stat(char *a);
 static void cmd_wc(char *a);
 static void cmd_grep(char *a);
 static void cmd_head(char *a);
+static void cmd_desktop(char *a);
 
 struct cmdent { const char *name; void (*fn)(char *); };
 /* ================= kernel bench：内核态微基准 =================
@@ -1760,9 +2036,12 @@ static void cmd_bench(char *args)
 static void cmd_disks(char *a)
 {
     (void)a;
-    if (!vb_present()) { uart_puts("没有 virtio-blk 磁盘\n"); return; }
+    if (!vb_present()) { uart_puts("没有可用磁盘（virtio-blk / virtio-scsi / nvme 都未识别）\n"); return; }
+    const char *bk = "virtio-blk";
+    if (vs_present()) bk = "virtio-scsi";
+    if (nv_present()) bk = "nvme";
     u64 mb = vb_capacity_bytes() / (1024 * 1024);
-    uart_puts("磁盘 0: "); uart_putdec((u32)mb); uart_puts(" MB, ");
+    uart_puts("磁盘 0 ("); uart_puts(bk); uart_puts("): "); uart_putdec((u32)mb); uart_puts(" MB, ");
     uart_putdec((u32)vb_capacity_bytes()); uart_puts(" 字节\n");
     u8 sec[512];
     if (vb_read(0, sec, 1) == 0) {
@@ -1883,6 +2162,26 @@ static void cmd_scsi(char *a)
     uart_puts("[scsi] reinit rc="); uart_putdec((u32)(r < 0 ? -r : r));
     uart_puts(" present="); uart_putdec((u32)vs_present());
     if (vs_present()) { uart_puts(" MB="); uart_putdec((u32)(vs_capacity_bytes() / (1024 * 1024))); }
+    uart_puts("\n");
+}
+
+/* ---- 阶段9③：virtio-rng 真熵源演示（取 N 字节随机并打印 hex） ---- */
+static void cmd_rng(char *a)
+{
+    u32 n = 32;
+    if (a) {
+        char *w = next_word(&a);
+        if (w) n = 0;
+        while (w && *w >= '0' && *w <= '9') { n = n * 10 + (u32)(*w - '0'); w++; }
+    }
+    if (n < 1) n = 1;
+    if (n > 256) n = 256;
+    if (!rng_present()) { uart_puts("[rng] 未就绪（内核没有 virtio-rng 设备）\n"); return; }
+    u8 buf[256];
+    int got = rng_get(buf, n);
+    if (got < 0) { uart_puts("[rng] 取熵失败("); uart_putdec((u32)(-got)); uart_puts(")\n"); return; }
+    uart_puts("[rng] 取熵 "); uart_putdec((u32)got); uart_puts(" 字节: ");
+    for (int i = 0; i < got; i++) uart_puthex2(buf[i]);
     uart_puts("\n");
 }
 
@@ -2007,6 +2306,9 @@ cnt_done:
     net_ping(ip, cnt);
 }
 
+/* 桌面 P1/P2：开机默认进桌面；从终端敲 desktop 可再次进入（Ctrl+Shift+F1 返回终端）。 */
+static void cmd_desktop(char *a) { (void)a; desktop_run(); }
+
 static const struct cmdent CMDS[] = {
     { "ls",    cmd_ls    }, { "cat",   cmd_cat   }, { "write", cmd_write },
     { "mkdir", cmd_mkdir }, { "rm",    cmd_rm    }, { "df",    cmd_df    },
@@ -2014,10 +2316,11 @@ static const struct cmdent CMDS[] = {
     { "cd",    cmd_cd    }, { "pwd",  cmd_pwd   },
     { "crash", cmd_crash }, { "mmu",   cmd_mmu   }, { "tasks", cmd_tasks },
     { "el0",   cmd_el0   }, { "help",  cmd_help  }, { "bench", cmd_bench },
-    { "disks", cmd_disks }, { "disktest", cmd_disktest }, { "install", cmd_install }, { "scsi", cmd_scsi },
+    { "disks", cmd_disks }, { "disktest", cmd_disktest }, { "install", cmd_install }, { "scsi", cmd_scsi }, { "rng", cmd_rng },
     { "net", cmd_net }, { "ifconfig", cmd_ifconfig }, { "ping", cmd_ping }, { "tcp", cmd_tcp }, { "cpu", cmd_cpu },
     { "touch", cmd_touch }, { "mv", cmd_mv }, { "stat", cmd_stat },
     { "wc", cmd_wc }, { "grep", cmd_grep }, { "head", cmd_head },
+    { "desktop", cmd_desktop },
     { 0, 0 }
 };
 
@@ -2181,7 +2484,9 @@ static void dispatch(char *s)
      右段：cat / wc / grep / head / write 从 stdin_buf 消费，可再接 > 写文件。
    明确边界（写进 help，不偷偷做半套）：只支持单级；左段不能带 > / <；
    左段若是 run/crash 这类不返回的命令，管道不成立。 */
-static void dispatch_line(char *s)
+/* 桌面 P2：改成非 static 导出，图形终端（gfxterm.c）也走同一个分发入口，
+   于是 help / ls / net / install yes / 管道 / 重定向等全部命令都能在图形界面里跑。 */
+void shell_dispatch_line(char *s)
 {
     char *bar = 0;
     for (char *p = s; *p; p++) if (*p == '|') { bar = p; break; }
@@ -2232,7 +2537,7 @@ static void on_char(char c)
         uart_puts("\n");
         line[linelen] = 0;
         linelen = 0;
-        dispatch_line(line);
+        shell_dispatch_line(line);
         uart_puts("> ");
         return;
     }
@@ -2630,6 +2935,7 @@ static void cmd_help(char *a)
         "  crash udf|brk|abort|wronly   崩溃演示（都会转储+自愈）\n"
         "  bench                内核微基准（内存/帧缓冲性能）\n"
         "  disks | disktest     看 virtio 磁盘 / 读写自测（写盘尾 8 扇区）\n"
+        "  scsi | rng [N]       看 virtio-scsi / 取 N 字节真随机熵（默认 32）\n"
         "  install yes          把系统装到硬盘（会清空整块盘！需从 ISO 启动）\n"
         "  net | net dhcp       初始化网卡 / 走 DHCP 拿 IP\n"
         "  net static <ip> [掩码] [网关]   手配 IP\n"
@@ -2637,6 +2943,7 @@ static void cmd_help(char *a)
         "  ping <ip> [1-10]     ICMP ping（带 RTT）\n"
         "  tcp get <ip> <端口>  建 TCP 连接并读最多 3 秒（80 自动发 GET）\n"
         "  cpu                  看多核：哪几颗在线 / 计数是否在涨\n"
+        "  desktop             进图形桌面（开机默认；Ctrl+Shift+F1 返回终端）\n"
         "  help                 本清单\n");
 }
 
@@ -2662,12 +2969,20 @@ static void __attribute__((noinline)) el1_landing(void)
        redir_finish 幂等：没开闸（redir_len<0）时直接返回。fault 路径也走这里，一并覆盖。 */
     redir_finish();
     uart_puts("[el1] 已从 EL0 撤回内核，shell 继续\n> ");
+    /* 桌面 P2：图形终端里跑 run / el0 / crash 这类「不按原路返回」的命令后，
+       不能掉回纯串口 shell —— 否则桌面凭空消失。桌面仍接管屏幕时重新进入，
+       desktop_run() 内部状态（G_inited）保留，退出后自然回到下面的 shell_loop。 */
+    if (gfx_screen_owned()) {
+        extern void desktop_run(void);
+        desktop_run();
+    }
     shell_loop();
 }
 
 void kernel_main(unsigned long bootinfo)
 {
     g_bi = (struct bootinfo *)bootinfo;   /* stub 通过 x0 传进来 */
+    raw_str("[probe] A pl011 ok\n");
     /* B4：裸 ELF 启动 x0=0 时，通过 QEMU fw_cfg 自建 ramfb 显示底座 */
     if (!g_bi || g_bi->magic != BOOTINFO_MAGIC) {
         if (fwc_ramfb_setup() == 0) {
@@ -2676,7 +2991,10 @@ void kernel_main(unsigned long bootinfo)
         }
     }
     fb_init();                            /* 有 GOP/ramfb 就把字也画到屏幕上 */
+    raw_str("[probe] B fb_init ok\n");
+    raw_str("[probe] C raw_hex="); raw_hex((u64)bootinfo); raw_str("\n");
     uart_puts("[boot] bi="); uart_puthex((u64)bootinfo);
+    raw_str("\n[probe] D uart_puthex ok\n");
     if (g_bi) {
         uart_puts(" magic="); uart_puthex(g_bi->magic);
         uart_puts(" base="); uart_puthex(g_bi->base);
@@ -2750,21 +3068,30 @@ void kernel_main(unsigned long bootinfo)
     /* ---- 阶段6③：先看有没有装好的磁盘系统，有就挂它，没有就用内存盘 ---- */
     int fs_ready = 0;
     int disk_ok = (vb_init() == 0);
+    const char *disk_kind = "virtio-blk";
     if (disk_ok) {
         uart_puts("[disk] virtio-blk 就绪，容量 ");
     } else {
         int rs = vs_init();
         if (rs == 0) {
-            disk_ok = 1;                   /* 虚拟机把盘挂在 scsi 总线上 → 用 virtio-scsi */
+            disk_ok = 1; disk_kind = "virtio-scsi";   /* 虚拟机把盘挂在 scsi 总线上 → virtio-scsi */
             uart_puts("[disk] virtio-scsi 就绪，容量 ");
         } else {
-            uart_puts("[disk] virtio-scsi 初始化失败(r=");
-            uart_putdec((u32)(-rs)); uart_puts(")\n");
+            int rn = nv_init();
+            if (rn == 0) {
+                disk_ok = 1; disk_kind = "nvme";      /* 原生 NVMe 控制器（class=0x010802） */
+                uart_puts("[disk] nvme 就绪，容量 ");
+            } else {
+                uart_puts("[disk] 磁盘初始化失败（scsi r=");
+                uart_putdec((u32)(-rs));
+                uart_puts(" nvme r="); uart_putdec((u32)(-rn));
+                uart_puts("）→ 内存盘\n");
+            }
         }
     }
     if (disk_ok) {
         uart_putdec((u32)(vb_capacity_bytes() / (1024 * 1024)));
-        uart_puts(" MB\n");
+        uart_puts(" MB ("); uart_puts(disk_kind); uart_puts(")\n");
         static u8 mbr[512];
         if (vb_read(0, mbr, 1) == 0 && mbr[510] == 0x55 && mbr[511] == 0xAA) {
             for (int i = 0; i < 4; i++) {
@@ -2821,6 +3148,9 @@ void kernel_main(unsigned long bootinfo)
     uart_puts(" lookup(/etc/hostname)="); uart_puthex((u64)(u32)fs_lookup("/etc/hostname"));
     uart_puts("\n");
 
+    /* 阶段9③：virtio-rng 真熵源（失败只是没熵，不影响启动，打印一行即可） */
+    rng_init();
+
     /* 阶段5：身份三件套（passwd/shadow/demo 家目录），开机即 root */
     fs_setuid(0);
     auth_init();
@@ -2850,5 +3180,13 @@ void kernel_main(unsigned long bootinfo)
 #ifdef BENCH_AT_BOOT
     cmd_bench(0);                 /* 测量构建：开机自动跑一遍基准，不依赖键盘输入 */
 #endif
+    /* 桌面 P1/P2：开机默认直接进图形桌面。
+       先把当前帧缓冲参数交给绘图层；串口 shell 仍是调试/回归通道 —— 桌面期间
+       只要串口有输入就自动让位（字符不丢，见 desktop.c）；键盘主动退出只有
+       Ctrl+Shift+F1（P2 按用户要求取消 Q / Esc）。 */
+    if (fb_mem)
+        gfx_init((void *)fb_mem, (int)fb_w, (int)fb_h, (int)fb_stride);
+    desktop_run();
+    uart_puts("> ");
     shell_loop();
 }

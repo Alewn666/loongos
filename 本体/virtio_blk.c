@@ -105,9 +105,17 @@ extern u64 vs_capacity_bytes(void);
 extern int vs_read(u64 lba, void *buf, u32 nsec);
 extern int vs_write(u64 lba, const void *buf, u32 nsec);
 
+/* 阶段9③：NVMe 原生磁盘驱动（参考 U-Boot drivers/nvme.c / Linux nvme/host/pci.c） */
+extern int  nv_init(void);
+extern int  nv_present(void);
+extern u64  nv_capacity_bytes(void);
+extern int  nv_read(u64 lba, void *buf, u32 nsec);
+extern int  nv_write(u64 lba, const void *buf, u32 nsec);
+
 extern int vbl_init(void);
 extern int vbl_request(u32 type, u64 lba, void *buf, u32 nsec, int dev_writes);
 extern u64 vbl_capacity_bytes(void);
+extern void pci_enum(void);         /* 通用 PCI 枚举（裸机自举分配总线号/BAR/桥窗口） */
 static int vb_use_legacy;
 static int  vb_ok;
 static u64  vb_common, vb_notify, vb_isr, vb_devcfg;
@@ -181,9 +189,10 @@ static u64 bar_assign(int b, int d, int f, int idx, u32 want)
 /* ---------------- 初始化 ---------------- */
 static int vb_init_modern(void)
 {
+    pci_enum();                     /* 确保总线号/BAR/桥窗口就绪（固件没配则自举分配） */
     vb_ok = 0;
     int bus = -1, dev = -1, fn = -1;
-    for (int b = 0; b < 8 && bus < 0; b++)
+    for (int b = 0; b < 64 && bus < 0; b++)
         for (int d = 0; d < 32 && bus < 0; d++)
             for (int f = 0; f < 8; f++) {
                 u32 id = cfg_rd(b, d, f, PCI_VENDOR);
@@ -308,7 +317,7 @@ static int vb_init_modern(void)
     return 0;
 }
 
-int  vb_present(void)   { return vb_ok || vs_present(); }
+int  vb_present(void)   { return vb_ok || vs_present() || nv_present(); }
 /* 先试 modern，失败自动回退 legacy（QEMU/libvirt 给的 transitional 设备两种接口都可能有） */
 int vb_init(void)
 {
@@ -328,10 +337,20 @@ int vb_init(void)
 
 
 int  vb_modern_only(void) { return 0; }
-u64  vb_capacity_sectors(void) { return vb_ok ? vb_cap_sec : (vs_capacity_bytes() / 512ull); }
+u64  vb_capacity_sectors(void)
+{
+    if (vb_ok) return vb_cap_sec;
+    if (vs_present()) return vs_capacity_bytes() / 512ull;
+    if (nv_present()) return nv_capacity_bytes() / 512ull;
+    return 0;
+}
 u64  vb_capacity_bytes(void)
 {
-    if (!vb_ok) return vs_present() ? vs_capacity_bytes() : 0;
+    if (!vb_ok) {
+        if (vs_present()) return vs_capacity_bytes();
+        if (nv_present()) return nv_capacity_bytes();
+        return 0;
+    }
     return vb_use_legacy ? vbl_capacity_bytes() : vb_cap_sec * 512ull;
 }
 
@@ -381,7 +400,11 @@ static int vb_request(u32 type, u64 lba, void *buf, u32 nsec, int dev_writes)
 
 int vb_read(u64 lba, void *buf, u32 nsec)
 {
-    if (!vb_ok) return vs_present() ? vs_read(lba, buf, nsec) : -1;
+    if (!vb_ok) {
+        if (vs_present()) return vs_read(lba, buf, nsec);
+        if (nv_present()) return nv_read(lba, buf, nsec);
+        return -1;
+    }
     u32 done = 0;
     while (done < nsec) {
         u32 chunk = (nsec - done > 8) ? 8 : (nsec - done);
@@ -397,7 +420,11 @@ int vb_read(u64 lba, void *buf, u32 nsec)
 
 int vb_write(u64 lba, const void *buf, u32 nsec)
 {
-    if (!vb_ok) return vs_present() ? vs_write(lba, buf, nsec) : -1;
+    if (!vb_ok) {
+        if (vs_present()) return vs_write(lba, buf, nsec);
+        if (nv_present()) return nv_write(lba, buf, nsec);
+        return -1;
+    }
     u32 done = 0;
     while (done < nsec) {
         u32 chunk = (nsec - done > 8) ? 8 : (nsec - done);

@@ -1,18 +1,19 @@
-/* LoongOS 阶段6① —— xHCI 主机控制器 + USB HID boot 键盘驱动
+/* LoongOS 阶段6① / 桌面 P2 —— xHCI 主机控制器 + USB HID 键盘/鼠标/平板
  *
- * 目标：飞牛虚拟机（ramfb 屏幕 + qemu-xhci + usb-kbd）里能直接用键盘打字，
- *       字符塞进 kernel.c 的 ring 环形缓冲，shell 一行都不用改。
+ * P2 目标（2026-11-08）：桌面要能用鼠标，且真机飞牛 VM 的拓扑是
+ *   qemu-xhci 一个控制器 + 三个设备（usb-tablet / usb-mouse / usb-kbd，端口 1/2/3）。
+ *   xHCI 一个 slot 只能绑定一个设备，所以本轮把「单 slot 单键盘」改成「多 slot 多设备」：
+ *     - 每个设备独立的设备上下文 / EP0 环 / 中断端点环 / 报告缓冲；
+ *     - 配置描述符按 QEMU 8.2.2 hw/usb/dev-hid.c 的实际字段识别三类接口；
+ *     - 键盘 → kbd_feed(ASCII)，鼠标/平板 → kernel 的 mouse_feed_*；
+ *     - Ctrl+Shift+F1 在报告层识别，直接请求桌面退出（F1 没有 ASCII）。
  *
- * 现实约束（写之前先看清楚）：
- *   - 内核无分配器：所有 DMA 结构用静态 64B 对齐数组（.bss，恒等映射 VA=PA）
- *   - 无 MSI-X：完全轮询事件环，不开 INE/IE；10Hz 定时器唤醒 wfi 时顺带 poll
- *   - 不依赖设备树：QEMU virt 的内存映射写死（ECAM 0x3f000000 等），与 GIC/UART 同款做法
- *   - DMA 一致性：QEMU TCG/KVM 的设备 DMA 与 guest CPU 在同一 host 一致性域，
- *     无需 cache 维护（真机 raspi3b 才需要 dc civac，届时再补）
+ * 原有约束不变：无分配器（静态 64B 对齐 DMA）、无 MSI-X（纯轮询）、
+ * 不依赖设备树、MMIO 一律走 rd32/wr32 内联汇编（KVM NISV 坑，见下方注释）。
  *
- * 参考：xHCI 1.1 规范 + Linux drivers/usb/host/xhci.h + QEMU hw/usb/hcd-xhci.c（逐字段核对过）
+ * 参考：xHCI 1.1 规范 / Linux drivers/usb/host/xhci.h /
+ *       QEMU 8.2.2 hw/usb/hcd-xhci.c + hw/usb/dev-hid.c + hw/input/hid.c
  */
-#include "usb_kbd.h"
 
 typedef unsigned long  u64;
 typedef unsigned int   u32;
@@ -24,6 +25,12 @@ extern void kputs(const char *s);      /* 串口 + 屏幕 */
 extern void kputhex(u64 v);
 extern void kputdec(u32 v);
 extern void kbd_feed(char c);          /* 带临界区塞进 ring */
+
+/* 桌面 P2：鼠标事件与组合键（kernel.c 提供） */
+extern void mouse_feed_rel(int dx, int dy, int btn, int wheel);
+extern void mouse_feed_abs(int ax, int ay, int btn, int wheel);
+extern void desktop_hotkey_exit(void);
+
 
 /* ---------- 常量 ---------- */
 /* QEMU virt（aarch64，highmem 默认开）实测内存映射（info mtree 真值）：
@@ -131,19 +138,41 @@ struct trb { u64 param; u32 status; u32 control; };
 #define NCMD_TRB 32
 #define NEVT_TRB 32
 #define NEP0_TRB 16
-#define NKBD_TRB 8
+#define NHID_TRB 8
+#define MAX_HID  4                 /* 键盘 + 相对鼠标 + 绝对平板 + 预留一个 */
+
+/* xHCI 一个 slot 一个设备上下文：CSZ=0 时是 32B slot + 31×32B EP = 1024B。
+   多设备必须各自独立 —— DCBAA[slot] 指向各自的上下文，xHCI 在里面维护
+   EP0 dequeue 指针；共享会让两个设备互相踩 TRB 与 cycle 状态。 */
+struct hid_dev {
+    int  slot;                  /* Enable Slot 返回的 slot id（1..MAX_HID） */
+    int  port;
+    int  speed;
+    int  ep_num;                /* 中断 IN 端点号 */
+    int  dci;                   /* 端点 DCI = 2*ep+1，doorbell 用 */
+    u16  maxpkt;                /* 端点最大包长（键盘/平板 8，相对鼠标 4） */
+    u8   interval;
+    u8   kind;                  /* 1=键盘 2=鼠标(相对) 3=平板(绝对) */
+    u8   ready;
+    u8   prev_keys[6];          /* 上一份键盘报告的 6 个 keycode */
+    u8   prev_mod;
+    u8   prev_btn;
+    int  enq;                   /* 中断环入队索引 */
+    u32  cycle;                 /* 中断环 cycle */
+    u32  ep0_enq;
+    u32  ep0_cycle;
+};
 
 static volatile u64 dcbaa[64 + 1] __attribute__((aligned(64)));
-static u8  dev_ctx[2048]   __attribute__((aligned(64)));   /* 设备上下文（一个 slot） */
-static u8  in_ctx[4096]    __attribute__((aligned(64)));   /* 输入上下文（含 EP 32 个槽位） */
+static u8  dev_ctx[MAX_HID][1024] __attribute__((aligned(64)));
+static u8  in_ctx[4096]          __attribute__((aligned(64)));   /* 输入上下文，枚举时串行复用 */
 static struct trb cmd_ring[NCMD_TRB] __attribute__((aligned(64)));
 static struct trb evt_ring[NEVT_TRB] __attribute__((aligned(64)));
-static u64 erst[2]         __attribute__((aligned(64)));   /* 16B: 段地址(8) + 保留(4) + 大小(4) */
-static struct trb ep0_ring[NEP0_TRB] __attribute__((aligned(64)));
-static struct trb kbd_ring[NKBD_TRB] __attribute__((aligned(64)));
-static u8  ctl_buf[512]    __attribute__((aligned(64)));   /* 控制传输数据缓冲 */
-static u8  kbd_buf[8]      __attribute__((aligned(64)));   /* HID 报告 8 字节 */
-
+static u64 erst[2]         __attribute__((aligned(64)));
+static struct trb ep0_ring[MAX_HID][NEP0_TRB] __attribute__((aligned(64)));
+static struct trb hid_ring[MAX_HID][NHID_TRB] __attribute__((aligned(64)));
+static u8  ctl_buf[512]    __attribute__((aligned(64)));
+static u8  hid_buf[MAX_HID][8] __attribute__((aligned(64)));
 /* ---------- 运行时状态 ---------- */
 static volatile u32 *xhci_cap;      /* capability 寄存器基址（BAR0） */
 static volatile u32 *xhci_op;       /* operational 寄存器基址 */
@@ -156,20 +185,10 @@ static u32  cmd_cycle = 1;          /* 命令环当前 cycle */
 static int  evt_deq;                /* 事件环出队索引 */
 static u32  evt_cycle = 1;          /* 事件环期望 cycle */
 
-static int  ep0_enq;
-static u32  ep0_cycle = 1;
-static int  kbd_enq;
-static u32  kbd_cycle = 1;
-
-static int  slot_id;
-static int  kbd_ep_num;             /* 键盘端点号（如 1） */
-static int  kbd_ep_dci;             /* 端点 DCI（doorbell 用） */
-static u16  kbd_maxpkt;
-static u8   kbd_interval;
-static int  kbd_prev_keys[6];       /* 上一份报告里的 6 个 keycode */
-static u8   kbd_prev_mod;
-static int  kbd_ready;
-
+static struct hid_dev G_dev[MAX_HID];
+static int  G_cur;                  /* 当前正在做控制传输 / 端点操作的设备下标 */
+static int  G_kbd_cnt;              /* 枚举到的键盘数 */
+static int  G_ptr_cnt;              /* 枚举到的指针设备数（相对鼠标 + 绝对平板） */
 /* ---------- 小工具 ---------- */
 static inline void barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
 
@@ -221,15 +240,18 @@ static inline volatile u32 *ecam_ptr(int bus, int dev, int fn, int reg)
                             + ((u64)fn << 12) + (reg & 0xffc));
 }
 
+/* ⚠️ 必须走 rd32/wr32 的内联汇编，不能写 *p：
+   循环里的直接解引用会被 GCC 强度削减成带写回的 ldr/str（后索引寻址），
+   KVM stage-2 下该访问 ISV=0 → NISV data abort（见本文件头踩坑记录）。
+   2026-11-07 飞牛虚拟机刷数据中止，这两处是唯一还没改到的 ECAM 访问。 */
 static int pci_cfg_read32(int bus, int dev, int fn, int reg)
 {
-    return (int)*ecam_ptr(bus, dev, fn, reg);
+    return (int)rd32(ecam_ptr(bus, dev, fn, reg));
 }
 
 static void pci_cfg_write32(int bus, int dev, int fn, int reg, u32 val)
 {
-    *ecam_ptr(bus, dev, fn, reg) = val;
-    barrier();
+    wr32(ecam_ptr(bus, dev, fn, reg), val);   /* wr32 内含 barrier() */
 }
 
 /* 找一个 xHCI 控制器；返回 bus/dev/fn，失败返回 -1
@@ -331,7 +353,6 @@ static u64 pci_setup_bar0(int bus, int dev, int fn)
     return bar;
 }
 
-/* ---------- 命令环 ---------- */
 static void cmd_doorbell(void)
 {
     barrier();
@@ -427,32 +448,35 @@ static int evt_wait_transfer(int epid, u32 *ccode_out, u32 *len_out)
     }
     return 0;
 }
-
 /* ---------- 控制传输（EP0） ---------- */
+/* ⚠️ 多设备：EP0 环按设备下标分开，doorbell 也要打在对应 slot 上。
+   ctrl_xfer 全程由 G_cur 指定「现在操作哪个设备」，枚举是串行的，不会并发。 */
 static int ep0_submit_trb(u32 type, u64 param, u32 status, u32 control_extra)
 {
-    struct trb *t = &ep0_ring[ep0_enq];
+    struct hid_dev *d = &G_dev[G_cur];
+    struct trb *t = &ep0_ring[G_cur][d->ep0_enq];
     t->param = param;
     t->status = status;
     t->control = (type << TRB_TYPE_SH) | control_extra |
-                 (ep0_cycle ? TRB_C : 0);
-    ep0_enq++;
-    if (ep0_enq == NEP0_TRB - 1) {
-        struct trb *l = &ep0_ring[NEP0_TRB - 1];
-        l->param = (u64)&ep0_ring[0];
+                 (d->ep0_cycle ? TRB_C : 0);
+    d->ep0_enq++;
+    if (d->ep0_enq == NEP0_TRB - 1) {
+        struct trb *l = &ep0_ring[G_cur][NEP0_TRB - 1];
+        l->param = (u64)&ep0_ring[G_cur][0];
         l->status = 0;
         l->control = (TR_LINK << TRB_TYPE_SH) | (1u << 1) |
-                     (ep0_cycle ? TRB_C : 0);
-        ep0_enq = 0;
-        ep0_cycle ^= 1;
+                     (d->ep0_cycle ? TRB_C : 0);
+        d->ep0_enq = 0;
+        d->ep0_cycle ^= 1;
     }
     return 0;
 }
 
+
 static void ep_doorbell(int dci)
 {
     barrier();
-    xhci_db[slot_id] = (u32)dci;   /* doorbell[slot] = 端点 DCI */
+    xhci_db[G_dev[G_cur].slot] = (u32)dci;   /* doorbell[slot] = 端点 DCI */
     barrier();
 }
 
@@ -497,7 +521,6 @@ static int ctrl_xfer(u8 bmRequestType, u8 bRequest, u16 wValue, u16 wIndex,
     }
     return 0;
 }
-
 /* ---------- 设备枚举 ---------- */
 struct usb_dev_desc {
     u8  bLength; u8 bDescriptorType; u16 bcdUSB;
@@ -534,13 +557,20 @@ static int get_desc(u8 type, u8 index, u16 len, void *buf)
 {
     return ctrl_xfer(0x80, 6, (u16)((type << 8) | index), 0, len, buf);
 }
-
-/* 解析配置描述符，找 HID boot 键盘接口 */
-static int parse_config(u8 *buf, int total, int *ep_num, u16 *maxpkt, u8 *interval)
+/* 解析配置描述符，识别三类 HID 设备。
+   判据逐字段核对 QEMU 8.2.2 hw/usb/dev-hid.c 的 desc_iface_* ：
+     keyboard : class=3 subclass=1 proto=1  wMaxPacketSize=8 → 8B boot 报告
+     mouse    : class=3 subclass=1 proto=2  wMaxPacketSize=4 → 4B 相对报告
+                (buttons, dx, dy, wheel)
+     tablet   : class=3 subclass=0 proto=0  wMaxPacketSize=8 → 6B 绝对报告
+                (buttons, x_lo, x_hi, y_lo, y_hi, wheel)，坐标 0..32767
+   真机 VM 三个设备全在同一个 qemu-xhci 上，端口顺序 tablet/mouse/keyboard，
+   所以必须逐个端口枚举、按类型分派，不能「找到第一个键盘就收工」。 */
+static int parse_config(u8 *buf, int total, int *ep_num, u16 *maxpkt,
+                        u8 *interval, int *kind)
 {
     int off = 0;
-    int cur_iface = -1;
-    int kbd_iface = -1;
+    int cur_iface = -1, hid_iface = -1, want = 0;
 
     while (off + 2 <= total) {
         u8 len = buf[off];
@@ -550,19 +580,29 @@ static int parse_config(u8 *buf, int total, int *ep_num, u16 *maxpkt, u8 *interv
         if (type == USB_DT_IFACE && len >= 9) {
             struct usb_iface_desc *d = (struct usb_iface_desc *)(buf + off);
             cur_iface = d->bInterfaceNumber;
-            if (d->bInterfaceClass == 3 &&      /* HID */
-                d->bInterfaceSubClass == 1 &&   /* boot */
-                d->bInterfaceProtocol == 1) {   /* keyboard */
-                kbd_iface = d->bInterfaceNumber;
+            hid_iface = -1; want = 0;
+            if (d->bInterfaceClass == 3) {
+                if (d->bInterfaceSubClass == 1 && d->bInterfaceProtocol == 1) {
+                    hid_iface = cur_iface; want = 1;      /* 键盘 */
+                } else if (d->bInterfaceSubClass == 1 && d->bInterfaceProtocol == 2) {
+                    hid_iface = cur_iface; want = 2;      /* 相对鼠标 */
+                } else if (d->bInterfaceProtocol == 0) {
+                    hid_iface = cur_iface; want = 3;      /* 绝对平板 */
+                }
             }
         } else if (type == USB_DT_ENDPOINT && len >= 7 &&
-                   cur_iface == kbd_iface) {
+                   cur_iface == hid_iface && hid_iface >= 0) {
             struct usb_ep_desc *e = (struct usb_ep_desc *)(buf + off);
+            u16 mps = e->wMaxPacketSize & 0x7ff;
             if ((e->bmAttributes & 3) == 3 && (e->bEndpointAddress & 0x80)) {
-                *ep_num = e->bEndpointAddress & 0x0f;
-                *maxpkt = e->wMaxPacketSize & 0x7ff;
-                *interval = e->bInterval;
-                return 0;
+                /* 平板报告 6B，端点至少要有 6B；键盘/鼠标天然满足 */
+                if (!(want == 3 && mps < 6)) {
+                    *ep_num = e->bEndpointAddress & 0x0f;
+                    *maxpkt = mps;
+                    *interval = e->bInterval;
+                    *kind = want;
+                    return 0;
+                }
             }
         }
         off += len;
@@ -636,7 +676,6 @@ static int port_reset(int port, int *speed_out)
         return -1;
     return 0;
 }
-
 /* ---------- 键盘报告 → ASCII ---------- */
 /* HID usage ID (USB HID Usage Tables 10, Keyboard/Keypad) → ASCII */
 static const char hid_map[128] = {
@@ -686,12 +725,15 @@ static char hid_to_ascii(int usage, int shift)
     }
     return 0;
 }
-
-/* 处理一份 8 字节 boot 报告 */
-static void handle_report(const u8 *rep)
+/* ---------- HID 报告解析 ---------- */
+/* 键盘：Ctrl+Shift+F1 组合键。
+   HID modifier 位：bit0 LCtrl bit1 LShift bit4 RCtrl bit5 RShift；F1 usage = 0x3A。
+   组合键没有 ASCII 字符，直接置「请求退出桌面」标志，由 desktop_run 消费。 */
+static void kbd_report(struct hid_dev *d, const u8 *rep)
 {
     u8 mod = rep[0];
-    int shift = (mod & 0x22) != 0;   /* LShift | RShift */
+    int shift = (mod & 0x22) != 0;
+    int ctrl  = (mod & 0x11) != 0;
     int cur[6];
     for (int i = 0; i < 6; i++)
         cur[i] = rep[2 + i];
@@ -703,64 +745,95 @@ static void handle_report(const u8 *rep)
             continue;
         int seen = 0;
         for (int j = 0; j < 6; j++)
-            if (kbd_prev_keys[j] == k) { seen = 1; break; }
-        if (!seen) {
-            char c = hid_to_ascii(k, shift);
-            if (c)
-                kbd_feed(c);
+            if (d->prev_keys[j] == k) { seen = 1; break; }
+        if (seen) continue;
+        if (k == 0x3A && ctrl && shift) {
+            desktop_hotkey_exit();
+            continue;
         }
+        char c = hid_to_ascii(k, shift);
+        if (c)
+            kbd_feed(c);
     }
     for (int i = 0; i < 6; i++)
-        kbd_prev_keys[i] = cur[i];
-    kbd_prev_mod = mod;
+        d->prev_keys[i] = (u8)cur[i];
+    d->prev_mod = mod;
 }
 
-/* ---------- 键盘端点：投递 / 收割 ---------- */
-static void kbd_arm(void)
+/* 指针设备：QEMU hw/input/hid.c 的 hid_pointer_poll() 报告格式
+   HID_MOUSE   (相对) 4B: buttons, dx(int8), dy(int8), wheel(int8)
+   HID_TABLET  (绝对) 6B: buttons, x_lo, x_hi, y_lo, y_hi, wheel
+   buttons bit0=左 bit1=右 bit2=中。绝对坐标范围 0..32767（QEMU_INPUT_ABS_MAX）。 */
+static void pointer_report(struct hid_dev *d, const u8 *rep)
 {
-    struct trb *t = &kbd_ring[kbd_enq];
-    t->param = (u64)kbd_buf;
-    t->status = 8;
+    int btn = rep[0] & 7;
+    if (d->kind == 2) {
+        int dx = (int)(signed char)rep[1];
+        int dy = (int)(signed char)rep[2];
+        int wh = (int)(signed char)rep[3];
+        mouse_feed_rel(dx, dy, btn, wh);
+    } else {
+        int ax = (int)rep[1] | ((int)rep[2] << 8);
+        int ay = (int)rep[3] | ((int)rep[4] << 8);
+        int wh = (int)(signed char)rep[5];
+        mouse_feed_abs(ax, ay, btn, wh);
+    }
+    d->prev_btn = (u8)btn;
+}
+
+/* ---------- 中断端点：投递 / 收割 ---------- */
+static void hid_arm(int idx)
+{
+    struct hid_dev *d = &G_dev[idx];
+    struct trb *t = &hid_ring[idx][d->enq];
+    t->param = (u64)hid_buf[idx];
+    t->status = d->maxpkt;           /* 请求设备声明的最大包长 */
     t->control = (TR_NORMAL << TRB_TYPE_SH) | TRB_IOC |
-                 (kbd_cycle ? TRB_C : 0);
-    kbd_enq++;
-    if (kbd_enq == NKBD_TRB - 1) {
-        struct trb *l = &kbd_ring[NKBD_TRB - 1];
-        l->param = (u64)&kbd_ring[0];
+                 (d->cycle ? TRB_C : 0);
+    d->enq++;
+    if (d->enq == NHID_TRB - 1) {
+        struct trb *l = &hid_ring[idx][NHID_TRB - 1];
+        l->param = (u64)&hid_ring[idx][0];
         l->status = 0;
         l->control = (TR_LINK << TRB_TYPE_SH) | (1u << 1) |
-                     (kbd_cycle ? TRB_C : 0);
-        kbd_enq = 0;
-        kbd_cycle ^= 1;
+                     (d->cycle ? TRB_C : 0);
+        d->enq = 0;
+        d->cycle ^= 1;
     }
-    ep_doorbell(kbd_ep_dci);
+    G_cur = idx;
+    ep_doorbell(d->dci);
 }
 
 /* ---------- 公开接口 ---------- */
+/* 一个事件环服务所有设备：按 (slot, dci) 反查设备，处理报告后重新投递。
+   没有指针事件时 QEMU 的 HID 设备回 NAK，xHCI 不会产生事件，不占 CPU。 */
 void usb_kbd_poll(void)
 {
-    if (!kbd_ready)
-        return;
-
     for (;;) {
         u32 type, cc, slot, ep;
         u64 param;
         if (!evt_poll_one(&type, &cc, &slot, &ep, &param))
             break;
-        if (type == ER_TRANSFER && (int)ep == kbd_ep_dci) {
-            if (cc == CC_SUCCESS || cc == CC_SHORT_PKT) {
-                handle_report(kbd_buf);
-            }
-            kbd_arm();               /* 重新投递下一个请求 */
+        if (type != ER_TRANSFER)
+            continue;
+        int idx = -1;
+        for (int i = 0; i < MAX_HID; i++)
+            if (G_dev[i].ready && G_dev[i].slot == (int)slot &&
+                G_dev[i].dci == (int)ep) { idx = i; break; }
+        if (idx < 0)
+            continue;
+        struct hid_dev *d = &G_dev[idx];
+        if (cc == CC_SUCCESS || cc == CC_SHORT_PKT) {
+            if (d->kind == 1)      kbd_report(d, hid_buf[idx]);
+            else if (d->kind >= 2) pointer_report(d, hid_buf[idx]);
         }
+        hid_arm(idx);               /* 重新投递下一个请求 */
     }
 }
 
 int usb_kbd_init(void)
 {
     int bus, dev, fn;
-
-    kbd_ready = 0;
 
     /* 1. 找 xHCI */
     if (pci_find_xhci(&bus, &dev, &fn) < 0) {
@@ -841,10 +914,7 @@ int usb_kbd_init(void)
     }
     evt_deq = 0;
     evt_cycle = 1;
-    erst[0] = (u64)evt_ring;                       /* 0-7: 段基址 */
-    /* ERST 条目第 2 个 8 字节：规范把"段大小"放在偏移 12（前 4 字节保留），
-       但 QEMU 的 XHCIEvRingSeg 是 {addr_lo,addr_hi,size,rsvd} —— size 在偏移 8！
-       两边都填，QEMU 和真机都能认。 */
+    erst[0] = (u64)evt_ring;
     erst[1] = (u64)NEVT_TRB | ((u64)NEVT_TRB << 32);
     wr32((volatile u32 *)((u8 *)xhci_rt + XRT_ERSTSZ(0)), 1);
     wr32((volatile u32 *)((u8 *)xhci_rt + XRT_ERSTBA(0)), (u32)(u64)erst);
@@ -860,101 +930,86 @@ int usb_kbd_init(void)
     }
     put("[usb ] 控制器已运行\n");
 
-    /* 9. 遍历所有「有设备」的端口：复位 → 枚举 → 找 HID boot 键盘
-       ⚠️ 一台虚拟机常挂多个 USB 设备（usb-tablet / usb-mouse / usb-kbd）。
-          只认「第一个有设备的端口」会抓错设备（2026-10-24 真机踩过：抓到 usb-tablet，
-          报「没找到 HID boot 键盘接口」直接放弃 → 用户屏幕上打不了字）。
-          所以逐个端口试，直到解析出 HID boot 键盘接口为止。 */
-    int port = -1, speed = 0, found = 0;
-    int ep_num = 0;
-    u16 maxpkt = 0;
-    u8 interval = 0;
-    u32 cc = 0, sl = 0;
-    int total = 0;
+    /* 9. 逐个端口枚举所有有设备的端口。
+       每个设备拿自己的 slot（QEMU 返回 1,2,3...），用 slot-1 作为静态数组下标，
+       这样即使中间某个设备枚举失败也不会复用别的设备的 DMA 区。 */
     struct usb_dev_desc dd;
     u8 cfg_head[9];
     struct usb_conf_desc *cd = (struct usb_conf_desc *)cfg_head;
 
-    for (int p = 1; p <= maxports && !found; p++) {
+    for (int p = 1; p <= maxports; p++) {
         u32 ps = rd32((volatile u32 *)((u8 *)xhci_op + XOP_PORTSC(p)));
         if (!(ps & PORTSC_CCS))
-            continue;                          /* 该端口没设备 */
-        port = p;
+            continue;
+        int port = p, speed = 0;
         put("[usb ] 端口 "); putdec(port); put(" 有设备，复位中...\n");
         if (port_reset(port, &speed) < 0) {
-            put("[usb ] 端口复位失败，试下一个\n");
+            put("[usb ] 端口复位失败，跳过\n");
             continue;
         }
-        put("[usb ] 端口复位完成，speed="); putdec(speed); put("\n");
 
         /* 10. Enable Slot */
         cmd_submit(0, 0, CR_ENABLE_SLOT << TRB_TYPE_SH);
-        cc = 0; sl = 0;
+        u32 cc = 0, sl = 0;
         if (!evt_wait_cmd(&cc, &sl) || cc != CC_SUCCESS) {
             put("[usb ] Enable Slot 失败 cc="); puthex(cc); put("\n");
-            put("[dbg ] CRCR="); puthex(rd32(xhci_op + XOP_CRCR / 4));
-            put(" cfg lo="); puthex((u32)(u64)cmd_ring);
-            put(" USBSTS="); puthex(rd32(xhci_op + XOP_USBSTS / 4));
-            put(" ERSTSZ="); puthex(rd32((volatile u32 *)((u8 *)xhci_rt + XRT_ERSTSZ(0))));
-            put(" ERSTBA="); puthex(rd32((volatile u32 *)((u8 *)xhci_rt + XRT_ERSTBA(0))));
-            put(" ERDP="); puthex(rd32((volatile u32 *)((u8 *)xhci_rt + XRT_ERDP(0))));
-            put("\n[dbg ] evt0 ctl="); puthex(evt_ring[0].control);
-            put(" st="); puthex(evt_ring[0].status);
-            put(" cmdtrb ctl="); puthex(cmd_ring[0].control);
-            put("\n");
             continue;
         }
-        slot_id = sl;
-        put("[usb ] slot="); putdec(slot_id); put("\n");
+        int slot = (int)sl;
+        if (slot < 1 || slot > MAX_HID) {
+            put("[usb ] slot 超出静态设备表，跳过: "); putdec((u32)slot); put("\n");
+            continue;
+        }
+        int idx = slot - 1;
+        G_cur = idx;
+        struct hid_dev *d = &G_dev[idx];
+        d->slot = slot; d->port = port; d->speed = speed;
+        d->ready = 0; d->kind = 0;
+        d->enq = 0; d->cycle = 1;
+        d->ep0_enq = 0; d->ep0_cycle = 1;
+        for (int i = 0; i < 6; i++) { d->prev_keys[i] = 0; }
+        d->prev_mod = 0; d->prev_btn = 0;
+        dcbaa[slot] = (u64)dev_ctx[idx];
+        put("[usb ] slot="); putdec((u32)slot); put("\n");
 
         /* 11. Address Device */
         in_ctx_zero();
         set_slot_ctx(1, port, speed);
-        /* EP0 环：先清空，cycle=1，dequeue 指向环首 */
         for (int i = 0; i < NEP0_TRB; i++) {
-            ep0_ring[i].param = 0; ep0_ring[i].status = 0; ep0_ring[i].control = 0;
+            ep0_ring[idx][i].param = 0; ep0_ring[idx][i].status = 0;
+            ep0_ring[idx][i].control = 0;
         }
-        ep0_enq = 0;
-        ep0_cycle = 1;
-        ep0_ring[NEP0_TRB - 1].param = (u64)&ep0_ring[0];
-        ep0_ring[NEP0_TRB - 1].control = (TR_LINK << TRB_TYPE_SH) | (1u << 1);
-        set_ep_ctx(1, EP_TYPE_CTRL, 8, 0, (u64)ep0_ring, 1);
-
-        /* add_flags 必须 = 0x3（slot + EP0），QEMU 硬校验 */
+        ep0_ring[idx][NEP0_TRB - 1].param = (u64)&ep0_ring[idx][0];
+        ep0_ring[idx][NEP0_TRB - 1].control = (TR_LINK << TRB_TYPE_SH) | (1u << 1);
+        set_ep_ctx(1, EP_TYPE_CTRL, 8, 0, (u64)ep0_ring[idx], 1);
         ((volatile u32 *)in_ctx)[1] = CTX_ADD_SLOT | CTX_ADD_EP0;
-
-        /* 设备上下文地址登记 */
-        dcbaa[slot_id] = (u64)dev_ctx;
-
         cmd_submit((u64)in_ctx, 0, CR_ADDRESS_DEV << TRB_TYPE_SH |
-                    ((u32)slot_id << TRB_SLOTID_SH));
+                    ((u32)slot << TRB_SLOTID_SH));
         if (!evt_wait_cmd(&cc, &sl) || cc != CC_SUCCESS) {
             put("[usb ] Address Device 失败 cc="); puthex(cc); put("\n");
             continue;
         }
         put("[usb ] 设备已寻址\n");
 
-        /* 12. 先读 8 字节设备描述符（任何设备都支持，MPS 未知时也安全），
-               拿到真实 bMaxPacketSize0 后用 Evaluate Context 更新 EP0，再读完整 18 字节 */
+        /* 12. 设备描述符（先 8B 拿 MPS0，必要时 Evaluate Context，再读完整 18B） */
         for (u32 i = 0; i < sizeof(dd); i++) ((u8 *)&dd)[i] = 0;
         if (get_desc(USB_DT_DEVICE, 0, 8, &dd) < 0) {
             put("[usb ] 取设备描述符(8B)失败\n");
             continue;
         }
         put("[usb ] MPS0="); putdec(dd.bMaxPacketSize0); put("\n");
-
         if (dd.bMaxPacketSize0 != 8) {
             in_ctx_zero();
-            set_ep_ctx(1, EP_TYPE_CTRL, dd.bMaxPacketSize0, 0, (u64)ep0_ring, ep0_cycle);
-            ((volatile u32 *)in_ctx)[0] = 0;                 /* drop = 0 */
-            ((volatile u32 *)in_ctx)[1] = CTX_ADD_EP0;       /* 只更新 EP0 */
+            set_ep_ctx(1, EP_TYPE_CTRL, dd.bMaxPacketSize0, 0,
+                       (u64)ep0_ring[idx], d->ep0_cycle);
+            ((volatile u32 *)in_ctx)[0] = 0;
+            ((volatile u32 *)in_ctx)[1] = CTX_ADD_EP0;
             cmd_submit((u64)in_ctx, 0, CR_EVAL_CONTEXT << TRB_TYPE_SH |
-                        ((u32)slot_id << TRB_SLOTID_SH));
+                        ((u32)slot << TRB_SLOTID_SH));
             if (!evt_wait_cmd(&cc, &sl) || cc != CC_SUCCESS) {
                 put("[usb ] Evaluate Context 失败 cc="); puthex(cc); put("\n");
-            continue;
+                continue;
             }
-            put("[usb ] EP0 MPS 已更新为 "); putdec(dd.bMaxPacketSize0); put("\n");
         }
         if (get_desc(USB_DT_DEVICE, 0, 18, &dd) < 0) {
             put("[usb ] 取设备描述符(18B)失败\n");
@@ -963,14 +1018,13 @@ int usb_kbd_init(void)
         put("[usb ] 设备 "); puthex(dd.idVendor); put(":"); puthex(dd.idProduct);
         put(" 类="); putdec(dd.bDeviceClass); put("\n");
 
-        /* 13. 取配置描述符 */
+        /* 13. 配置描述符 + 类型识别 */
         if (get_desc(USB_DT_CONFIG, 0, 9, cfg_head) < 0) {
             put("[usb ] 取配置头失败\n");
             continue;
         }
         cd = (struct usb_conf_desc *)cfg_head;
-        total = cd->wTotalLength;
-        put("[usb ] 配置总长="); putdec((u32)total); put("\n");
+        int total = cd->wTotalLength;
         if (total < 9 || total > (int)sizeof(ctl_buf)) {
             put("[usb ] 配置长度异常\n");
             continue;
@@ -979,71 +1033,69 @@ int usb_kbd_init(void)
             put("[usb ] 取配置失败\n");
             continue;
         }
-
-        if (parse_config(ctl_buf, total, &ep_num, &maxpkt, &interval) < 0) {
-            put("[usb ] 这个端口不是 HID boot 键盘，试下一个\n");
+        int kind = 0, ep_num = 0;
+        u16 maxpkt = 0;
+        u8 interval = 0;
+        if (parse_config(ctl_buf, total, &ep_num, &maxpkt, &interval, &kind) < 0) {
+            put("[usb ] 这个端口不是支持的 HID 设备，跳过\n");
             continue;
         }
-        found = 1;
-    }   /* ← for 端口循环结束 */
+        d->kind = (u8)kind; d->ep_num = ep_num;
+        d->maxpkt = maxpkt; d->interval = interval;
+        d->dci = (ep_num << 1) | 1;
+        put("[usb ] 识别 kind="); putdec((u32)kind);
+        put(" 端点 0x"); puthex((u64)ep_num);
+        put(" maxpkt="); putdec(maxpkt); put("\n");
 
-    if (!found) {
-        put("[usb ] 没找到 HID boot 键盘（已试过所有有设备的端口）\n");
-        return -1;
+        /* 14. SET_CONFIGURATION */
+        if (ctrl_xfer(0x00, 9, cd->bConfigurationValue, 0, 0, 0) < 0) {
+            put("[usb ] SET_CONFIGURATION 失败\n");
+            continue;
+        }
+        /* 15. SET_PROTOCOL(boot)：只对 boot 设备（键盘 / 相对鼠标）；平板是 report 协议 */
+        if (kind != 3 && ctrl_xfer(0x21, 0x0B, 0, 0, 0, 0) < 0)
+            put("[usb ] SET_PROTOCOL 失败（忽略）\n");
+
+        /* 16. Configure Endpoint：加中断 IN 端点 */
+        in_ctx_zero();
+        set_slot_ctx(d->dci, d->port, d->speed);
+        set_ep_ctx(1, EP_TYPE_CTRL, dd.bMaxPacketSize0 ? dd.bMaxPacketSize0 : 8,
+                   0, (u64)ep0_ring[idx], d->ep0_cycle);
+        for (int i = 0; i < NHID_TRB; i++) {
+            hid_ring[idx][i].param = 0; hid_ring[idx][i].status = 0;
+            hid_ring[idx][i].control = 0;
+        }
+        hid_ring[idx][NHID_TRB - 1].param = (u64)&hid_ring[idx][0];
+        hid_ring[idx][NHID_TRB - 1].control = (TR_LINK << TRB_TYPE_SH) | (1u << 1);
+        set_ep_ctx(d->dci, EP_TYPE_INT_IN, maxpkt, 0, (u64)hid_ring[idx], 1);
+        ((volatile u32 *)in_ctx)[1] = CTX_ADD_SLOT | (1u << d->dci);
+        cmd_submit((u64)in_ctx, 0, CR_CONFIG_EP << TRB_TYPE_SH |
+                    ((u32)slot << TRB_SLOTID_SH));
+        if (!evt_wait_cmd(&cc, &sl) || cc != CC_SUCCESS) {
+            put("[usb ] Configure Endpoint 失败 cc="); puthex(cc); put("\n");
+            continue;
+        }
+
+        /* 17. 标记就绪。⚠️ 这里**先不 arm** —— 枚举是串行的，
+           evt_wait_cmd 会吞掉所有非命令完成事件；若提前 arm 了前面的设备，
+           后面设备枚举期间到达的鼠标/键盘报告会被丢掉且不再投递（端点卡死）。
+           所有设备配置完后再统一 arm，见循环之后。 */
+        d->ready = 1;
+        if (kind == 1) G_kbd_cnt++;
+        if (kind >= 2) G_ptr_cnt++;
+        put("[usb ] 设备就绪 slot="); putdec((u32)slot);
+        put(" DCI="); putdec((u32)d->dci); put("\n");
     }
 
-    kbd_ep_num = ep_num;
-    kbd_maxpkt = maxpkt;
-    kbd_interval = interval;
-    put("[usb ] 键盘端点 0x"); puthex((u64)ep_num);
-    put(" maxpkt="); putdec(maxpkt);
-    put(" interval="); putdec(interval); put("\n");
+    /* 18. 统一投递所有中断请求：此刻事件环里不会再混进设备报告 */
+    for (int i = 0; i < MAX_HID; i++)
+        if (G_dev[i].ready) hid_arm(i);
 
-    /* 14. SET_CONFIGURATION */
-    if (ctrl_xfer(0x00, 9, cd->bConfigurationValue, 0, 0, 0) < 0) {
-        put("[usb ] SET_CONFIGURATION 失败\n");
-        return -1;
-    }
-    put("[usb ] 配置已设置\n");
-
-    /* 15. HID SET_PROTOCOL(boot)；失败不致命（多数设备默认 boot） */
-    if (ctrl_xfer(0x21, 0x0B, 0, 0, 0, 0) < 0)
-        put("[usb ] SET_PROTOCOL 失败（忽略）\n");
-
-    /* 16. Configure Endpoint：加键盘中断 IN 端点 */
-    kbd_ep_dci = (ep_num << 1) | 1;        /* EPn IN → DCI = 2n+1 */
-    in_ctx_zero();
-    set_slot_ctx(kbd_ep_dci, port, speed); /* context entries = 最高 DCI */
-    /* EP0 上下文也要带上（保持有效） */
-    set_ep_ctx(1, EP_TYPE_CTRL, dd.bMaxPacketSize0 ? dd.bMaxPacketSize0 : 8,
-               0, (u64)ep0_ring, ep0_cycle);
-    /* 键盘端点环 */
-    for (int i = 0; i < NKBD_TRB; i++) {
-        kbd_ring[i].param = 0; kbd_ring[i].status = 0; kbd_ring[i].control = 0;
-    }
-    kbd_enq = 0;
-    kbd_cycle = 1;
-    kbd_ring[NKBD_TRB - 1].param = (u64)&kbd_ring[0];
-    kbd_ring[NKBD_TRB - 1].control = (TR_LINK << TRB_TYPE_SH) | (1u << 1);
-
-    set_ep_ctx(kbd_ep_dci, EP_TYPE_INT_IN, maxpkt, 0, (u64)kbd_ring, 1);
-
-    /* add_flags：slot + 新端点（bit = DCI） */
-    ((volatile u32 *)in_ctx)[1] = CTX_ADD_SLOT | (1u << kbd_ep_dci);
-
-    cmd_submit((u64)in_ctx, 0, CR_CONFIG_EP << TRB_TYPE_SH |
-                ((u32)slot_id << TRB_SLOTID_SH));
-    if (!evt_wait_cmd(&cc, &sl) || cc != CC_SUCCESS) {
-        put("[usb ] Configure Endpoint 失败 cc="); puthex(cc); put("\n");
-        return -1;
-    }
-    put("[usb ] 键盘端点已启用 DCI="); putdec((u32)kbd_ep_dci); put("\n");
-
-    /* 17. 投递第一个中断请求 */
-    for (int i = 0; i < 6; i++) kbd_prev_keys[i] = 0;
-    kbd_prev_mod = 0;
-    kbd_arm();
-    kbd_ready = 1;
-    put("[usb ] ✅ USB 键盘就绪，可以在屏幕上打字了\n");
-    return 0;
+    put("[usb ] HID 枚举完成：键盘="); putdec((u32)G_kbd_cnt);
+    put(" 指针设备="); putdec((u32)G_ptr_cnt); put("\n");
+    if (!G_kbd_cnt)
+        put("[usb ] ⚠️ 没找到 USB 键盘，仍可用串口打字\n");
+    if (!G_ptr_cnt)
+        put("[usb ] ⚠️ 没找到鼠标/平板，桌面只能用键盘操作\n");
+    return (G_kbd_cnt || G_ptr_cnt) ? 0 : -1;
 }

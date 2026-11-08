@@ -38,3 +38,10 @@ dist/
 .DS_Store
 Thumbs.db
 .idea/
+
+# 编译产物：仓库里保留少量（BOOTAA64.EFI / kernel.elf / 若干 .o）供直接体验，
+# 见 README「诚实的边界」；此后新增的一律不再纳入，源码以 build.sh 为准
+*.o
+*.elf
+*.a
+*.bin

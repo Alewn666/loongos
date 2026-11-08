@@ -23,14 +23,32 @@ cp BOOTAA64.EFI "$STAGE/EFI/BOOT/BOOTAA64.EFI"   # UEFI 标准引导路径（树
 cp kernel.elf   "$STAGE/kernel.elf"              # stub 从卷根读它
 
 # ---- 2. 内嵌 El Torito FAT 镜像（同一套文件，兜底读盘路径）----
+# ⚠️ 两个镜像职责不同（2026-11-08 修正装盘链路）：
+#   payload.img = 4MB FAT（BOOTAA64.EFI + kernel.elf），install 时**原样写进硬盘
+#                 ESP 分区**；装好的盘从硬盘启动时 stub 就从这个 FAT 卷读 kernel.elf。
+#   esp.img     = 12MB FAT，El Torito 引导卷。除引导文件外还必须**内含
+#                 \payload.img**：uefi_stub.c 用 loaded->DeviceHandle 打开的是这个
+#                 FAT 卷（不是 ISO9660 树），只把 payload.img 放进 ISO 树会打印
+#                 "[stub] no payload.img" → install 直接 FAIL no-esp-payload。
+PAYLOAD=build/payload.img
+rm -f "$PAYLOAD"
+dd if=/dev/zero of="$PAYLOAD" bs=1M count=4 status=none
+mformat -i "$PAYLOAD" ::
+mmd -i "$PAYLOAD" ::/EFI ::/EFI/BOOT
+mcopy -i "$PAYLOAD" BOOTAA64.EFI ::/EFI/BOOT/BOOTAA64.EFI
+mcopy -i "$PAYLOAD" kernel.elf   ::/kernel.elf
+
 rm -f "$ESP"
-dd if=/dev/zero of="$ESP" bs=1M count=4 status=none
+dd if=/dev/zero of="$ESP" bs=1M count=12 status=none
 mformat -i "$ESP" ::
 mmd -i "$ESP" ::/EFI ::/EFI/BOOT
 mcopy -i "$ESP" BOOTAA64.EFI ::/EFI/BOOT/BOOTAA64.EFI
 mcopy -i "$ESP" kernel.elf   ::/kernel.elf
-# esp.img 也放进树（-e 按镜像内路径引用它）
-cp "$ESP" "$STAGE/esp.img"
+mcopy -i "$ESP" "$PAYLOAD"   ::/payload.img
+
+# ISO9660 树里也各放一份（供按树读盘的固件兜底）
+cp "$ESP"     "$STAGE/esp.img"
+cp "$PAYLOAD" "$STAGE/payload.img"
 
 # ---- 3. 组装：树=$STAGE，El Torito 指向树内的 esp.img ----
 xorriso -as mkisofs -R -J -V LOONGOS     -e esp.img -no-emul-boot     -o "$OUT" "$STAGE" 2>&1 | tail -1

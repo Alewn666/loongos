@@ -55,6 +55,28 @@ SECTIONS
         __bss_end = .;
     } :data
 
+    /* NVMe DMA 区（2026-11-08 新增）
+     * ------------------------------------------------------------------
+     * 为什么必须单独一段、且放在内核栈之后：
+     *   1) NVMe 要求 ASQ/ACQ/IO SQ/IO CQ/DMA 缓冲全部 4KB 页对齐
+     *      （QEMU nvme_start_ctrl() 对 ASQ/ACQ 做 (page_size-1) 掩码检查）。
+     *   2) 本段整体 4KB 对齐，内部每页 4KB 对齐，天然满足要求。
+     *   3) **必须排在 .bss 之后**：.bss 里的成员按声明顺序排列，而内核栈
+     *      (_stack_bottom.._stack_top) 是在 .bss 成员**之后**才分配的。
+     *      若把 20KB 的 DMA 缓冲放进 .bss，链接器会把栈顶推到缓冲中间，
+     *      导致内核栈覆盖 DMA 缓冲（实测 nv_mem=0x401f4000 而
+     *      _stack_bottom=0x401f7010 → 直接踩坏队列）。
+     *      放在栈之后，两者彻底分开。
+     *   4) __bss_end 仍是内核 .bss 的真实上界（构建期 BSS 守卫读它），
+     *      本段在其之后，需要同时更新守卫的边界检查。
+     */
+    .nvmedma : ALIGN(4096) {
+        __nvmedma_start = .;
+        KEEP(*(.nvmedma .nvmedma.*))
+        . = ALIGN(4096);
+        __nvmedma_end = .;
+    } :data
+
     __kernel_end = .;
 
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
