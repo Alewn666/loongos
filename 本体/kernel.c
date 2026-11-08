@@ -540,15 +540,17 @@ static volatile int G_exit_req;
  *   G_moff_x/y 是从「内核收到的坐标」里减掉的常量偏移，由桌面校准向导或
  *   `mousecal <dx> <dy>` 设置，写进 /etc/mousecal，装盘后重启仍生效。
  * G_raw_ax/ay 保留最近一次平板原始坐标（0..32767），供排障时确认映射链。
- * G_abs_tick 用于让绝对平板优先：相对鼠标只在「近期没有绝对报告」时才更新坐标，
- * 否则两个设备轮流覆盖 G_mx/G_my，光标会漂。 */
-/* 全局节拍（定义在下方调度器；这里用于判断「近期是否收到绝对报告」） */
-extern volatile u64 tick;
+ * G_abs_cnt / G_rel_cnt 统计两类指针报告次数，敲 mousecal 可看真机 VNC 到底
+ * 走绝对平板还是相对鼠标（P2.2 排障用）。
+ *
+ * ⚠️ 2026-11-09 P2.2：这里曾有个「近期有绝对报告就忽略相对增量」的 2 秒窗口，
+ * 导致真机走相对模式时鼠标根本滑不动、只有点击触发整屏重画才现形。实际 QEMU
+ * 行为是绝对模式下相对鼠标只收 BTN（dx/dy 恒 0），不会覆盖平板坐标，因此
+ * 不需要按时间猜来源，见 mouse_feed_rel()。 */
 
 static volatile int G_moff_x, G_moff_y;
 static volatile int G_raw_ax, G_raw_ay;
-static volatile u64 G_abs_tick;
-static volatile int G_abs_seen;
+static volatile u32 G_abs_cnt, G_rel_cnt;
 
 static void mouse_clamp(int *x, int *y)
 {
@@ -561,10 +563,13 @@ static void mouse_clamp(int *x, int *y)
 
 void mouse_feed_rel(int dx, int dy, int btn, int wheel)
 {
-    /* 绝对平板在场时，相对鼠标的坐标增量会与平板轮流覆盖 G_mx/G_my，光标乱跳。
-       真机 VNC 走绝对模式，相对设备只贡献按钮/滚轮；只有「2 秒内没有任何绝对报告」
-       （即确实没有平板、用户只用相对鼠标）才让它更新坐标。 */
-    if (!G_abs_seen || tick - G_abs_tick > 20) {
+    /* P2.2：相对增量一律累加，不再用「近期有没有绝对报告」的时间窗口去猜。
+       真机网页 VNC 走相对模式时，平板开机只报过一次，那个 2 秒窗口会把之后
+       所有位移长期吞掉 —— 表现为「鼠标根本滑动不了，点一下才知道位置」。
+       QEMU 绝对模式里相对鼠标只收到 BTN 事件、dx/dy 恒为 0，所以「纯按钮/
+       滚轮报告」不动坐标即可，真正的位移一律累加，两者互不干扰。 */
+    G_rel_cnt++;
+    if (dx || dy) {
         int x = G_mx + dx, y = G_my + dy;
         mouse_clamp(&x, &y);
         G_mx = x; G_my = y;
@@ -583,7 +588,7 @@ void mouse_feed_abs(int ax, int ay, int btn, int wheel)
     int y = (int)(((long)ay * (h - 1)) / 32767) - G_moff_y;
     mouse_clamp(&x, &y);
     G_mx = x; G_my = y;
-    G_abs_seen = 1; G_abs_tick = tick;
+    G_abs_cnt++;
     G_btn_abs = btn & 7;
     G_mbtn = G_btn_abs | G_btn_rel;
     G_mwheel += wheel;
@@ -2437,6 +2442,8 @@ static void cmd_mousecal(char *a)
     uart_puts(" dy="); put_sdec(dy); uart_puts("\n");
     uart_puts("[mousecal] 最近平板原始坐标 ax="); uart_putdec((u32)ax);
     uart_puts(" ay="); uart_putdec((u32)ay); uart_puts(" (0..32767)\n");
+    uart_puts("[mousecal] 指针报告数 绝对="); uart_putdec(G_abs_cnt);
+    uart_puts(" 相对="); uart_putdec(G_rel_cnt); uart_puts("\n");
     uart_puts("[mousecal] 用法: mousecal / mousecal <dx> <dy> / mousecal reset\n");
     uart_puts("           或桌面「开始菜单 → 鼠标校准」点靶心自动校准\n");
 }

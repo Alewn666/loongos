@@ -83,7 +83,8 @@ HAL     framebuffer(GOP/ramfb) │ USB xHCI │ 10Hz timer
 
 - **P1 ✅**：渐变壁纸 + 顶栏 + 任务栏时钟、中英混排、脏矩形、开机默认进桌面、无 GOP 优雅降级。
 - **P2 ✅**：三设备同挂枚举、鼠标指针、点击 / 拖拽 / 关闭 / z 序、开始菜单 11 项、安装向导、图形终端跑全部命令、退出键改为**仅 Ctrl+Shift+F1**。
-- **P2.1 ✅**：鼠标固定偏移校准（点靶心自动补偿 + `mousecal` 命令 + 持久化）、绝对/相对坐标源互斥、virtio-scsi 放宽 ID 与失败自诊断。
+- **P2.1 ✅**：鼠标固定偏移校准（点靶心自动补偿 + `mousecal` 命令 + 持久化）、virtio-scsi 放宽 ID 与失败自诊断。~~绝对/相对坐标源互斥~~（该做法已在 P2.2 撤销）。
+- **P2.2 ✅**：修复 P2.1 引入的「相对鼠标不跟随」回归——去掉基于 `tick` 的 2 秒时间窗口，相对增量一律累加、纯按钮报告不动坐标；新增 `test_mousemove.py` 覆盖「只移动不点击」盲区；`mousecal` 增加绝对/相对输入源统计。
 - **P3+ 待做**：文件管理器、文本编辑器、窗口缩放与最小化、右键菜单、更换字库（见「诚实的边界」）。
 
 实测截图见 [docs/screenshots/](本体/docs/screenshots/)，逐轮设计与排障记录见 `LOONGOS_DESKTOP_TODO.md` 与 `docs/检查与修复记录.md`。
@@ -109,6 +110,7 @@ python3 test_nvme_install.py       # NVMe 装盘 → MOUNTED-DISK → 重启文�
 python3 test_desktop_p2.py         # 桌面 P2 端到端 8/8：QMP 注入鼠标点击/拖拽、
                                    # Ctrl+Shift+F1，screendump 抓图比对
 python3 test_mousecal.py           # 鼠标校准：串口命令/持久化 + 图形点靶心对齐
+python3 test_mousemove.py          # 只移动不点击：绝对/相对坐标下光标实时跟随（P2.2）
 bash test_drivers.sh               # 直启 TCG 抓设备识别
 ```
 
@@ -142,7 +144,7 @@ loongos/
 - **字库有已知缺陷**：`font_cjk.h` 里 `·`(U+00B7) 字形本身是两条竖线，部分框形字（口/回/窗）缺底横——是 885 个字形的历史数据问题，尚未整体更换；桌面文案已避开这些字。
 - **桌面与鼠标只在 TCG 下实测**：沙箱无 `/dev/kvm`，`test_desktop_p2.py` 8/8 全在 QEMU TCG 完成；真机是 KVM，装机后建议确认一次「进桌面 → 鼠标拖拽 → Ctrl+Shift+F1 → install/net」。
 - 输入是轮询式事件处理，没有触摸 / 多点触控 / 手势；窗口缩放、最小化、右键菜单仍在 P3 清单里。
-- **网页 VNC 的鼠标固定偏移**来自客户端画布留白 / 缩放没扣，内核改不了 VNC：`开始菜单 → 鼠标校准` 点一次靶心即可补偿，`mousecal` 命令可查询 / 手设 / 清零。偏移存 `/etc/mousecal`，未装盘（内存盘）时重启会丢。
+- **网页 VNC 的鼠标固定偏移**来自客户端画布留白 / 缩放没扣（VNC 走相对模式时，内核光标从屏幕中心累加位移，与客户端物理光标起点本就不同），内核改不了 VNC：`开始菜单 → 鼠标校准` 点一次靶心即可补偿，`mousecal` 命令可查询 / 手设 / 清零，并打印绝对/相对报告数判断 VNC 走哪种模式。偏移存 `/etc/mousecal`，未装盘（内存盘）时重启会丢。P2.2 已修复「相对位移被吞、鼠标不跟随」的回归。
 - 目标平台是 QEMU `virt` 与标准 UEFI aarch64，未适配具体实体 ARM 板卡的板级驱动。
 - 仓库里的 `BOOTAA64.EFI`、`kernel.elf` 与若干 `.o` 是构建产物，便于直接体验；源码以 `build.sh` 为准，新增编译产物不再纳入版本控制（见 `.gitignore`）。
 
