@@ -1,3 +1,4 @@
+#include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
 /* LoongOS —— virtio-rng 熵源驱动（virtio 随机数字设备，VIRTIO 1.0 modern）
  *
  * 为什么加它（2026-11-08，"补点驱动"）：
@@ -21,10 +22,6 @@ typedef unsigned int   u32;
 typedef unsigned short u16;
 typedef unsigned char  u8;
 
-extern void kputs(const char *);
-extern void kputhex(u64 v);
-extern void kputdec(u32 v);
-extern void pci_enum(void);
 
 /* ---------------- PCI ---------------- */
 #define PCI_ECAM_BASE   0x4010000000ULL

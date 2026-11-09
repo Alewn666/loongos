@@ -1,3 +1,4 @@
+#include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
 /* LoongOS 阶段6① / 桌面 P2 —— xHCI 主机控制器 + USB HID 键盘/鼠标/平板
  *
  * P2 目标（2026-11-08）：桌面要能用鼠标，且真机飞牛 VM 的拓扑是
@@ -21,15 +22,8 @@ typedef unsigned short u16;
 typedef unsigned char  u8;
 
 /* ---------- 内核侧接口（kernel.c 提供） ---------- */
-extern void kputs(const char *s);      /* 串口 + 屏幕 */
-extern void kputhex(u64 v);
-extern void kputdec(u32 v);
-extern void kbd_feed(char c);          /* 带临界区塞进 ring */
 
 /* 桌面 P2：鼠标事件与组合键（kernel.c 提供） */
-extern void mouse_feed_rel(int dx, int dy, int btn, int wheel);
-extern void mouse_feed_abs(int ax, int ay, int btn, int wheel);
-extern void desktop_hotkey_exit(void);
 
 
 /* ---------- 常量 ---------- */

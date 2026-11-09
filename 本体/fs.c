@@ -1,10 +1,10 @@
+#include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
 /* LoongOS 阶段4 - 极简文件系统（内存盘）实现
  * 经典三层：superblock + inode + 目录项；块分配走位图；文件块经 bmap（直接10 + 间接1）。
  * 无 libc：自带 memcpy/strlen/strcmp；无动态内存：一切都在 1MB 的 fs_disk 数组里。 */
 
 #include "fs.h"
 
-extern volatile u64 tick;    /* kernel.c 的时钟，mtime 用 tick/10 折算秒 */
 
 /* ---------------- 内存盘本体（以后换 virtio-blk 只动 bread/bwrite） ---------------- */
 static u8 fs_disk[FS_BLOCKS * FS_BLOCK];
@@ -20,8 +20,6 @@ static const u8 fs_zero[FS_BLOCK] = { 0 };   /* 零块模板（.rodata），ball
 /* ---- 阶段6③：磁盘后端 ----
    装上磁盘后 bread/bwrite 直接走 virtio-blk（每块 4KB = 8 个 512B 扇区，一次请求）。
    内存盘模式（没装盘 / 从 ISO 跑）保持原样。 */
-extern int vb_read_block(u64 blk_no, u64 part_lba, void *buf);
-extern int vb_write_block(u64 blk_no, u64 part_lba, const void *buf);
 
 static int  fs_on_disk = 0;        /* 1 = 根文件系统在磁盘分区上 */
 static u64  fs_part_lba = 0;       /* 分区起始 LBA（512B 扇区） */

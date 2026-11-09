@@ -1,3 +1,5 @@
+#include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
+#include "blkdev.h"    /* 块设备统一抽象层：导出 ops */
 /* LoongOS 阶段6③ —— virtio-scsi 磁盘驱动（modern virtio-pci，VIRTIO 1.0）
  *
  * 为什么需要它（2026-10-25）：
@@ -25,11 +27,6 @@ typedef unsigned int   u32;
 typedef unsigned short u16;
 typedef unsigned char  u8;
 
-extern void kputs(const char *s);
-extern void kputhex(u64 v);
-extern void kputdec(u32 v);
-extern void kputhex2(u8 v);
-extern void pci_enum(void);         /* 通用 PCI 枚举（裸机自举分配总线号/BAR/桥窗口） */
 
 /* ---------------- PCI ---------------- */
 #define PCI_ECAM_BASE   0x4010000000ULL
@@ -745,3 +742,16 @@ int vs_write(u64 lba, const void *buf, u32 nsec)
 }
 
 u32 vs_status(void) { return vs_last_status; }
+
+/* ---- 注册到统一块设备层（blkdev）----
+ * 后续新增磁盘驱动只需照此导出一个 xxx_ops，不必改动 kernel.c / virtio_blk.c。 */
+static u64 vs_dev_capacity_sectors(void) { return vs_capacity_bytes() / 512ull; }
+const struct blkdev_ops vs_ops = {
+    .name             = "virtio-scsi",
+    .init             = vs_init,
+    .present          = vs_present,
+    .capacity_bytes   = vs_capacity_bytes,
+    .capacity_sectors = vs_dev_capacity_sectors,
+    .read             = vs_read,
+    .write            = vs_write,
+};

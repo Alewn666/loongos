@@ -3,6 +3,13 @@
    控制器 virtio-scsi，光盘=LUN0，硬盘=LUN1（用户虚拟机就是这样）。
 阶段：① 从 ISO 启动 → install yes → ② 只挂硬盘启动 → ③ 写文件 → 重启后文件还在。
 用法：python3 test_scsi_install.py
+
+2026-11-10 修复历史遗留红项：早期硬编码 `-accel kvm -cpu host`，在没有
+/dev/kvm 的环境（本项目所有回归都跑在这种沙箱里）QEMU 会以
+"invalid accelerator kvm" 直接退出，串口 socket 连不上、self.s 恒为 None，
+pump() 抛含糊的 `AttributeError: 'NoneType' object has no attribute 'recv'`。
+现改为与 test_uefi.sh / test_nvme_install.py 一致的 TCG (-cpu cortex-a57)，
+并在串口连不上时打印 QEMU stderr 给出清晰错误。改动仅限测试脚本，内核不变。
 """
 import os, socket, shutil, subprocess, sys, time
 
@@ -30,8 +37,11 @@ class VM:
         # ⚠️ 每次都用全新 NVRAM：残留的启动项（指向 ISO）会让 UEFI 直接跳 PXE，
         #    表现为"装好的盘起不来"，其实是固件根本没去扫盘。2026-10-25 实测踩过。
         shutil.copy("/usr/share/AAVMF/AAVMF_VARS.fd", VARS)
+        # ⚠️ 用 TCG (-cpu cortex-a57)，不要 -accel kvm -cpu host：
+        #    沙箱/无 /dev/kvm 环境下后者会让 QEMU 启动即失败（见文件头说明）。
+        #    与 test_uefi.sh / test_nvme_install.py 保持同一套加速策略。
         cmd = ["qemu-system-aarch64", "-machine", "virt-7.2,gic-version=3",
-               "-accel", "kvm", "-cpu", "host", "-m", "128", "-smp", "1",
+               "-cpu", "cortex-a57", "-m", "128", "-smp", "1",
                "-drive", "if=pflash,format=raw,readonly=on,file=" + CODE,
                "-drive", "if=pflash,format=raw,file=" + VARS,
                "-serial", "unix:%s,server,nowait" % SER,
@@ -46,18 +56,30 @@ class VM:
             cmd += ["-device", "scsi-cd,bus=scsi0.0,channel=0,scsi-id=0,lun=0"]
         cmd += ["-drive", "if=none,id=hd0,format=raw,file=" + DISK,
                 "-device", "scsi-hd,bus=scsi0.0,channel=0,scsi-id=0,lun=1,drive=hd0"]
-        self.err = open(os.path.join(BASE, "build", "scsi_install_qemu.err"), "wb")
+        self.err_path = os.path.join(BASE, "build", "scsi_install_qemu.err")
+        self.err = open(self.err_path, "wb")
         self.p = subprocess.Popen(cmd, stdout=self.err, stderr=subprocess.STDOUT)
         self.s = None
         for _ in range(80):
+            if self.p.poll() is not None:      # QEMU 已退出，别再空等 8 秒
+                break
             try:
                 self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 self.s.connect(SER)
                 break
             except OSError:
                 self.s = None; time.sleep(0.1)
-        if self.s:
-            self.s.settimeout(0.2)
+        if self.s is None:
+            # 明确报出 QEMU 的真实死因（历史上这里静默留 None，最终在 pump()
+            # 抛 'NoneType' has no attribute 'recv'，排查成本极高）。
+            self.err.flush()
+            try:
+                with open(self.err_path, "rb") as f:
+                    why = f.read().decode("utf-8", "replace").strip()
+            except OSError:
+                why = "(读不到 QEMU stderr)"
+            raise RuntimeError("QEMU 串口连不上，QEMU 可能启动失败：\n  " + (why or "(无 stderr)"))
+        self.s.settimeout(0.2)
         self.buf = ""
 
     def pump(self, sec):

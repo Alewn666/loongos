@@ -1,3 +1,4 @@
+#include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
 /* LoongOS 桌面路线 P2 · 桌面外壳（desktop.c）
  *
  * 用户要求（2026-11-08）：
@@ -29,22 +30,8 @@ typedef unsigned long u64;
 typedef unsigned int  u32;
 
 /* ---- kernel.c / 驱动提供的桥 ---- */
-extern void usb_kbd_poll(void);
-extern void net_poll(void);
-extern void smp_tick_inc(void);
-extern void kputs(const char *s);
 #ifdef DESKTOP_MOUSE_DEBUG
-extern void kputdec(u32 v);          /* 仅诊断构建用：逐帧打印鼠标状态 */
 #endif
-extern void fb_console_reset(void);
-extern int  desktop_ring_peek_uart(void);
-extern int  desktop_ring_pop_kbd(char *c);
-extern volatile u64 tick;
-extern int  mouse_get(int *x, int *y, int *btn, int *wheel);
-extern void mouse_reset(int x, int y);
-extern int  desktop_exit_requested(void);
-extern void mouse_cal_set(int dx, int dy);
-extern void mouse_cal_get(int *dx, int *dy);
 
 /* ---- 配色 ---- */
 #define C_WALL_A    GFX_RGB(16, 30, 52)

@@ -1,3 +1,5 @@
+#include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
+#include "blkdev.h"    /* 块设备统一抽象层：导出 vb_ops */
 /* LoongOS 阶段6③ —— virtio-blk 磁盘驱动（**modern** virtio-pci，VIRTIO 1.0）
  *
  * 为什么用 modern 而不是 legacy：
@@ -20,9 +22,6 @@ typedef unsigned int   u32;
 typedef unsigned short u16;
 typedef unsigned char  u8;
 
-extern void kputs(const char *s);
-extern void kputhex(u64 v);
-extern void kputdec(u32 v);
 
 /* ---------------- PCI ---------------- */
 #define PCI_ECAM_BASE   0x4010000000ULL
@@ -99,23 +98,9 @@ static inline void bar(void)          { __asm__ volatile("dsb sy" ::: "memory");
 /* ---------------- 状态 ---------------- */
 /* ---- legacy 回退（virtio_blk_legacy.c）：QEMU transitional 设备上 modern 读特征会失败 ---- */
 /* ---- virtio-scsi 兜底（virtio_scsi.c）：虚拟机把盘挂成 scsi 总线时用这个 ---- */
-extern int vs_init(void);
-extern int vs_present(void);
-extern u64 vs_capacity_bytes(void);
-extern int vs_read(u64 lba, void *buf, u32 nsec);
-extern int vs_write(u64 lba, const void *buf, u32 nsec);
 
 /* 阶段9③：NVMe 原生磁盘驱动（参考 U-Boot drivers/nvme.c / Linux nvme/host/pci.c） */
-extern int  nv_init(void);
-extern int  nv_present(void);
-extern u64  nv_capacity_bytes(void);
-extern int  nv_read(u64 lba, void *buf, u32 nsec);
-extern int  nv_write(u64 lba, const void *buf, u32 nsec);
 
-extern int vbl_init(void);
-extern int vbl_request(u32 type, u64 lba, void *buf, u32 nsec, int dev_writes);
-extern u64 vbl_capacity_bytes(void);
-extern void pci_enum(void);         /* 通用 PCI 枚举（裸机自举分配总线号/BAR/桥窗口） */
 static int vb_use_legacy;
 static int  vb_ok;
 static u64  vb_common, vb_notify, vb_isr, vb_devcfg;
@@ -317,7 +302,18 @@ static int vb_init_modern(void)
     return 0;
 }
 
-int  vb_present(void)   { return vb_ok || vs_present() || nv_present(); }
+/* ------------------------------------------------------------------------
+ * 2026-11-09 内核优化：本文件回归「只管 virtio-blk」。
+ * 原先 vb_present / vb_capacity_* / vb_read / vb_write 五个函数里各硬编码了
+ * `vs_present()/nv_present()` 分发分支，等于把全系统块设备策略塞进了单个驱动。
+ * 现在这些分发统一由 blkdev.c 的 blk_* 门面按驱动表完成；本文件只提供
+ * vb_dev_* 私有实现 + 一个 vb_ops 注册项。历史名 vb_* 仍由 blkdev.c 导出，
+ * fs.c / kernel.c 的调用点一行未改。
+ *
+ * ⚠️ vb_dev_present() 必须**忠实返回 vb_ok**：历史里 legacy 初始化成功时
+ * vb_ok 仍为 0（只有 modern 成功才置位），vb_present() 因此不包括 legacy。
+ * 这是历史语义，不能"顺手修好"，否则行为变化。
+ * ---------------------------------------------------------------------- */
 /* 先试 modern，失败自动回退 legacy（QEMU/libvirt 给的 transitional 设备两种接口都可能有） */
 int vb_init(void)
 {
@@ -335,22 +331,13 @@ int vb_init(void)
     return r;
 }
 
-
 int  vb_modern_only(void) { return 0; }
-u64  vb_capacity_sectors(void)
+int  vb_dev_present(void) { return vb_ok; }
+u64  vb_dev_capacity_sectors(void) { return vb_cap_sec; }
+u64  vb_dev_capacity_bytes(void)
 {
-    if (vb_ok) return vb_cap_sec;
-    if (vs_present()) return vs_capacity_bytes() / 512ull;
-    if (nv_present()) return nv_capacity_bytes() / 512ull;
-    return 0;
-}
-u64  vb_capacity_bytes(void)
-{
-    if (!vb_ok) {
-        if (vs_present()) return vs_capacity_bytes();
-        if (nv_present()) return nv_capacity_bytes();
-        return 0;
-    }
+    /* 历史：vb_ok 为真时走这里；capacity_sectors 用 vb_cap_sec、bytes 在 legacy
+       下用 vbl_capacity_bytes() —— 两者不一致是历史原样，保留不动。 */
     return vb_use_legacy ? vbl_capacity_bytes() : vb_cap_sec * 512ull;
 }
 
@@ -398,13 +385,10 @@ static int vb_request(u32 type, u64 lba, void *buf, u32 nsec, int dev_writes)
     return -4;
 }
 
-int vb_read(u64 lba, void *buf, u32 nsec)
+/* 以下为 virtio-blk 私有实现，只由 vb_ops 调用（分发已在 blkdev.c 完成）。
+   历史 `if (!vb_ok) { vs/nv 分支 }` 那一段删除，语义由 blk_find() 等价保证。 */
+int vb_dev_read(u64 lba, void *buf, u32 nsec)
 {
-    if (!vb_ok) {
-        if (vs_present()) return vs_read(lba, buf, nsec);
-        if (nv_present()) return nv_read(lba, buf, nsec);
-        return -1;
-    }
     u32 done = 0;
     while (done < nsec) {
         u32 chunk = (nsec - done > 8) ? 8 : (nsec - done);
@@ -418,13 +402,8 @@ int vb_read(u64 lba, void *buf, u32 nsec)
     return 0;
 }
 
-int vb_write(u64 lba, const void *buf, u32 nsec)
+int vb_dev_write(u64 lba, const void *buf, u32 nsec)
 {
-    if (!vb_ok) {
-        if (vs_present()) return vs_write(lba, buf, nsec);
-        if (nv_present()) return nv_write(lba, buf, nsec);
-        return -1;
-    }
     u32 done = 0;
     while (done < nsec) {
         u32 chunk = (nsec - done > 8) ? 8 : (nsec - done);
@@ -438,12 +417,13 @@ int vb_write(u64 lba, const void *buf, u32 nsec)
     return 0;
 }
 
-/* fs 层用：一块 = 4KB = 8 扇区 */
-int vb_read_block(u64 blk_no, u64 part_lba, void *buf)
-{
-    return vb_read(part_lba + blk_no * 8, buf, 8);
-}
-int vb_write_block(u64 blk_no, u64 part_lba, const void *buf)
-{
-    return vb_write(part_lba + blk_no * 8, buf, 8);
-}
+/* ---- 注册到统一块设备层 ---- */
+const struct blkdev_ops vb_ops = {
+    .name             = "virtio-blk",
+    .init             = vb_init,
+    .present          = vb_dev_present,
+    .capacity_bytes   = vb_dev_capacity_bytes,
+    .capacity_sectors = vb_dev_capacity_sectors,
+    .read             = vb_dev_read,
+    .write            = vb_dev_write,
+};

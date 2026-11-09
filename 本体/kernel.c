@@ -1,3 +1,5 @@
+#include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
+#include "blkdev.h"    /* 块设备统一抽象层：blk_probe_all / 驱动表 */
 /* LoongOS 阶段5④ - 重定向（cmd > 输出到文件、write < 输入喂文件）
  * 阶段5① 起能力全保留：1MB 内存盘 fs（Unix 单根 /）、行输入 shell、root/demo + 口令 + DAC。
  * 本阶段新增：
@@ -21,10 +23,7 @@ typedef unsigned int  u32;
 typedef unsigned char u8;
 
 /* gfx.c 绘图层：kernel.c 只用到这两个（完整接口见 gfx_draw.h，供 desktop.c） */
-extern void gfx_init(void *fb, int w, int h, int stride);
-extern int  gfx_screen_owned(void);
 /* 桌面 P2：图形终端把 uart_putc 的每一字节收进自己的历史缓冲（未启用时立即返回） */
-extern void gfxterm_putc(char c);
 
 /* ---------------- PL011 串口（QEMU virt @ 0x09000000, IRQ 33） ---------------- */
 #define UART0_BASE 0x09000000UL
@@ -54,50 +53,13 @@ static __inline__ void io_wr32(u64 a, u32 v)
 }
 
 /* ---- 阶段6③：virtio-blk（virtio_blk.c） ---- */
-extern int  vb_init(void);
 /* ---- virtio-scsi（virtio_scsi.c）：虚拟机把硬盘挂成 scsi 总线时的驱动 ---- */
-extern int  vs_init(void);
-extern int  vs_present(void);
-extern unsigned long long vs_capacity_bytes(void);
-extern int  vb_present(void);
-extern int  vb_modern_only(void);
-extern u64  vb_capacity_bytes(void);
-extern u64  vb_capacity_sectors(void);
-extern int  vb_read(u64 lba, void *buf, u32 nsec);
-extern int  vb_write(u64 lba, const void *buf, u32 nsec);
 /* 阶段9③：NVMe 原生磁盘驱动（参考 U-Boot drivers/nvme.c / Linux drivers/nvme/host/pci.c） */
-extern int  nv_init(void);
-extern int  nv_present(void);
-extern u64  nv_capacity_bytes(void);
 /* 阶段9③：virtio-rng 真熵源（参考 Linux drivers/char/hw_random/virtio-rng.c / U-Boot） */
-extern int  rng_init(void);
-extern int  rng_present(void);
-extern int  rng_get(void *buf, u32 len);
-extern int  fs_format_disk(u64 part_lba, u32 nblocks);
-extern int  fs_mount_disk(u64 part_lba, u32 nblocks);
-extern int  fs_is_disk(void);
-extern u32  fs_blocks(void);
 /* 阶段7：联网（virtio_net.c 驱动 + net.c 协议栈） */
-extern int  net_init_driver(void);
-extern int  net_dhcp(void);
-extern int  net_static_config(const char *ip, const char *mask, const char *gw);
-extern void net_ifconfig_print(void);
-extern int  net_ping(const char *ip, int count);
-extern void net_poll(void);
 /* 阶段9：SMP */
-extern int  smp_start(unsigned long *cpu_mask);
-extern void smp_set_gic_ver(int v);
-extern int  smp_wait_online(unsigned long cpu, int spins);
-extern unsigned long smp_cpu_id(void);
-extern volatile unsigned long smp_online[4];
-extern volatile unsigned long smp_counter[4];
 
 /* 阶段8：TCP */
-extern int  tcp_connect(unsigned int ip, unsigned short port, int timeout_ms);
-extern int  tcp_send(const void *buf, int len);
-extern int  tcp_recv(void *buf, int max, int timeout_ms);
-extern void tcp_close(void);
-extern int  tcp_established(void);
 #define FR_TXFF    (1u << 5)
 #define FR_RXFE    (1u << 4)
 /* ⚠️ QEMU pl011：INT_RX=bit4、INT_TX=bit5（开错位=发一个字就中断风暴）；
@@ -990,12 +952,6 @@ static void gic_init(void)
 #define PROT_USERRW (PTE_VALID | PTE_TABLE | PTE_AF | PTE_SH_INNER | PTE_AP_KRW_URW | PTE_PXN | PTE_UXN | PTE_ATTR_NORM)
 
 /* 链接脚本给的节区边界（linker.ld） */
-extern u64 __text_start[], __text_end[];
-extern u64 __el0text_start[], __el0text_end[];
-extern u64 __rodata_start[], __rodata_end[];
-extern u64 __data_start[], __bss_end[];
-extern u64 __nvmedma_start[], __nvmedma_end[];   /* NVMe DMA 区（linker.ld 的 .nvmedma 段，排在栈之后） */
-extern u64 _stack_top[];
 
 /* 页表（4KB 对齐，放在 .bss 里，随内核一起被映射为 RW） */
 __attribute__((aligned(4096))) static u64 l0_table[512];  /* 阶段6①：48 位 VA 的 L0（只有 [0] 有用） */
@@ -1374,11 +1330,6 @@ static int path_resolve(const char *in, char *out, int cap);
 /* ---------------- 阶段5②：ELF 加载器 + 用户程序系统调用 ---------------- */
 /* 用户程序由 build.sh 编成独立 ELF（-Ttext=0x40100000），再用 objcopy -I binary
    把 ELF 文件本身嵌进内核镜像（符号 _binary_<名>_start/_end），开机写进 /bin */
-extern const u8 _binary_hello_elf_start[], _binary_hello_elf_end[];
-extern const u8 _binary_bad_elf_start[],  _binary_bad_elf_end[];
-extern const u8 _binary_hang_elf_start[], _binary_hang_elf_end[];
-extern const u8 _binary_cat_elf_start[],  _binary_cat_elf_end[];
-extern const u8 _binary_args_elf_start[], _binary_args_elf_end[];
 
 static u8 elf_buf[65536];           /* 装载缓冲：用户程序最大 64KB */
 static int user_running = 0;        /* 用户程序跑在 EL0 期间=1（SVC/fault 走用户路径） */
@@ -3205,29 +3156,23 @@ void kernel_main(unsigned long bootinfo)
         uart_puts("\n");
     }
 
-    /* ---- 阶段6③：先看有没有装好的磁盘系统，有就挂它，没有就用内存盘 ---- */
+    /* ---- 阶段6③：先看有没有装好的磁盘系统，有就挂它，没有就用内存盘 ----
+     * 2026-11-09 优化：探测链改由 blkdev 的驱动表驱动（blk_probe_all 依次
+     * init，遇第一个成功即停，顺序 = 历史 vb→vs→nv）。后续新增磁盘驱动
+     * 只需在 blkdev.c 的 blk_drivers[] 注册，不必再改这段启动逻辑。
+     * ⚠️ disk_kind 取 blk_active 索引对应的名字，不能用 blk_name()：后者按
+     *    运行时 present 查询，legacy 初始化成功时 vb_ok 仍为 0，会返回 "none"，
+     *    与历史打印不符。打印字节流保持逐字一致（拆成 3 次 puts 结果相同）。 */
     int fs_ready = 0;
-    int disk_ok = (vb_init() == 0);
-    const char *disk_kind = "virtio-blk";
+    int disk_ok = (blk_probe_all() == 0);
+    const char *disk_kind = disk_ok ? blk_drivers[blk_active]->name : "none";
     if (disk_ok) {
-        uart_puts("[disk] virtio-blk 就绪，容量 ");
+        uart_puts("[disk] "); uart_puts(disk_kind); uart_puts(" 就绪，容量 ");
     } else {
-        int rs = vs_init();
-        if (rs == 0) {
-            disk_ok = 1; disk_kind = "virtio-scsi";   /* 虚拟机把盘挂在 scsi 总线上 → virtio-scsi */
-            uart_puts("[disk] virtio-scsi 就绪，容量 ");
-        } else {
-            int rn = nv_init();
-            if (rn == 0) {
-                disk_ok = 1; disk_kind = "nvme";      /* 原生 NVMe 控制器（class=0x010802） */
-                uart_puts("[disk] nvme 就绪，容量 ");
-            } else {
-                uart_puts("[disk] 磁盘初始化失败（scsi r=");
-                uart_putdec((u32)(-rs));
-                uart_puts(" nvme r="); uart_putdec((u32)(-rn));
-                uart_puts("）→ 内存盘\n");
-            }
-        }
+        uart_puts("[disk] 磁盘初始化失败（scsi r=");
+        uart_putdec((u32)(-blk_init_rc[1]));
+        uart_puts(" nvme r="); uart_putdec((u32)(-blk_init_rc[2]));
+        uart_puts("）→ 内存盘\n");
     }
     if (disk_ok) {
         uart_putdec((u32)(vb_capacity_bytes() / (1024 * 1024)));

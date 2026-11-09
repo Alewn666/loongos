@@ -1,3 +1,4 @@
+#include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
 /* LoongOS 阶段7 —— virtio-net 网卡驱动（modern virtio-pci，VIRTIO 1.0）
  *
  * 与 virtio_blk.c 同一套路：modern MMIO BAR + 能力链 + VERSION_1 特征协商。
@@ -16,9 +17,6 @@ typedef unsigned int   u32;
 typedef unsigned short u16;
 typedef unsigned char  u8;
 
-extern void kputs(const char *s);
-extern void kputhex(u64 v);
-extern void kputdec(u32 v);
 
 /* ---------------- PCI（与 virtio_blk.c 同参） ---------------- */
 #define PCI_ECAM_BASE   0x4010000000ULL

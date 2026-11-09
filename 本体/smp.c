@@ -1,3 +1,4 @@
+#include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
 /* LoongOS 阶段9 —— SMP（多核）
  *
  * 已实现：
@@ -266,7 +267,6 @@ static long psci_cpu_on(u64 target, u64 entry, u64 ctx)
     return x0;
 }
 
-extern void smp_secondary_entry(void);
 
 int smp_start(u64 *cpu_mask_out)
 {

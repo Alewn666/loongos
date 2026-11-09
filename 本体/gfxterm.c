@@ -1,3 +1,4 @@
+#include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
 /* LoongOS 桌面路线 P2 · 图形终端（gfxterm.c）
  *
  * 一个「终端窗口」的完整实现：历史缓冲 + UTF-8 行渲染 + 输入行编辑器 +
@@ -15,7 +16,6 @@
 typedef unsigned int u32;
 
 /* kernel.c 导出：与串口 shell 完全同一个分发入口 */
-extern void shell_dispatch_line(char *s);
 
 #define GT_HIST   12288
 #define GT_LINE   200

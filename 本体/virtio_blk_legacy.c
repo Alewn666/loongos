@@ -1,3 +1,4 @@
+#include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
 /* LoongOS 阶段6③ —— virtio-blk 的 **legacy** 实现（modern 失败时的回退路径）
  *
  * 背景（2026-10-25）：modern 路径在 QEMU 的 transitional 设备上读设备特征失败

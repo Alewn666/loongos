@@ -1,3 +1,4 @@
+#include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
 /* LoongOS 桌面路线 P1 · 绘图实现层（gfx.c）
  *
  * 职责：把 gfx.h 的纯函数（裁剪/相交/脏矩形合并）接到真实帧缓冲上。
@@ -20,7 +21,6 @@ typedef uint8_t  u8;
 
 /* kernel.c 导出：查询字形位图（不拷贝）。返回 0 = 找到。
    row_bytes：ASCII 为 1（8 像素/行），CJK 为 2（16 像素/行，高低字节各 8 像素） */
-extern int fb_query_glyph(u32 cp, const u8 **bmp, int *w, int *h, int *row_bytes);
 
 static volatile u32 *G_fb;
 static int G_w, G_h, G_stride;

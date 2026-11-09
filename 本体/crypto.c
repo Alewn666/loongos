@@ -1,3 +1,4 @@
+#include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
 /* LoongOS SHA-256（FIPS 180-4 标准算法，纯 C 实现）
  * 栈占用：sha256_block 内 w[64]=256B + 尾块 tail[128] → 合计 ~400B，
  * 内核栈由 linker.ld 在 .bss 里留 32KB（. += 32 * 1024），余量充足。 */

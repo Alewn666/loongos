@@ -1,3 +1,4 @@
+#include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
 /* LoongOS 阶段8 —— 最小 TCP（RFC 793 子集）
  *
  * 目标：能连出去、能收发、能体面关闭。够 SSH 握手 / HTTP GET 用。
@@ -18,13 +19,8 @@ typedef unsigned int   u32;
 typedef unsigned short u16;
 typedef unsigned char  u8;
 
-extern void kputs(const char *s);
-extern void kputhex(u64 v);
-extern void kputdec(u32 v);
-extern volatile u64 tick;
 
 /* net.c 提供的收发原语 */
-extern int  ip_send_tcp(u32 dst_ip, const u8 *seg, int len);
 
 /* 时钟（同 net.c：测试可注入） */
 #ifndef NET_NO_CNT

@@ -1,3 +1,5 @@
+#include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
+#include "blkdev.h"    /* 块设备统一抽象层：导出 ops */
 /* LoongOS —— NVMe 磁盘驱动（PCIe NVMe 控制器，NVM Express 1.x）
  *
  * 为什么加它（2026-11-08，"补点驱动"）：
@@ -27,11 +29,6 @@ typedef unsigned int   u32;
 typedef unsigned short u16;
 typedef unsigned char  u8;
 
-extern void kputs(const char *);
-extern void kputhex(u64 v);
-extern void kputdec(u32 v);
-extern void kputhex2(u8 v);
-extern void pci_enum(void);
 
 /* ---------------- PCI ---------------- */
 #define PCI_ECAM_BASE   0x4010000000ULL
@@ -528,6 +525,18 @@ int nv_init(void)
 
 int nv_present(void) { return nvme_ok; }
 u64 nv_capacity_bytes(void) { return nvme_ok ? nvme_cap_sec * 512ull : 0; }
+static u64 nv_capacity_sectors_impl(void) { return nv_capacity_bytes() / 512ull; }
+
+/* ---- 注册到统一块设备层（blkdev）---- */
+const struct blkdev_ops nv_ops = {
+    .name             = "nvme",
+    .init             = nv_init,
+    .present          = nv_present,
+    .capacity_bytes   = nv_capacity_bytes,
+    .capacity_sectors = nv_capacity_sectors_impl,
+    .read             = nv_read,
+    .write            = nv_write,
+};
 
 /* ---------------- 读写（调用方传 512B 扇区；内部按块大小换算并分批） ---------------- */
 int nv_read(u64 lba, void *buf, u32 nsec)

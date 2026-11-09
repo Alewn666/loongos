@@ -1,3 +1,4 @@
+#include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
 /* LoongOS 阶段7 —— 最小网络栈（以太网 + ARP + IPv4 + ICMP + UDP + DHCP 客户端）
  *
  * 设计取舍（教学内核，够用为止）：
@@ -13,17 +14,7 @@ typedef unsigned int   u32;
 typedef unsigned short u16;
 typedef unsigned char  u8;
 
-extern void kputs(const char *s);
-extern void kputhex(u64 v);
-extern void kputdec(u32 v);
-extern volatile u64 tick;              /* kernel.c：10Hz */
 
-extern int  vn_init(void);
-extern int  vn_present(void);
-extern void vn_mac_copy(u8 out[6]);
-extern int  vn_link(void);
-extern int  vn_send(const void *frame, int len);
-extern int  vn_poll(int (*on_rx)(const u8 *frame, int len));
 
 /* ---------------- 小工具 ---------------- */
 static void put16(u8 *p, u16 v) { p[0] = (u8)(v >> 8); p[1] = (u8)v; }

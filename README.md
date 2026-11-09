@@ -29,6 +29,25 @@
 | 网络 | `virtio_net.c` / `net.c` / `tcp.c` | virtio-net + TCP 协议栈 |
 | 加密 | `crypto.c` / `test_crypto.c` | 登录口令校验与哈希 |
 | 安装 | `build_iso.sh` / `build_image.sh` | 生成可写入硬盘的 ISO 与磁盘镜像；五方 md5 校验保证 ISO 内嵌内核与源码构建一致 |
+| 内核接口 | `loongos.h` | 跨模块声明的唯一事实来源；收敛散落在各 `.c` 的 127 处重复 `extern`，修掉类型漂移与幽灵声明 |
+| 块设备抽象 | `blkdev.h` / `blkdev.c` | `struct blkdev_ops` + `blk_drivers[]` 统一优先级表；新增驱动只改 3 处，不再动 `kernel.c` |
+| 构建与空间守卫 | `build.sh` / `bss_budget.txt` | `KERN_SRCS` 单一编译单元来源 + 未登记源文件守卫 + 每次构建打印分段预算与上界余量 |
+
+## 内核结构优化（2026-11-10）：为后续功能铺路，功能零变化
+
+这一轮**不改任何功能**，只把内核「地基」整理成能继续往上长东西的样子。方法是先固化两份基线，再分四阶段重构，每阶段都用基线证明行为没变：
+
+| 阶段 | 改动 | 「功能不变」的证据 |
+| --- | --- | --- |
+| 基线 | `golden_behavior.txt`（启动日志 + 29 条命令逐字）+ `kernel.elf` md5 `072bbda9…` | 连续两次采集一致 |
+| 一 · 结构解耦 | 新建 `loongos.h` 作跨模块声明唯一来源，删 127 处重复 `extern`；`build.sh` 收敛为 `KERN_SRCS` 单一来源 + 未登记源文件守卫 | 重构后 `kernel.elf` md5 仍为 `072bbda9…`，**逐字节不变** |
+| 二 · 块设备抽象 | 新建 `blkdev.h/.c`，virtio-blk / virtio-scsi / NVMe 各导出 `xxx_ops`，`blk_drivers[]` 统一优先级，`vb_*` 保留兼容门面 | 行为基线逐字一致；NVMe 装盘 / UEFI 5 拓扑 / 桌面 / EL0 全通过 |
+| 三 · 空间预算 | 定位 BSS 余量 8→4 KB 的根因（`.bss` 内 4 KB 对齐缓冲被一个 4 B 标志顶后一页，是链接对齐碎片、非泄漏）；`build.sh` 增分段预算表 + 三级阈值 + 团队基线 delta | 注入 20 KB 静态缓冲，守卫 fail fast 拦下越界；`kernel.elf` md5 不变 |
+| 四 · 交付 | 全套回归 9/9、ISO 重建（内嵌内核五方 md5 一致）、文档与仓库同步 | — |
+
+新增一个块设备驱动（AHCI / USB 存储 / virtio 新类型）现在只需三步：**导出 `xxx_ops` → `blk_drivers[]` 加一项 → `build.sh` 登记 `.c`**，`kernel.c` 和各既有驱动一行都不用改；以前要同时改 5 个门面函数 + 启动探测链 + 类型判断共 7 处，漏一处就「认得到盘但读不了」。
+
+关于上界余量为什么是 4 KB、它会不会悄悄越界、后续真要更多空间怎么扩，见 [内核空间预算与扩容指引](本体/docs/内核空间预算与扩容指引.md)。
 
 ## 从源码到开机
 
@@ -36,7 +55,8 @@
 
 ```bash
 cd 本体
-sh build.sh                # 需要 aarch64-linux-gnu- 工具链；内含 BSS 余量守卫（当前余量 12 KB）
+sh build.sh                # 需要 aarch64-linux-gnu- 工具链；内含内核空间预算守卫
+                           # （每次构建打印各段大小与上界余量，见 docs/内核空间预算与扩容指引.md）
 sh run.sh                  # 最简：纯串口，QEMU virt (gic-version=2, cortex-a57, 128MB)
                            # 退出：Ctrl+A 松开，再按 X
 
@@ -95,6 +115,9 @@ HAL     framebuffer(GOP/ramfb) │ USB xHCI │ 10Hz timer
 
 ```bash
 cd 本体
+# 「功能不变」的两道基线（内核结构性优化后必跑）
+python3 test_behavior.py --compare golden_behavior.txt   # 启动日志 + 29 条命令逐字比对
+                                                        # build.sh 末尾自动打印内核空间预算表
 python3 test_stage4_fs.py          # 文件系统            28/28
 python3 test_stage5_qemu.py        # QEMU 启动            35/35
 python3 test_stage5b_elf.py        # ELF 用户程序         33/33
@@ -122,16 +145,21 @@ bash test_drivers.sh               # 直启 TCG 抓设备识别
 loongos/
 ├── 本体/                 # 内核源码、构建与测试（主体）
 │   ├── boot.S kernel.c smp.c fs.c crypto.c net.c tcp.c
+│   ├── loongos.h         # 跨模块声明唯一事实来源（2026-11-10 内核优化）
+│   ├── blkdev.h blkdev.c # 块设备统一抽象层：驱动表 + 统一门面
 │   ├── usb_kbd.c virtio_*.c nvme.c pci.c virtio_rng.c uefi_stub.c
 │   ├── gfx.h gfx.c gfx_draw.h desktop.c desktop.h gfxterm.c gfxterm.h
 │   ├── font8x16.h font_cjk.h linker.ld auth_cred.h
 │   ├── user/             # 用户态 ELF 样例程序
 │   ├── build.sh build_iso.sh build_image.sh build_pe.py
+│   ├── bss_budget.txt    # 内核空间预算基线（build.sh 自动维护，纳入版本库）
+│   ├── golden_behavior.txt  # 行为黄金基线：启动日志 + 29 条命令
 │   ├── run.sh run_full.sh make_disk.sh   # 最简 / 满配启动 / 磁盘镜像
 │   ├── test_stage*.py test_desktop_p2.py test_nvme_install.py
+│   ├── test_behavior.py  # 行为基线采集/逐字比对
 │   ├── test_uefi.sh test_drivers.sh test_wm_host.c test_net_host.c
 │   ├── LOONGOS_*_TODO.md  # 各阶段任务清单（内核演进档案）
-│   └── docs/             # 桌面架构、检查与修复记录、实测截图
+│   └── docs/             # 桌面架构、检查与修复记录、内核空间预算与扩容指引、实测截图
 └── 手机版/               # Termux + QEMU 运行说明与修复记录
 ```
 
@@ -153,6 +181,7 @@ loongos/
 - [手机版/说明.md](手机版/说明.md) — 在安卓手机上从安装到敲命令
 - [本体/LOONGOS_DESKTOP_TODO.md](本体/LOONGOS_DESKTOP_TODO.md) — 桌面 P1/P2 验收清单与 P3+ 待办
 - [本体/docs/桌面系统_架构与路线.md](本体/docs/桌面系统_架构与路线.md) — 早期图形化架构与分期清单（其中「只有 write/exit 两个系统调用」的现状描述已过时）
+- [本体/docs/内核空间预算与扩容指引.md](本体/docs/内核空间预算与扩容指引.md) — 内核链接布局、BSS 余量 ±4 KB 对齐碎片根因、预算守卫与扩容路径
 - [本体/docs/检查与修复记录.md](本体/docs/检查与修复记录.md) — 逐轮设计取舍与排障实录
 - `LOONGOS_*_TODO.md` 与 `docs/检查与修复记录*.md` — 各阶段任务清单
 

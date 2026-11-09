@@ -1,0 +1,232 @@
+=== BOOT ===
+[probe] A pl011 ok
+[probe] B fb_init ok
+[probe] C raw_hex=0xADDR
+[boot] bi=0xADDR
+[probe] D uart_puthex ok
+
+
+========================================
+  灵珑系统 | LoongOS stage5 - 用户与权限
+========================================
+[gic ] GICv2 + PL011 RX 中断已开
+[mmu ] MMU 已开启：内核 text 只读、data 可写、设备 Device 映射
+[smp ] PSCI 拉起从核 0 个
+[strchk] zh-bytes=e7 81 b5 e7 8f 91
+[disk] modern 初始化失败(r=1)，回退 legacy … ❌ legacy 也不可用
+[scsi] 扫描总线数=2
+[scsi] 没找到 virtio-scsi 设备(1af4:#/#/#)
+[scsi] PCI 清单 b:d.f id=vendor:device cls=baseclass
+[scsi]  0:0.0 id=0xADDR cls=0xADDR
+[scsi]  0:1.0 id=0xADDR cls=0xADDR
+[nvme] 未找到 NVMe 控制器(class=0xADDR)
+[disk] 磁盘初始化失败（scsi r=1 nvme r=1）→ 内存盘
+[fs  ] 内存盘 1MB 格式化完成，/ /etc /bin /home + 演示文件已建
+[fs  ] root type=1 size=#  lookup(/home)=0xADDR lookup(/etc/hostname)=0xADDR
+[rng] 未找到 virtio-rng 设备(1af4:#/#)
+[auth] /etc/passwd + /etc/shadow（SHA-256 迭代哈希 x50000）+ /home/demo 已建
+[auth] 用户: root(0) / demo(#)；默认口令见文档（教学演示），whoami 看身份，su 切换
+[user] /bin/hello /bin/bad /bin/hang /bin/cat /bin/args 已装进内存盘（内嵌 ELF，run <路径> 可跑）
+[time] Generic Timer freq=0xADDRHz，10Hz 抢占式轮转
+[usb ] 没找到 xHCI 控制器（虚拟机没插 USB 控制器？）
+[shell] help=命令清单；试试 ls /  cat /home/readme.txt  whoami  su demo
+> [desktop] 无帧缓冲，保持串口 shell
+>
+=== CMD: help ===
+help
+命令清单:
+  ls [路径]            列目录（无路径=当前目录）
+  cd [路径]            切换当前目录（默认 /；支持 . .. 和相对路径）
+  pwd                  看当前目录
+  cat <路径>           看文件
+  write <路径> <内容>  建/覆写文件
+  mkdir <路径>         建目录
+  rm <路径>            删文件或空目录
+  df                   内存盘用量
+  touch <路径>         建空文件；已存在则刷新修改时间
+  mv <源> <目标>       改名 / 移动文件（不支持目录）
+  stat <路径>          看 inode / 类型 / 大小 / 属主 / 时间
+  管道: a | b          单级；右段可用 cat / wc / grep <词> / head [n] / write
+        ls /etc | wc | cat    （左段不能带 > <，右段可再接 > 写文件）
+  whoami               当前身份
+  su [用户]            切换用户（要口令；root 免）——默认 root/demo
+  run <路径> [参数…]   跑用户程序（如 run /bin/cat、run /bin/args hello world）
+  重定向: cmd > 文件   把命令输出写进文件（如 ls /etc > t.txt）
+           write 目标 < 源  把源文件整份写给目标（= 文件复制）
+  mmu | tasks | el0    MMU 状态 / 任务表 / 进 EL0 演示
+  crash udf|brk|abort|wronly   崩溃演示（都会转储+自愈）
+  bench                内核微基准（内存/帧缓冲性能）
+  disks | disktest     看 virtio 磁盘 / 读写自测（写盘尾 8 扇区）
+  scsi | rng [N]       看 virtio-scsi / 取 N 字节真随机熵（默认 32）
+  install yes          把系统装到硬盘（会清空整块盘！需从 ISO 启动）
+  net | net dhcp       初始化网卡 / 走 DHCP 拿 IP
+  net static <ip> [掩码] [网关]   手配 IP
+  ifconfig             看网卡状态 / IP / 统计 / ARP 缓存
+  ping <ip> [1-10]     ICMP ping（带 RTT）
+  tcp get <ip> <端口>  建 TCP 连接并读最多 3 秒（80 自动发 GET）
+  cpu                  看多核：哪几颗在线 / 计数是否在涨
+  desktop             进图形桌面（开机默认；Ctrl+Shift+F1 返回终端）
+  mousecal            看/设鼠标偏移（桌面开始菜单可点靶心自动校准）
+  help                 本清单
+>
+=== CMD: pwd ===
+pwd
+/
+>
+=== CMD: whoami ===
+whoami
+root (uid=0)
+>
+=== CMD: df ===
+df
+RAM 盘: 已用 25 / 256 块（100 KB / # KB）
+>
+=== CMD: ls ===
+ls
+d  .
+d  ..
+d  etc
+d  bin
+d  home
+>
+=== CMD: ls /etc ===
+ls /etc
+d  .
+d  ..
+f  hostname  5B
+f  passwd  17B
+f  shadow  186B
+>
+=== CMD: ls /bin ===
+ls /bin
+d  .
+d  ..
+f  hello  5624B
+f  cat  6072B
+f  args  5984B
+f  bad  5768B
+f  hang  5528B
+>
+=== CMD: cat /etc/hostname ===
+cat /etc/hostname
+myos
+>
+=== CMD: cat /home/readme.txt ===
+cat /home/readme.txt
+你好，这是灵珑系统（LoongOS）文件系统里的第一个文件！
+内存盘 1MB，块 4KB，superblock+位图+inode 表的经典结构。
+试试: ls /home  cat /home/readme.txt  write /home/a.txt hi  df
+>
+=== CMD: stat /etc/hostname ===
+stat /etc/hostname
+路径: /etc/hostname
+inode: 5  类型: 普通文件  大小: 5 字节
+属主 uid: 0  私密: 否  mtime: 0 秒
+>
+=== CMD: wc /etc/hostname ===
+wc /etc/hostname
+用法: <命令> | wc
+>
+=== CMD: head /etc/hostname ===
+head /etc/hostname
+用法: <命令> | head [行数]
+>
+=== CMD: grep LoongOS /home/readme.txt ===
+grep LoongOS /home/readme.txt
+grep 需要管道输入
+>
+=== CMD: ls /etc | wc | cat ===
+ls /etc | wc | cat
+管道语法错：目前只支持单级 a | b
+>
+=== CMD: ls /etc | head 3 ===
+ls /etc | head 3
+d  .
+d  ..
+f  hostname  5B
+>
+=== CMD: ls /etc > t.txt ===
+ls /etc > t.txt
+已重定向 63 字节 -> /t.txt
+>
+=== CMD: cat t.txt ===
+cat t.txt
+d  .
+d  ..
+f  hostname  5B
+f  passwd  17B
+f  shadow  186B
+>
+=== CMD: write cp.txt < /etc/hostname ===
+write cp.txt < /etc/hostname
+已写入 5 字节 -> /cp.txt（来自 < 文件）
+>
+=== CMD: cat cp.txt ===
+cat cp.txt
+myos
+>
+=== CMD: foobar ===
+foobar
+未知命令: foobar（help 看清单）
+>
+=== CMD: ls /nope ===
+ls /nope
+没有这个路径: /nope
+>
+=== CMD: cat ===
+cat
+用法: cat <路径>
+>
+=== CMD: mousecal ===
+mousecal
+[mousecal] 当前偏移 dx=0 dy=0
+[mousecal] 最近平板原始坐标 ax=0 ay=0 (0..#)
+[mousecal] 指针报告数 绝对=0 相对=0
+[mousecal] 用法: mousecal / mousecal <dx> <dy> / mousecal reset
+           或桌面「开始菜单 → 鼠标校准」点靶心自动校准
+>
+=== CMD: disks ===
+disks
+没有可用磁盘（virtio-blk / virtio-scsi / nvme 都未识别）
+>
+=== CMD: scsi ===
+scsi
+[scsi] dbg bdf=0 id=0xADDR rawBAR: 0xADDR 0xADDR 0xADDR 0xADDR 0xADDR 0xADDR
+[scsi] 扫描总线数=2
+[scsi] 没找到 virtio-scsi 设备(1af4:#/#/#)
+[scsi] PCI 清单 b:d.f id=vendor:device cls=baseclass
+[scsi]  0:0.0 id=0xADDR cls=0xADDR
+[scsi]  0:1.0 id=0xADDR cls=0xADDR
+[scsi] reinit rc=1 present=0
+>
+=== CMD: rng 8 ===
+rng 8
+[rng] 未就绪（内核没有 virtio-rng 设备）
+>
+=== CMD: mmu ===
+mmu
+
+[mmu] SCTLR=0xADDR (M=0xADDR C=0xADDR I=0xADDR)
+[mmu] TCR  =0xADDR  TTBR0=0xADDR  MAIR=0xADDR
+[sect] text 0xADDR..0xADDR
+[sect] el0  0xADDR..0xADDR
+[sect] roda 0xADDR..0xADDR
+[sect] data 0xADDR..0xADDR
+[el0]  page 0xADDR
+>
+=== CMD: tasks ===
+tasks
+
+[tick] 现在 tick=#xADDR  当前任务=task0xADDR
+任务表（共 2 个）:
+[task] task0xADDR kernel/shell  被调度 0xADDR 次  帧=0xADDR（运行中，上次帧已消费）
+[task] task0xADDR worker  被调度 0xADDR 次  帧=0xADDR  上次抢占点 ELR=0xADDR
+>
+=== CMD: cpu ===
+cpu
+本核 MPIDR.aff0=0  本核 tick=#
+  cpu0  在线    tick #  (+0)
+  cpu1  未启动  tick #  (+0)
+  cpu2  未启动  tick #  (+0)
+  cpu3  未启动  tick #  (+0)
+>
