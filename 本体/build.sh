@@ -74,6 +74,28 @@ ${CROSS}ld -T linker.ld -o kernel.elf $OBJS \
     build/hello_blob.o build/bad_blob.o build/hang_blob.o build/cat_blob.o build/args_blob.o
 ${CROSS}objdump -h kernel.elf | head -12
 
+# --- 启动期 fw_cfg DMA 缓冲「段归属」守卫（P3.2 事故固化）------------------------
+# 事故（2026-11-10）：fwc_cfg_buf/fwc_dma_desc 原是 .bss 里未初始化的静态数组。
+#   P3.2 往 .bss 中段插入 136B 按钮边沿队列后，链接器把它们从 0x400b8778/
+#   0x400b8798 推到 0x400b8808/0x400b8828；QEMU fw_cfg DMA 对描述符/数据缓冲的
+#   绝对地址敏感，图形拓扑(ramfb)下第四笔 fwcfg.dma 触发后 guest 直接挂死，
+#   串口日志止于 [probe] A pl011 ok。二分 + 逐笔插桩实证：与逻辑/越界/对齐/
+#   余量全无关，纯粹是地址漂移。修复 = 显式初始化让它们落 .data，与 .bss 解耦。
+# 这里把约束钉死：两个符号的 nm 段类型必须是 d/D（.data）或 r/R（.rodata），
+#   绝不能是 b/B（.bss）。谁改回去，构建立刻 fail fast，不用再等到真机黑屏。
+DMA_SEG_FAIL=0
+for sym in fwc_cfg_buf fwc_dma_desc; do
+    seg=$(${CROSS}nm kernel.elf | awk -v s="$sym" '$NF==s{print $2; exit}')
+    case "$seg" in
+        d|D|r|R) printf '[guard] fw_cfg DMA 缓冲 %-14s 段=%s（.data/.rodata）✓\n' "$sym" "$seg" ;;
+        *)       echo "X fw_cfg DMA 缓冲 $sym 落在段 '$seg'（应为 .data 的 d/D）"; DMA_SEG_FAIL=1 ;;
+    esac
+done
+[ "$DMA_SEG_FAIL" = 0 ] || {
+    echo "X 启动期 fw_cfg DMA 缓冲必须留在 .data：见 kernel.c 里 2026-11-10 事故注释"
+    exit 1
+}
+
 # --- 内核空间预算守卫（阶段三）：把「还剩多少空间」量化到每一次构建 -----------
 # 背景（阶段6③ 血泪 + 阶段二新发现）：
 #   * 无堆分配器，所有窗口/图形缓冲/设备 DMA 队列都是静态数组；BSS 一旦涨过

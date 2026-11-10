@@ -2,7 +2,7 @@
 margin_bytes=4096
 kernel_upper=0x4020f000
 user_base=0x40210000
-bss_bytes=1385920
-data_bytes=30712
+bss_bytes=1385952
+data_bytes=30768
 nvmedma_bytes=24576
-align_gap_bytes=2624
+align_gap_bytes=2592

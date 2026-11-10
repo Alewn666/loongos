@@ -51,6 +51,18 @@ static char G_line[64];
 static int  G_line_n;
 static int  G_exit;          /* Ctrl+Shift+F1 退出标志 */
 
+/* ---- P3.3 白色闪烁插入光标（与 ARM 图形终端同一套手感）------------------
+ * 用共用绘图层 gfx_draw_caret() 画方块；相位由 PIT g_ticks 驱动（100Hz，
+ * 10ms/tick），打字后 500ms 常亮，之后 500ms 亮 / 500ms 灭。
+ * 输入行改成深色终端条，白色光标才看得见。
+ */
+#define XT_INPUT_BG  GFX_RGB(20, 33, 52)
+#define XT_TEXT      GFX_RGB(207, 224, 242)
+#define XT_CARET     GFX_RGB(255, 255, 255)
+static int  G_blink_on = 1;
+static unsigned long long G_last_key_ms;
+static int  G_key_kick = 1;
+
 /* 记录指针轨迹，画一条淡色轨迹线，直观验证「实时跟随」 */
 #define TRAIL_MAX 32
 static int G_tx[TRAIL_MAX], G_ty[TRAIL_MAX], G_tn;
@@ -87,16 +99,20 @@ static void draw_all(void)
     gfx_text(w1.x+12, w1.y+100, "相对/绝对统一，按钮边沿上报，无坐标漂移",
              GFX_RGB(0x33,0x66,0x99), 0xFFFFFFFFu);
 
-    /* 终端窗口：键盘回显 */
+    /* 终端窗口：深色输入条 + 白色文字 + 白色闪烁插入光标（P3.3） */
     struct gfx_rect w2 = {40, 220, 520, 150};
     draw_window(w2, "图形终端");
+    struct gfx_rect inr = {w2.x + 8, w2.y + 30, w2.w - 16, 24};
+    gfx_fill(inr, XT_INPUT_BG);
     char prompt[80];
     int n = 0;
     const char *pre = "> ";
     while (pre[n]) { prompt[n] = pre[n]; n++; }
     for (int i = 0; i < G_line_n; i++) prompt[n++] = G_line[i];
     prompt[n] = 0;
-    gfx_text(w2.x+12, w2.y+34, prompt, GFX_RGB(0x10,0x10,0x10), 0xFFFFFFFFu);
+    gfx_text(inr.x + 4, inr.y + 4, prompt, XT_TEXT, 0xFFFFFFFFu);
+    int caret_x = inr.x + 4 + gfx_text_w(prompt);
+    gfx_draw_caret(caret_x, inr.y + 4, G_blink_on, XT_CARET, XT_INPUT_BG);
 
     /* 状态窗口：诊断数据（帧数 / 指针坐标 / 丢失数 / 节拍） */
     struct gfx_rect w3 = {480, 48, 280, 150};
@@ -149,6 +165,9 @@ static void handle_frame(const struct input_event *ev, int n)
             continue;
         }
         if (e->value == KEY_VAL_UP) continue;       /* 只在按下/重复时回显 */
+        /* P3.3 正在输入：光标立刻回到常亮并从这一刻重新计时 */
+        G_key_kick = 1;
+        if (!G_blink_on) G_blink_on = 1;
         char c;
         if (input_key_to_ascii(e->code, mods, &c)) {
             if (c == '\b') { if (G_line_n) G_line_n--; }
@@ -169,6 +188,7 @@ void desktop_run(void)
     draw_all();
 
     struct input_event buf[INPUT_FRAME_MAX];
+    G_blink_on = 1; G_key_kick = 1;
     for (;;) {
         if (G_exit) break;
         int got = 0;
@@ -179,9 +199,19 @@ void desktop_run(void)
                 got = 1;
             }
         }
-        if (got) draw_all();               /* 有输入帧才重绘：清楚证明「移动即刷新」 */
 
-        /* 空闲时 hlt 等中断，避免空转烧 CPU；中断会唤醒 */
+        /* P3.3 闪烁相位：PIT 100Hz → 10ms/tick。hlt 每 10ms 被 PIT 唤醒，
+           空闲时也按真实时间推进，相位翻转就重绘一次（光标闪烁）。 */
+        unsigned long long now_ms = g_ticks * 10ull;
+        if (G_key_kick) { G_key_kick = 0; G_last_key_ms = now_ms; }
+        unsigned long long since = now_ms - G_last_key_ms;
+        int on = (since < 500ull) ? 1
+               : (((since - 500ull) / 500ull) & 1) == 0;
+        if (on != G_blink_on) { G_blink_on = on; got = 1; }
+
+        if (got) draw_all();               /* 有输入帧或相位翻转就重绘 */
+
+        /* 空闲时 hlt 等中断，避免空转烧 CPU；PIT 会周期性唤醒 */
         __asm__ volatile("hlt");
     }
     gfx_release_screen();

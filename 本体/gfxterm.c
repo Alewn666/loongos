@@ -29,15 +29,29 @@ typedef unsigned int u32;
 #define C_DIM     GFX_RGB(122, 138, 166)
 #define C_PROMPT  GFX_RGB(86, 214, 176)
 #define C_INPUTBG GFX_RGB(20, 33, 52)
+#define C_WHITE   GFX_RGB(255, 255, 255)   /* P3.3 插入光标：白色 */
 #define C_TRANSP  0xFFFFFFFFu
 
 static char G_hist[GT_HIST];
 static int  G_len;
 static volatile int G_on;
-static int  G_dirty;
+static int  G_dirty;                  /* P3.3: 0 无 / 1 仅输入行 / 2 整窗口 */
 static int  G_scroll;                 /* 向上翻了多少行（0 = 贴底） */
 static char G_line[GT_LINE];
 static int  G_llen;
+
+/* ---- P3.3 白色闪烁插入光标（Linux / Windows 终端节奏）----------------------
+ * 打字时光标常亮；停手 500ms 后开始 500ms 亮 / 500ms 灭地闪。
+ * 相位由桌面循环喂进来的「真实毫秒」驱动，与 CPU 主频、帧率都无关；
+ * 空闲时靠 60fps 帧刷新，不需要给光标单独开一个中断。
+ */
+#define GT_BLINK_HOLD_MS 500ull
+#define GT_BLINK_HALF_MS 500ull
+static int  G_blink_on = 1;
+static unsigned long long G_last_key_ms;
+static int  G_key_kick = 1;           /* 首次进桌面先点亮 */
+static struct gfx_rect G_inrect;      /* draw 时缓存：闪烁只脏这一条输入行 */
+static int  G_inrect_valid;
 
 struct gt_row { int s, e; };          /* 历史里一行的 [s,e)，不含 \n */
 
@@ -58,7 +72,10 @@ static int gt_nrow(void)
     if (G_len > 0 && G_hist[G_len - 1] != '\n') n++;
     return n;
 }
-static void gt_mark(void) { G_dirty = 1; }
+/* 脏区分级：历史输出变了要重画整个窗口；只有输入行/光标变了，
+   就只脏那条 22px 高的输入行 —— 每秒两次闪烁不再重绘 64 行历史。 */
+static void gt_mark_all(void)   { G_dirty = 2; }
+static void gt_mark_input(void) { if (G_dirty < 1) G_dirty = 1; }
 
 /* ---- 输出挂钩 ---- */
 void gfxterm_putc(char c)
@@ -72,20 +89,44 @@ void gfxterm_putc(char c)
         G_len -= drop;
     }
     G_hist[G_len++] = c;
-    G_dirty = 1;
+    gt_mark_all();
 }
 
 void gfxterm_init(void)
 {
-    G_len = 0; G_dirty = 1; G_scroll = 0;
+    G_len = 0; G_scroll = 0;
     G_llen = 0; G_line[0] = 0;
     G_on = 1;
+    G_blink_on = 1; G_key_kick = 1; G_inrect_valid = 0;
+    gt_mark_all();
     gt_puts("LoongOS 图形终端  |  输入 help 看命令清单\n");
     gt_puts("提示：开始菜单可安装系统；install yes 也可直接装盘\n");
     gt_puts("退出桌面：Ctrl + Shift + F1\n\n");
 }
 void gfxterm_stop(void) { G_on = 0; }
 int  gfxterm_dirty(void) { int d = G_dirty; G_dirty = 0; return d; }
+
+/* P3.3：桌面主循环每个空闲帧喂一次 now_ms（由架构时钟换算）。 */
+void gfxterm_blink(unsigned long long now_ms)
+{
+    if (G_key_kick) {
+        G_key_kick = 0;
+        G_last_key_ms = now_ms;
+        if (!G_blink_on) { G_blink_on = 1; gt_mark_input(); }
+        return;
+    }
+    unsigned long long since = now_ms - G_last_key_ms;
+    int on = (since < GT_BLINK_HOLD_MS)
+                 ? 1
+                 : (((since - GT_BLINK_HOLD_MS) / GT_BLINK_HALF_MS) & 1) == 0;
+    if (on != G_blink_on) { G_blink_on = on; gt_mark_input(); }
+}
+
+struct gfx_rect gfxterm_input_rect(void)
+{
+    if (!G_inrect_valid) return (struct gfx_rect){0, 0, 0, 0};
+    return G_inrect;
+}
 
 void gfxterm_scroll(int delta)
 {
@@ -94,7 +135,7 @@ void gfxterm_scroll(int delta)
     G_scroll += delta;
     if (G_scroll < 0) G_scroll = 0;
     if (G_scroll > max) G_scroll = max;
-    gt_mark();
+    gt_mark_all();
 }
 
 /* ---- 命令执行 ---- */
@@ -119,19 +160,24 @@ void gfxterm_exec(const char *line)
     buf[i] = 0;
     /* shell_dispatch_line 会原地改字符串（管道分割写 0），所以传可写副本 */
     shell_dispatch_line(buf);
-    gt_mark();
+    gt_mark_all();
 }
 
 /* ---- 输入行编辑 ---- */
 void gfxterm_key(char c)
 {
     unsigned char uc = (unsigned char)c;
+    /* P3.3「正在输入」：任何按键都让光标立刻回到常亮，并从这一刻重新计时。
+       不等下一个空闲帧，避免打字时看到光标忽明忽暗。 */
+    G_key_kick = 1;
+    if (!G_blink_on) G_blink_on = 1;
+    gt_mark_input();
     if (c == '\r' || c == '\n') {
         G_line[G_llen] = 0;
         int n = G_llen;
         G_llen = 0;
         if (n) gfxterm_exec(G_line);
-        else   { gfxterm_putc('\n'); gt_mark(); }
+        else   { gfxterm_putc('\n'); gt_mark_input(); }
         G_line[0] = 0;
         return;
     }
@@ -144,17 +190,17 @@ void gfxterm_key(char c)
             G_llen -= n;
         }
         G_line[G_llen] = 0;
-        gt_mark();
+        gt_mark_input();
         return;
     }
     if (c == 27) {                    /* Esc 清空当前输入行（不再是退出键） */
-        G_llen = 0; G_line[0] = 0; gt_mark(); return;
+        G_llen = 0; G_line[0] = 0; gt_mark_input(); return;
     }
     if ((uc >= 32 && uc < 127) || uc >= 0x80) {
         if (G_llen < GT_LINE - 1) {
             G_line[G_llen++] = c;
             G_line[G_llen] = 0;
-            gt_mark();
+            gt_mark_input();
         }
     }
 }
@@ -194,20 +240,26 @@ void gfxterm_draw(struct gfx_rect r, int focused)
         gfx_text(r.x + 6, r.y + (nlines - n + k) * LH, buf, C_TEXT, C_TRANSP);
     }
 
-    /* 输入行：贴内容区底部 */
+    /* 输入行：贴内容区底部。缓存矩形，闪烁相位切换时只脏这一条 22px 高区域。 */
     int iy = r.y + r.h - INPUT_H;
-    gfx_fill((struct gfx_rect){r.x, iy, r.w, INPUT_H}, C_INPUTBG);
+    G_inrect = (struct gfx_rect){r.x, iy, r.w, INPUT_H};
+    G_inrect_valid = 1;
+    gfx_fill(G_inrect, C_INPUTBG);
     gfx_fill((struct gfx_rect){r.x, iy, r.w, 1}, GFX_RGB(40, 62, 92));
     gfx_text(r.x + 6, iy + 2, "> ", C_PROMPT, C_TRANSP);
     int tx = r.x + 6 + gfx_text_w("> ");
     gfx_text(tx, iy + 2, G_line, C_TEXT, C_TRANSP);
     int cx = tx + gfx_text_w(G_line);
-    gfx_fill((struct gfx_rect){cx, iy + 2, 8, 16},
-             focused ? C_PROMPT : C_DIM);
+
+    /* P3.3 白色闪烁插入光标：只画在获得焦点的终端里，避免多个窗口都亮着。
+       灭态画成输入行底色（等于擦掉），不再是旧的青绿/灰色实心方块。 */
+    if (focused)
+        gfx_draw_caret(cx, iy + 2, G_blink_on, C_WHITE, C_INPUTBG);
+    else
+        gfx_fill((struct gfx_rect){cx, iy + 2, 8, 16}, C_INPUTBG);
 
     /* 翻页提示 */
     if (G_scroll > 0)
         gfx_text(r.x + r.w - 96, r.y + 2, "已向上翻页", C_DIM, C_TRANSP);
-    (void)focused;
     gfx_clip_pop();
 }

@@ -20,8 +20,9 @@
 | 显示 | `kernel.c` / `font8x16.h` / `font_cjk.h` / `gfx.c` | 8×16 英文 + 16×16 中文点阵；UEFI GOP **或** QEMU ramfb（裸 ELF 启动经 fw_cfg DMA 自建 800×600 显示底座）；渐变壁纸、顶栏、任务栏时钟、脏矩形重画 |
 | 输入 | `usb_kbd.c` | xHCI **多设备** HID：boot 键盘(8B) + 相对鼠标(4B) + 绝对平板(6B) 可同挂一个控制器；报告层识别 Ctrl+Shift+F1 |
 | 图形桌面 | `gfx.c` / `gfx.h` / `gfx_draw.h` / `desktop.c` | 裁剪 / 命中 / z 序 / 脏矩形纯函数层 + 5 窗口、鼠标指针、点击提焦点、拖标题栏、点 × 关闭、任务栏切换；**开始菜单 11 项**、安装系统向导（二次确认，10 秒超时自动撤销） |
+| 桌面手感 P3 | `desktop.c` / `kernel.c` / `gfxterm.c` / `gfx_draw.h` | 去掉主循环 `wfi`（改连续轮询 + 硬件计数器 60fps 帧节流），键鼠输入不再排队等 100ms 拍子；按钮**边沿事件队列**保证极短快速点击 / 短拖拽不丢；**白色闪烁插入光标**（打字后常亮 500ms，之后 500ms 亮/灭） |
 | 鼠标校准 | `kernel.c` / `desktop.c` | VNC 客户端送坐标带固定偏移时，`开始菜单 → 鼠标校准` 点靶心自动补偿；`mousecal` 命令查询/手设/清零，偏移存 `/etc/mousecal`，装盘重启仍生效 |
-| 图形终端 | `gfxterm.c` | 窗口内可跑**全部** shell 命令（含 `install yes`）；`uart_putc` 输出捕获进 12KB 历史缓冲，中英混排、UTF-8 输入、退格、滚轮翻页 |
+| 图形终端 | `gfxterm.c` | 窗口内可跑**全部** shell 命令（含 `install yes`）；`uart_putc` 输出捕获进 12KB 历史缓冲，中英混排、UTF-8 输入、退格、滚轮翻页、白色闪烁光标 |
 | 文件系统 | `fs.c` | 自带 fs，内存盘 / 磁盘持久化 |
 | 用户程序 | `kernel.c` / `user/*.c` | ELF 加载与 `run`；`write` / `open` / `read` / `close` / `lseek` / `exit` 等系统调用（`svc #0`）；`hello` `cat` `args` `bad` `hang` 五个样例 |
 | 存储 | `virtio_blk.c` / `virtio_blk_legacy.c` / `virtio_scsi.c` / `nvme.c` / `pci.c` | virtio-blk modern/legacy 双路径；**原生 NVMe**（Admin/IO SQ-CQ、PRP、CC/CSTS、Identify），`install yes` 装盘后重启文件仍在；virtio-scsi transitional 因 64 位 BAR 风险主动放弃 |
@@ -48,6 +49,22 @@
 新增一个块设备驱动（AHCI / USB 存储 / virtio 新类型）现在只需三步：**导出 `xxx_ops` → `blk_drivers[]` 加一项 → `build.sh` 登记 `.c`**，`kernel.c` 和各既有驱动一行都不用改；以前要同时改 5 个门面函数 + 启动探测链 + 类型判断共 7 处，漏一处就「认得到盘但读不了」。
 
 关于上界余量为什么是 4 KB、它会不会悄悄越界、后续真要更多空间怎么扩，见 [内核空间预算与扩容指引](本体/docs/内核空间预算与扩容指引.md)。
+
+## 桌面手感优化 P3（2026-11-10）：像 Windows / 带 GUI 的 Linux
+
+针对真机反馈「鼠标滑动不跟手、点击像点不准、键盘输入有延迟、想要一个闪烁光标」，把桌面从 **10Hz 节拍驱动**改成**输入即时驱动**。三项改动共用同一个根因修复：
+
+| 改动 | 旧行为 | 新行为 |
+| --- | --- | --- |
+| **主循环去 `wfi`** | 整机只使能 UART(33)/TIMER(30) 两个 IRQ，xHCI 无中断；`wfi` 只能被 10Hz timer 唤醒 → 键鼠事件排队 **0~100ms**，画面 10fps | 连续 `usb_kbd_poll()` 收割，有输入立即 `gfx_present()`；空闲用 `cntpct_el0` 硬件计数器做 **60fps 帧节流**驱动闪烁与时钟；原 10Hz 任务按 `tick` 变化执行，语义不变 |
+| **按钮边沿事件队列** | 每轮取「合并按钮状态快照」与上次比较得 pressed/released，一拍内「按下+松开」被吞 → 快速点击、短拖拽偶发失灵 | `mouse_feed_*` 把每次按钮状态变化压入 32 槽环形队列，`mouse_pop_btn()` 逐事件分派，坐标仍读最新值（滑动连续） |
+| **白色闪烁插入光标** | 8×16 青绿实心方块、常亮、非白 | 共用绘图层 `gfx_draw_caret()` 画白色方块；打字重置亮相位（500ms 常亮），之后 500ms 亮/灭；相位切换只脏输入行 22px，不重绘 64 行历史 |
+
+**「输入即时化」的量化证据**（`test_desktop_p3.py`，同一套用例跑 P3 前/后内核）：极短快速点击的菜单区域差异从 **0.006（边沿被吞）→ 0.936（菜单打开）**，白色光标闪烁从 **0.000（恒亮）→ 0.267（在闪）**；纯移动跟随与键盘回显两版都 PASS（功能不回归）。键鼠走同一 `usb_kbd_poll()` 收割路径与同一主循环，边沿不丢的结论对键盘同样成立。
+
+> 关于「测延迟」的诚实说明：QMP `input-send-event` / `sendkey` 是异步注入（自带 60ms~数百 ms 抖动），`screendump` 又会在 60fps 局部重绘下抓到半帧，**测试通道测不了内核微秒级延迟**。所以「输入即时化」用确定性的边沿事件判据（T2）证明，不靠「发完立刻截屏」这类不可复现的数字；架构层根因与修复见 `desktop.c` 主循环注释。
+
+闪烁光标是**共用绘图层能力**，同时同步到 X86 分支：`x86/desktop_x86.c` 用 PIT `g_ticks`(100Hz) 驱动同一 `gfx_draw_caret()`，`x86/test_x86_blink.py` 实测相邻帧差异 0.205（在闪），X86 端到端 6/6 全通过。
 
 ## 从源码到开机
 
@@ -98,13 +115,15 @@ apps    开始菜单 / 安装向导 / 图形终端 / 系统信息 / 操作说明
 wm      窗口池 / 焦点 / 拖拽 / z 序 / 命中分派                 ← desktop.c
 gfx     裁剪栈 / fill / rect / line / text / damage            ← gfx.h + gfx.c（36 项宿主单测）
 input   键盘 / 相对鼠标 / 绝对平板 / Ctrl+Shift+F1             ← usb_kbd.c 多设备 HID + kernel.c 输入桥
-HAL     framebuffer(GOP/ramfb) │ USB xHCI │ 10Hz timer
+                                                                （P3：按钮边沿事件队列 + 连续轮询）
+HAL     framebuffer(GOP/ramfb) │ USB xHCI │ 10Hz timer │ cntpct_el0 60fps 帧节流
 ```
 
 - **P1 ✅**：渐变壁纸 + 顶栏 + 任务栏时钟、中英混排、脏矩形、开机默认进桌面、无 GOP 优雅降级。
 - **P2 ✅**：三设备同挂枚举、鼠标指针、点击 / 拖拽 / 关闭 / z 序、开始菜单 11 项、安装向导、图形终端跑全部命令、退出键改为**仅 Ctrl+Shift+F1**。
 - **P2.1 ✅**：鼠标固定偏移校准（点靶心自动补偿 + `mousecal` 命令 + 持久化）、virtio-scsi 放宽 ID 与失败自诊断。~~绝对/相对坐标源互斥~~（该做法已在 P2.2 撤销）。
 - **P2.2 ✅**：修复 P2.1 引入的「相对鼠标不跟随」回归——去掉基于 `tick` 的 2 秒时间窗口，相对增量一律累加、纯按钮报告不动坐标；新增 `test_mousemove.py` 覆盖「只移动不点击」盲区；`mousecal` 增加绝对/相对输入源统计。
+- **P3 ✅**：桌面手感全面优化（详见上方专章）——主循环去 `wfi` 改连续轮询 + 60fps 帧节流、按钮边沿事件队列、白色闪烁插入光标；新增 `test_desktop_p3.py` 做 P3 前/后量化对照，共用绘图层能力同步到 X86（`x86/test_x86_blink.py`）。
 - **P3+ 待做**：文件管理器、文本编辑器、窗口缩放与最小化、右键菜单、更换字库（见「诚实的边界」）。
 
 实测截图见 [docs/screenshots/](本体/docs/screenshots/)，逐轮设计与排障记录见 `LOONGOS_DESKTOP_TODO.md` 与 `docs/检查与修复记录.md`。
@@ -134,7 +153,11 @@ python3 test_desktop_p2.py         # 桌面 P2 端到端 8/8：QMP 注入鼠标�
                                    # Ctrl+Shift+F1，screendump 抓图比对
 python3 test_mousecal.py           # 鼠标校准：串口命令/持久化 + 图形点靶心对齐
 python3 test_mousemove.py          # 只移动不点击：绝对/相对坐标下光标实时跟随（P2.2）
+python3 test_desktop_p3.py         # P3 手感验收：快速点击边沿 / 白色闪烁光标 /
+                                   # 纯移动跟随 / 键盘回显（可指定 KERNEL= 跑 P3 前后对照）
 bash test_drivers.sh               # 直启 TCG 抓设备识别
+cd ../x86 && python3 test_x86.py           # X86 端到端 6/6（Linux 风格输入 + 桌面）
+cd ../x86 && python3 test_x86_blink.py     # X86 白色闪烁光标专项（共用绘图层）
 ```
 
 另外还有 `bench_boot.py` 启动耗时基准，以及 `diag_serial.py`、`probe_mmio.py`、`probe_pte.py`、`probe_drag.py` 等一批排障脚本——写内核时踩过的坑基本都留了可复现的工具。测试脚本均用 `cd "$(dirname "$0")"`，clone 到任意目录都能跑。
@@ -171,7 +194,7 @@ loongos/
 - **AAVMF 没有 NVMe 引导驱动**：NVMe 盘只能由内核起来后识别，不能作为 UEFI 启动盘；安装仍从 ISO/光盘引导。
 - **字库有已知缺陷**：`font_cjk.h` 里 `·`(U+00B7) 字形本身是两条竖线，部分框形字（口/回/窗）缺底横——是 885 个字形的历史数据问题，尚未整体更换；桌面文案已避开这些字。
 - **桌面与鼠标只在 TCG 下实测**：沙箱无 `/dev/kvm`，`test_desktop_p2.py` 8/8 全在 QEMU TCG 完成；真机是 KVM，装机后建议确认一次「进桌面 → 鼠标拖拽 → Ctrl+Shift+F1 → install/net」。
-- 输入是轮询式事件处理，没有触摸 / 多点触控 / 手势；窗口缩放、最小化、右键菜单仍在 P3 清单里。
+- 输入是**连续轮询式事件处理**（P3 起桌面主循环已去掉 `wfi`，xHCI 无 IRQ 只能靠轮询；键鼠立即收割、60fps 帧节流），没有触摸 / 多点触控 / 手势；窗口缩放、最小化、右键菜单仍在 P3+ 清单里。桌面主循环忙等（用 `yield` hint 不用 `wfi`），空闲也会占满一个核，单核 TCG 下无碍。
 - **网页 VNC 的鼠标固定偏移**来自客户端画布留白 / 缩放没扣（VNC 走相对模式时，内核光标从屏幕中心累加位移，与客户端物理光标起点本就不同），内核改不了 VNC：`开始菜单 → 鼠标校准` 点一次靶心即可补偿，`mousecal` 命令可查询 / 手设 / 清零，并打印绝对/相对报告数判断 VNC 走哪种模式。偏移存 `/etc/mousecal`，未装盘（内存盘）时重启会丢。P2.2 已修复「相对位移被吞、鼠标不跟随」的回归。
 - 目标平台是 QEMU `virt` 与标准 UEFI aarch64，未适配具体实体 ARM 板卡的板级驱动。
 - 仓库里的 `BOOTAA64.EFI`、`kernel.elf` 与若干 `.o` 是构建产物，便于直接体验；源码以 `build.sh` 为准，新增编译产物不再纳入版本控制（见 `.gitignore`）。

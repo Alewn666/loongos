@@ -55,6 +55,7 @@ extern void mouse_feed_abs(int ax, int ay, int btn, int wheel);
 extern void mouse_feed_rel(int dx, int dy, int btn, int wheel);
 extern void mouse_reset(int x, int y);
 extern int  mouse_get(int *x, int *y, int *btn, int *wheel);
+extern int  mouse_pop_btn(int *state);  /* P3.2 按钮边沿事件：一次状态变化 */
 extern void mouse_cal_get(int *dx, int *dy);
 extern void mouse_cal_set(int dx, int dy);
 extern void desktop_hotkey_exit(void);             /* Ctrl+Shift+F1 */

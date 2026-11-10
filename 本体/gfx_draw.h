@@ -36,6 +36,17 @@ void gfx_fill(struct gfx_rect r, uint32_t rgb);
 void gfx_rect_draw(struct gfx_rect r, uint32_t rgb, int thickness);
 void gfx_line(int x0, int y0, int x1, int y1, uint32_t rgb);
 
+/* P3.3 文本插入光标（caret）：架构中立的绘制 helper，ARM 图形终端与 x86
+   键盘回显窗口共用。闪烁「相位」由各自架构的时钟驱动（ARM 用 cntpct_el0，
+   x86 用 PIT g_ticks），这里只负责把相位画成一个 8x16 的方块。
+   on_rgb/off_rgb 由调用方给，因为两边输入行底色不同。放在 gfx_fill 声明
+   之后，避免 C 的「先声明后使用」。 */
+static inline void gfx_draw_caret(int x, int y, int on,
+                                  uint32_t on_rgb, uint32_t off_rgb)
+{
+    gfx_fill((struct gfx_rect){x, y, 8, 16}, on ? on_rgb : off_rgb);
+}
+
 /* 文字：ASCII 8x16 + UTF-8 中文 16x16（码点绘制复用 kernel.c 的字库）。
    bg 为 0xFFFFFFFF 时表示透明（只画前景）。返回绘制后的 x 坐标。 */
 int  gfx_text(int x, int y, const char *s, uint32_t fg, uint32_t bg);

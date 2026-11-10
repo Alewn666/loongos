@@ -371,8 +371,16 @@ static u32 bswap32_(u32 v)
    写 "etc/ramfb" 必须走 DMA：在 guest RAM 里放一份 FWCfgDmaAccess（control/length/
    address，全大端），再把描述符物理地址写进 fwcfg.dma 触发传输，QEMU 才会调用
    ramfb 的 write_cb 建立 display surface。 */
-static u8 fwc_cfg_buf[28] __attribute__((aligned(8)));
-static u8 fwc_dma_desc[16] __attribute__((aligned(8)));
+/* ⚠️ 启动期 fw_cfg DMA 缓冲：必须放 .data（显式初始化），禁止退回 .bss。
+ * 2026-11-10（P3.2 事故）：往 .bss 中段插入 136B 按钮边沿队列变量后，链接器把
+ * 这两个缓冲从 0x400b8778/0x400b8798 推到 0x400b8808/0x400b8828，图形拓扑(ramfb)
+ * 下第四笔 fwcfg.dma 触发后 guest 直接挂死（日志止于 [probe] A pl011 ok）。
+ * 二分 + 逐笔插桩确认：与逻辑、越界、对齐、余量全无关（段边界四份完全一致），
+ * 是 QEMU fw_cfg DMA 对描述符/数据缓冲绝对地址敏感。显式初始化落 .data 后地址与
+ * .bss 增长彻底解耦，实测恢复正常。以后新增变量请勿改这两行的段归属。
+ * 初值 {1} 仅为让它进 .data；fwc_dma_write() 会写满 28B/16B 全覆盖，无副作用。 */
+static u8 fwc_cfg_buf[28] __attribute__((aligned(8))) = {1};
+static u8 fwc_dma_desc[16] __attribute__((aligned(8))) = {1};
 
 static void fwc_dma_write(u16 sel, const u8 *cfg, u32 len)
 {
@@ -496,6 +504,35 @@ static volatile int G_btn_abs, G_btn_rel;   /* 绝对/相对设备各自的按�
 static volatile int G_mbtn;                  /* 合并结果 = abs | rel */
 static volatile int G_exit_req;
 
+/* ---- P3.2 按钮边沿事件队列（为「点击就是点击」）-----------------------------
+ * 旧做法：desktop.c 每轮取一个合并状态快照，与上次比较得出 pressed/released。
+ * 主循环过去被 wfi 卡在 10Hz，一批 HID 报告里若「按下→松开」都发生了，
+ * 快照只会看到最终态，中间边沿被吞掉 —— 快速点击 / 短拖拽偶发失灵。
+ * 现在把「合并按钮状态的每一次变化」压成离散事件，桌面逐个消费，
+ * 状态快照只用于兜底。这就是 Windows / Linux 输入子系统的事件模型。
+ * 坐标不进队列（滑动永远读最新值），只有「离散动作」才需要保序。
+ */
+#define MBTN_Q_SZ 32
+static volatile int G_mbtn_q[MBTN_Q_SZ];
+static volatile u32 G_mbtn_q_head, G_mbtn_q_tail;
+
+static void mbtn_push(int state)
+{
+    u32 next = (G_mbtn_q_head + 1) % MBTN_Q_SZ;
+    if (next == G_mbtn_q_tail) return;      /* 满：丢弃新事件，避免覆盖未消费的按下 */
+    G_mbtn_q[G_mbtn_q_head] = state & 7;
+    G_mbtn_q_head = next;
+}
+
+/* desktop.c 消费：返回 1 表示取到一次按钮状态变化 */
+int mouse_pop_btn(int *state)
+{
+    if (G_mbtn_q_tail == G_mbtn_q_head) return 0;
+    if (state) *state = G_mbtn_q[G_mbtn_q_tail];
+    G_mbtn_q_tail = (G_mbtn_q_tail + 1) % MBTN_Q_SZ;
+    return 1;
+}
+
 /* ---- 鼠标校准（2026-11-08 真机反馈：VNC 客户端送坐标带固定偏移）----------------
  * 现象：真机网页 VNC 里，桌面画出来的光标与用户看到的物理鼠标始终差固定一段像素。
  * 原因在客户端（画布留白 / 边框 / 缩放没扣），内核改不了 VNC，但可以补偿：
@@ -537,7 +574,11 @@ void mouse_feed_rel(int dx, int dy, int btn, int wheel)
         G_mx = x; G_my = y;
     }
     G_btn_rel = btn & 7;
-    G_mbtn = G_btn_abs | G_btn_rel;
+    {   /* P3.2：按钮状态变化入队，桌面逐事件消费（不再靠快照猜边沿） */
+        int merged = G_btn_abs | G_btn_rel;
+        if (merged != G_mbtn) mbtn_push(merged);
+        G_mbtn = merged;
+    }
     G_mwheel += wheel;
     G_mdirty = 1;
 }
@@ -552,7 +593,11 @@ void mouse_feed_abs(int ax, int ay, int btn, int wheel)
     G_mx = x; G_my = y;
     G_abs_cnt++;
     G_btn_abs = btn & 7;
-    G_mbtn = G_btn_abs | G_btn_rel;
+    {   /* P3.2：按钮状态变化入队，桌面逐事件消费（不再靠快照猜边沿） */
+        int merged = G_btn_abs | G_btn_rel;
+        if (merged != G_mbtn) mbtn_push(merged);
+        G_mbtn = merged;
+    }
     G_mwheel += wheel;
     G_mdirty = 1;
 }
@@ -577,6 +622,7 @@ void mouse_reset(int x, int y)
     G_mx = x; G_my = y;
     G_btn_abs = 0; G_btn_rel = 0; G_mbtn = 0;
     G_mwheel = 0; G_mdirty = 0;
+    G_mbtn_q_head = G_mbtn_q_tail = 0;    /* 进桌面时清掉残留边沿事件 */
 }
 
 /* ---- 鼠标校准：持久化到 /etc/mousecal（纯文本 "dx dy\n"） ------------------- */

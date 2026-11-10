@@ -29,6 +29,21 @@
 typedef unsigned long u64;
 typedef unsigned int  u32;
 
+/* ---- P3.1 桌面帧时钟 -------------------------------------------------------
+ * kernel.c 的全局 tick 是 10Hz：fs 的 mtime、EL0 看门狗、任务心跳、桌面时钟
+ * 都写死「1 tick = 100ms」，改频率会破坏一大片语义。但 GUI 需要 60fps 的
+ * 呈现节奏 + 零等待的输入收割，两者必须解耦 —— 这里直接读 AArch64 generic
+ * timer 的硬件计数器，只给桌面循环用，不动全局 tick。
+ */
+static inline u64 dsk_cntpct(void)
+{
+    u64 v; __asm__ volatile("mrs %0, cntpct_el0" : "=r"(v)); return v;
+}
+static inline u64 dsk_cntfrq(void)
+{
+    u64 v; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v)); return v;
+}
+
 /* ---- kernel.c / 驱动提供的桥 ---- */
 #ifdef DESKTOP_MOUSE_DEBUG
 #endif
@@ -431,41 +446,53 @@ static void handle_press(void)
     }
 }
 
-static void poll_mouse(void)
+/* 返回 1 表示这一轮有指针输入（坐标 / 滚轮 / 按钮边沿），主循环据此立刻呈现。
+ * P3.2：按钮改用离散边沿事件，不再拿状态快照与上次比较 —— 一批 HID 报告里
+ * 「按下→松开」都发生时也能完整分派，快速点击不会丢。坐标永远读最新值，
+ * 这就是「滑动就是滑动，点击就是点击」。
+ */
+static int poll_mouse(void)
 {
-    int nx, ny, nb, wh;
-    if (!mouse_get(&nx, &ny, &nb, &wh)) return;
+    int nx, ny, wh;
+    int changed = 0;
+
+    if (mouse_get(&nx, &ny, 0, &wh)) {
+        struct gfx_rect old = cursor_rect(G_mx, G_my);
+        int moved = (nx != G_mx || ny != G_my);
+        G_mx = nx; G_my = ny;
+        gfx_damage(gfx_union(old, cursor_rect(G_mx, G_my)));
+        changed = 1;
 
 #ifdef DESKTOP_MOUSE_DEBUG
-    kputs("[mdbg] x="); kputdec((u32)nx);
-    kputs(" y="); kputdec((u32)ny);
-    kputs(" btn="); kputdec((u32)nb);
-    kputs(" prev="); kputdec((u32)G_mprev);
-    kputs(" drag="); kputdec((u32)(G_drag + 1));
-    kputs("\n");
+        kputs("[mdbg] x="); kputdec((u32)nx);
+        kputs(" y="); kputdec((u32)ny);
+        kputs(" drag="); kputdec((u32)(G_drag + 1));
+        kputs("\n");
 #endif
-
-    struct gfx_rect old = cursor_rect(G_mx, G_my);
-    G_mx = nx; G_my = ny;
-    struct gfx_rect now = cursor_rect(G_mx, G_my);
-    gfx_damage(gfx_union(old, now));       /* 光标只脏两个小矩形 */
-
-    int pressed  = (nb & 1) && !(G_mprev & 1);
-    int released = !(nb & 1) && (G_mprev & 1);
-    if (wh) {
-        gfxterm_scroll(wh > 0 ? 2 : -2);
-        gfx_damage(G_win[W_TERM].r);
+        if (wh) {
+            gfxterm_scroll(wh > 0 ? 2 : -2);
+            gfx_damage(G_win[W_TERM].r);
+        }
+        /* 拖拽：只在坐标真变了才移窗口并整屏重画（旧版每 100ms 无脑重画一次） */
+        if (G_drag >= 0 && moved) {
+            struct gfx_rect *r = &G_win[G_drag].r;
+            r->x = G_mx - G_drag_dx;
+            r->y = G_my - G_drag_dy;
+            clamp_win(r);
+            gfx_damage(full_screen());
+        }
     }
-    if (pressed)  handle_press();
-    if (released) G_drag = -1;
-    if (G_drag >= 0) {
-        struct gfx_rect *r = &G_win[G_drag].r;
-        r->x = G_mx - G_drag_dx;
-        r->y = G_my - G_drag_dy;
-        clamp_win(r);
-        gfx_damage(full_screen());
+
+    int st;
+    while (mouse_pop_btn(&st)) {
+        int pressed  = (st & 1) && !(G_mprev & 1);
+        int released = !(st & 1) && (G_mprev & 1);
+        if (pressed)  handle_press();
+        if (released) G_drag = -1;
+        G_mprev = st;
+        changed = 1;
     }
-    G_mprev = nb;
+    return changed;
 }
 
 /* ---- 键盘 ---- */
@@ -702,11 +729,30 @@ void desktop_run(void)
     kputs("[desktop] 图形桌面已就绪：鼠标点击/拖动，开始菜单进入全部功能，终端可跑所有命令\n");
     kputs("[desktop] 退出请按 Ctrl+Shift+F1（串口输入会自动让位）\n");
 
+    /* ---- P3.1 输入即时化帧循环 --------------------------------------------
+     * 旧版每轮 __asm__("wfi")：整机只使能了 UART(33) 与 TIMER(30) 两个 IRQ，
+     * xHCI 是纯轮询设备、不产生中断。于是 wfi 只能被 10Hz 定时器（或串口
+     * 字符）唤醒 —— 鼠标位移、键盘按键全要排队等到下一个 100ms 拍子才被
+     * 收割、才 gfx_present()。这就是「滑动不跟手」「输入有延迟」的共同根因，
+     * 也让任何闪烁动画都不可能（画面只有 10fps）。
+     *
+     * 现在：① 连续轮询输入，有输入立刻 present（零排队）；
+     *       ② 空闲按 60fps 出帧，专门驱动闪烁光标与时钟；
+     *       ③ 原来挂在 wfi 节拍上的 10Hz 任务按 tick 变化执行，语义不变；
+     *       ④ yield 只是 hint、不睡眠（这里绝不能用 wfi）。
+     */
+    u64 freq = dsk_cntfrq();
+    if (!freq) freq = 24000000ull;              /* 读不到 cntfrq 时兜底 */
+    u64 frame_cyc = freq / 60;
+    if (!frame_cyc) frame_cyc = 1;
+    u64 ms_cyc = freq / 1000;
+    if (!ms_cyc) ms_cyc = 1;
+    u64 next_frame = dsk_cntpct() + frame_cyc;
+    u64 last_tick = tick;
+
     for (;;) {
-        smp_tick_inc();
+        /* ① 零等待收割：xHCI 没有 IRQ，绝不能睡 */
         usb_kbd_poll();                /* 键盘 + 鼠标 + 组合键都在这里收割 */
-        net_poll();
-        __asm__ volatile("wfi");
 
         /* 串口控制台优先：只要有串口字符就退出桌面，且**不消费**它，
            让 shell_loop() 原样取走。全套自动化回归不受影响。 */
@@ -714,6 +760,7 @@ void desktop_run(void)
         /* 用户指定：只有 Ctrl+Shift+F1 能主动退出桌面 */
         if (desktop_exit_requested()) break;
 
+        int input = 0;
         char c;
         while (desktop_ring_pop_kbd(&c)) {
             if (G_focus == W_TERM) {
@@ -722,18 +769,50 @@ void desktop_run(void)
             } else {
                 handle_key(c);
             }
+            input = 1;
+        }
+        if (poll_mouse()) input = 1;
+
+        /* ② 原 10Hz 任务：只在全局 tick 前进时跑一次，保持原有频率与语义 */
+        if (tick != last_tick) {
+            last_tick = tick;
+            smp_tick_inc();
+            net_poll();
+            /* 二次确认 10 秒后自动撤销（tick 仍是 10Hz，逻辑不变） */
+            if (G_install_armed && tick - G_arm_tick > 100) {
+                G_install_armed = 0;
+                gfx_damage(full_screen());
+                input = 1;
+            }
+            u64 sec = tick / 10;
+            if (sec != G_last_sec) {
+                G_last_sec = sec; gfx_damage(clock_rect()); input = 1;
+            }
         }
 
-        poll_mouse();
-        if (gfxterm_dirty()) gfx_damage(G_win[W_TERM].r);
-        /* 二次确认 10 秒后自动撤销 */
-        if (G_install_armed && tick - G_arm_tick > 100) {
-            G_install_armed = 0;
-            gfx_damage(full_screen());
+        /* ③ 闪烁相位：按真实毫秒推进，空闲帧也要走 */
+        u64 now = dsk_cntpct();
+        int frame_due = (now >= next_frame);
+        if (frame_due) {
+            next_frame = now + frame_cyc;
+            gfxterm_blink(now / ms_cyc);
         }
-        u64 sec = tick / 10;
-        if (sec != G_last_sec) { G_last_sec = sec; gfx_damage(clock_rect()); }
-        gfx_present();
+
+        /* ④ 脏区呈现：有输入立刻画；空闲按 60fps 画（闪烁 / 时钟）。
+           光标相位切换只脏输入行那 22px，不重绘 64 行历史。 */
+        int d = gfxterm_dirty();
+        if (d == 2) {
+            gfx_damage(G_win[W_TERM].r);
+            input = 1;
+        } else if (d == 1) {
+            struct gfx_rect ir = gfxterm_input_rect();
+            if (gfx_rect_valid(ir)) gfx_damage(ir);
+            else gfx_damage(G_win[W_TERM].r);   /* 首帧未 draw 过时兜底整窗 */
+            input = 1;
+        }
+        if (input || frame_due) gfx_present();
+
+        __asm__ volatile("yield");     /* hint，不睡眠 */
     }
 
     gfxterm_stop();

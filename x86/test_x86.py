@@ -130,30 +130,32 @@ def main():
 
         # ---------- 4. 键盘回显 ----------
         print("\n[4] 键盘打字回显到图形终端")
-        # 终端窗口内容区 (40,220)~(560,370)，提示符在第 254 行附近
+        # 终端窗口内容区 (40,220)~(560,370)，输入条 y≈250..274。
+        # P3.3 起输入条是深色底(20,33,52)、文字与光标都是白色，所以要统计
+        # 「白色像素增加」而不是旧的「深色像素增加」（后者会因深色底反而下降）。
         for qc in ["h","e","l","l","o"]:
             c.tap(qc); time.sleep(0.08)
         time.sleep(0.4)
         s3 = c.shot("04_typed")
-        # 回显区：第二行 y≈254，x 从 52 起
-        echo_box = (50, 250, 300, 272)
-        dark_before = sum(1 for (r,g,b) in s2.crop(echo_box).getdata() if r<100 and g<100 and b<100)
-        dark_after  = sum(1 for (r,g,b) in s3.crop(echo_box).getdata() if r<100 and g<100 and b<100)
-        report("终端区出现新的深色文字像素（hello 已回显）",
-               dark_after > dark_before + 20,
-               "before=%d after=%d" % (dark_before, dark_after))
+        echo_box = (50, 250, 400, 274)
+        white_before = bright_in(s2, echo_box)
+        white_after  = bright_in(s3, echo_box)
+        # 阈值取 60：五个字符的点阵白像素远多于此，且能吸收光标闪烁的单帧抖动
+        report("终端区出现新的白色文字像素（hello 已回显）",
+               white_after > white_before + 60,
+               "before=%d after=%d" % (white_before, white_after))
 
         # ---------- 5. 自动重复（按住不放应产生多个字符） ----------
         print("\n[5] typematic 自动重复（按住 a 不放）")
-        n_before = dark_after
+        n_before = white_after
         c.key("a", True)
         time.sleep(1.2)                  # 250ms delay + 40ms rate → 应重复多次
         c.key("a", False)
         time.sleep(0.4)
         s4 = c.shot("05_repeat")
-        dark_rep = sum(1 for (r,g,b) in s4.crop((50,250,400,272)).getdata() if r<100 and g<100 and b<100)
-        report("长按后文字像素继续增加（自动重复生效）", dark_rep > n_before + 20,
-               "typed=%d long=%d" % (n_before, dark_rep))
+        white_rep = bright_in(s4, echo_box)
+        report("长按后白色文字像素继续增加（自动重复生效）", white_rep > n_before + 60,
+               "typed=%d long=%d" % (n_before, white_rep))
 
         # ---------- 6. Ctrl+Shift+F1 退出桌面 ----------
         print("\n[6] Ctrl+Shift+F1 退出桌面")

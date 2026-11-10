@@ -20,7 +20,9 @@ void gfxterm_putc(char c);               /* uart_putc 挂钩（放最前面，\r
 void gfxterm_key(char c);                /* 输入行编辑，回车执行命令 */
 void gfxterm_exec(const char *line);     /* 直接执行一条命令（开始菜单 / 按钮用） */
 void gfxterm_draw(struct gfx_rect r, int focused);   /* 画终端窗口内容区 */
-int  gfxterm_dirty(void);                /* 有新输出/输入变化，返回 1 并清标志 */
+int  gfxterm_dirty(void);                /* 0 无 / 1 仅输入行 / 2 整窗口，读后清标志 */
 void gfxterm_scroll(int delta);          /* delta>0 向上翻历史，<0 向下 */
+void gfxterm_blink(unsigned long long now_ms);  /* P3.3 按真实时间推进闪烁相位 */
+struct gfx_rect gfxterm_input_rect(void);      /* 输入行矩形（供精确脏区重绘） */
 
 #endif /* LOONGOS_GFXTERM_H */
