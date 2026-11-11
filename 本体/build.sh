@@ -74,25 +74,47 @@ ${CROSS}ld -T linker.ld -o kernel.elf $OBJS \
     build/hello_blob.o build/bad_blob.o build/hang_blob.o build/cat_blob.o build/args_blob.o
 ${CROSS}objdump -h kernel.elf | head -12
 
-# --- 启动期 fw_cfg DMA 缓冲「段归属」守卫（P3.2 事故固化）------------------------
-# 事故（2026-11-10）：fwc_cfg_buf/fwc_dma_desc 原是 .bss 里未初始化的静态数组。
-#   P3.2 往 .bss 中段插入 136B 按钮边沿队列后，链接器把它们从 0x400b8778/
-#   0x400b8798 推到 0x400b8808/0x400b8828；QEMU fw_cfg DMA 对描述符/数据缓冲的
-#   绝对地址敏感，图形拓扑(ramfb)下第四笔 fwcfg.dma 触发后 guest 直接挂死，
-#   串口日志止于 [probe] A pl011 ok。二分 + 逐笔插桩实证：与逻辑/越界/对齐/
-#   余量全无关，纯粹是地址漂移。修复 = 显式初始化让它们落 .data，与 .bss 解耦。
-# 这里把约束钉死：两个符号的 nm 段类型必须是 d/D（.data）或 r/R（.rodata），
-#   绝不能是 b/B（.bss）。谁改回去，构建立刻 fail fast，不用再等到真机黑屏。
+# --- 启动期 fw_cfg DMA 缓冲「真实 RAM 归属」守卫（2026-11-11 二次勘误后重写）------
+# 事故链（两个都栽在「用了弱判据」上，务必记住）：
+#  ① P3.2（2026-11-10）：缓冲原在 .bss，插入 136B 队列变量后地址漂移，图形拓扑
+#     开机 HANG（日志止于 [probe] A）。修复 = 显式初始化落 .data。
+#  ② R 轮（2026-11-11）：误以为「.data 浮动=加功能必炸」，把缓冲钉到固定物理
+#     地址 0x4007E000（内核加载 0x40080000 之前的低 RAM / QEMU loader-DTB 区）。
+#     7 组实验全用「串口出现『进桌面』」当成功，但那句是 fwc_ramfb_setup() 返回后
+#     无条件打印的假象 —— 实际 QEMU 根本没建 ramfb surface，screendump 恒为
+#     640x480 纯黑，全套图形回归（P2/P2.1/P2.2/P3）画面差异全 0.000 而静默全红。
+#     A/B 铁证：缓冲在内核镜像内的 .data(0x400ae480) / .bss(0x400b8778) 都能
+#     screendump 出 800x600 彩色画面；0x4007E000 恒黑屏。
+# 真正约束（本守卫钉死）：缓冲必须是 .data 显式初始化静态数组（不退回 .bss），
+#   且 nm 绝对地址 >= 0x40080000（内核镜像加载区内、QEMU 已映射的普通 RAM）。
+#   是否真能出画面不靠地址猜，由回归里的 test_framebuffer.py 用真实 screendump
+#   （尺寸 800x600 + 颜色数 > 阈值）守住 —— 行为判据优先于静态地址约定。
 DMA_SEG_FAIL=0
 for sym in fwc_cfg_buf fwc_dma_desc; do
-    seg=$(${CROSS}nm kernel.elf | awk -v s="$sym" '$NF==s{print $2; exit}')
+    line=$(${CROSS}nm kernel.elf | awk -v s="$sym" '$NF==s{print $1" "$2; exit}')
+    addr=$(printf '%s' "$line" | awk '{print $1}')
+    seg=$(printf '%s' "$line"  | awk '{print $2}')
     case "$seg" in
-        d|D|r|R) printf '[guard] fw_cfg DMA 缓冲 %-14s 段=%s（.data/.rodata）✓\n' "$sym" "$seg" ;;
-        *)       echo "X fw_cfg DMA 缓冲 $sym 落在段 '$seg'（应为 .data 的 d/D）"; DMA_SEG_FAIL=1 ;;
+        d|D|r|R) ;;                       # .data / .rodata 均可
+        *) echo "X fw_cfg DMA 缓冲 $sym 落在段 '$seg'（应为 .data 的 d/D，禁止退回 .bss 或改绝对地址宏）"; DMA_SEG_FAIL=1; continue ;;
     esac
+    # 0x40080000 = 内核镜像加载起点；低于它的地址是 QEMU loader/DTB 暂存区，
+    # fw_cfg DMA 在那里不会建立 ramfb surface（黑屏）。用字符串比较十六进制位数+
+    # 字典序即可（都是 0x40 开头的 8 位十六进制）：>= 0x40080000。
+    ge=$(awk -v a="0x$addr" '
+        function h2d(s,  i,ch,v,n){n=0;s=tolower(s);sub(/^0x/,"",s);
+          for(i=1;i<=length(s);i++){ch=substr(s,i,1);v=index("0123456789abcdef",ch)-1;if(v<0)return -1;n=n*16+v}return n}
+        BEGIN{ print (h2d(a) >= 1074266112) ? "OK" : "LOW" }')   # 1074266112=0x40080000
+    if [ "$ge" = "OK" ]; then
+        printf '[guard] fw_cfg DMA 缓冲 %-14s 段=%s 地址=0x%s（>= 0x40080000 镜像内 RAM）✓\n' "$sym" "$seg" "$addr"
+    else
+        echo "X fw_cfg DMA 缓冲 $sym 地址 0x$addr < 0x40080000：落在内核镜像前低 RAM，ramfb 会黑屏"
+        DMA_SEG_FAIL=1
+    fi
 done
 [ "$DMA_SEG_FAIL" = 0 ] || {
-    echo "X 启动期 fw_cfg DMA 缓冲必须留在 .data：见 kernel.c 里 2026-11-10 事故注释"
+    echo "X 启动期 fw_cfg DMA 缓冲真实 RAM 归属守卫未通过：见 kernel.c 里 2026-11-11 二次勘误注释"
+    echo "  （新增代码后务必跑 test_framebuffer.py 用真实画面确认，别再用『进桌面』当成功）"
     exit 1
 }
 

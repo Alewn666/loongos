@@ -107,6 +107,17 @@
 - [x] **量化验收** `test_desktop_p3.py`（P3 前/后对照）：T2 快速点击 0.006 被吞 → 0.936 不丢；T4 闪烁 0.000 恒亮 → 0.267 在闪；T1 跟随 / T3 回显两版都 PASS。X86 `test_x86_blink.py` 0.205 在闪、端到端 6/6。
 - [x] 全套回归 9/9、行为基线逐字一致、ISO/X86 ISO 重建（五方 md5 一致）、编译零告警、空间预算 + 段归属守卫通过。
 
+## R 轮 · 系统资源调配优化 ✅（2026-11-11）
+
+> **用户反馈**：「全面优化系统资源调配」。不改任何用户可见功能，把 CPU / 时钟 / 内存三类资源系统化整理。
+
+- [x] **CPU 50%→0.6%**：P3 的 `yield` 忙等空闲占满一核（实测宿主 CPU 50%，另一半时间片被 task1 `wfi` 吃掉）。改为事件驱动 `wfi` 休眠 + 自适应调频（ACTIVE 1000 / IDLE 250 / DEEP 120Hz），有输入仍全速不睡保住 P3 跟手感。
+- [x] **硬件唤醒与 `tick` 解耦**：`timer_set_wake_hz()` 动态调频；`tick` 由 `cntpct_el0` 真实 cycle 结算（恒 10Hz、自动补拍），与唤醒频率无关，fs mtime / EL0 看门狗 / 抢占轮转 / 桌面时钟语义零变化。桌面态抑制 `task_switch`，GUI 独占 CPU0。
+- [x] **三个实测踩坑**：数 IRQ 分频→tick 漂移（TCG 下设定 1000Hz 实际只触发 ~558Hz）→ 改 cycle 结算；`cntpct` 虚拟时间 ≠ 墙钟 → 空闲计时改用 `tick`；`input` 被闪烁/时钟污染 → 独立 `real_input`。
+- [x] **内存地基勘误**：曾把 fw_cfg DMA 缓冲钉到固定物理地址 `0x4007E000`，用「进桌面」当判据误判成功，实际导致 ramfb **黑屏**（全套图形回归画面差异全 0.000）。最终回退静态数组 `.data` + 段归属/地址守卫，并新增 `test_framebuffer.py` 用真实 screendump 像素判定杜绝「串口假绿」（详见《检查与修复记录》第三十二轮）。
+- [x] **可观测性**：`res` 命令（资源账，不进 help 保基线）、`test_idle_cpu.py`（宿主 jiffies 测 CPU）、`test_resource_live.py`（QMP 读 guest 内存验 wfi/IRQ/tick/调频，ALL PASS）、`diag_res.py`。
+- [x] 全套回归 **12/12 全绿**（含真实画面判据）、行为基线逐字一致、ISO 五方 md5 一致、编译可复现（kernel.elf md5 前后一致）、X86 编译无告警。
+
 ## P3 · 首批应用
 - [x] 终端窗口（把 shell 搬进窗口，P2 已随 gfxterm 完成，且支持全部命令）
 - [ ] 文件管理器（复用 fs.c，图形化 ls/cd/cat/write）

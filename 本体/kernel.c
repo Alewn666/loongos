@@ -371,14 +371,25 @@ static u32 bswap32_(u32 v)
    写 "etc/ramfb" 必须走 DMA：在 guest RAM 里放一份 FWCfgDmaAccess（control/length/
    address，全大端），再把描述符物理地址写进 fwcfg.dma 触发传输，QEMU 才会调用
    ramfb 的 write_cb 建立 display surface。 */
-/* ⚠️ 启动期 fw_cfg DMA 缓冲：必须放 .data（显式初始化），禁止退回 .bss。
- * 2026-11-10（P3.2 事故）：往 .bss 中段插入 136B 按钮边沿队列变量后，链接器把
- * 这两个缓冲从 0x400b8778/0x400b8798 推到 0x400b8808/0x400b8828，图形拓扑(ramfb)
- * 下第四笔 fwcfg.dma 触发后 guest 直接挂死（日志止于 [probe] A pl011 ok）。
- * 二分 + 逐笔插桩确认：与逻辑、越界、对齐、余量全无关（段边界四份完全一致），
- * 是 QEMU fw_cfg DMA 对描述符/数据缓冲绝对地址敏感。显式初始化落 .data 后地址与
- * .bss 增长彻底解耦，实测恢复正常。以后新增变量请勿改这两行的段归属。
- * 初值 {1} 仅为让它进 .data；fwc_dma_write() 会写满 28B/16B 全覆盖，无副作用。 */
+/* ⚠️ 启动期 fw_cfg DMA 缓冲：必须落在【内核镜像加载区内的真实 RAM】，即 .data。
+ *
+ * 二次勘误（2026-11-11，R 轮收尾，改用「真实画面」作判据重做 A/B）：
+ *   上一版把缓冲钉到固定物理地址 0x4007E000（内核加载地址 0x40080000 之前的
+ *   低 RAM，QEMU 用于 loader/DTB 暂存），结果 QEMU 的 fw_cfg DMA 没有真正建立
+ *   ramfb display surface —— screendump 恒为 640x480 纯黑，全套图形回归
+ *   （P2 桌面 / P2.1 校准 / P2.2 跟随 / P3 手感）画面差异全 0.000 而全红。
+ *   串口那句「fwcfg ramfb 已配置 800x600」是 fwc_ramfb_setup() 返回后无条件打印
+ *   的假象 —— 之前 7 组实验用「进桌面/不挂死」当成功判据，把「静默黑屏」误判
+ *   成成功，才得出「固定地址可行」的错误结论并越走越远。
+ *   A/B 铁证：v1.2.0 用 .data(0x400ae480)、P3 前用 .bss(0x400b8778) 都能
+ *   screendump 出 800x600 彩色画面；0x4007E000 恒定 640x480 黑屏。
+ *   结论：缓冲地址必须 >= 0x40080000（内核镜像内、QEMU 已映射的普通 RAM）。
+ *
+ * 用显式初始化 ={1} 落 .data：与 .bss 中段插入变量的地址漂移解耦（P3.2 事故），
+ * 且不新增任何段/宏，未来「加代码导致 .data 平移是否仍出画面」由
+ * test_framebuffer.py 的真实 screendump 判据在每次回归里守住 —— 用行为测试
+ * 兜底，比脆弱的固定地址约定稳健得多。fwc_dma_write() 写满 28B/16B 全覆盖。
+ * build.sh 守卫校验两符号在 .data 且地址 >= 0x40080000。 */
 static u8 fwc_cfg_buf[28] __attribute__((aligned(8))) = {1};
 static u8 fwc_dma_desc[16] __attribute__((aligned(8))) = {1};
 
@@ -1206,8 +1217,54 @@ static void mmu_status(void)
 
 /* ---------------- ARM Generic Timer（物理定时器 PPI=INTID 30，阶段3） ---------------- */
 #define TIMER_IRQ 30
-volatile u64 tick = 0;      /* 非 static：fs.c 用 extern 读它算 mtime（秒 = tick/10） */
-static u64 timer_interval = 0;
+volatile u64 tick = 0;      /* 软件节拍：恒 10Hz。非 static：fs.c 用 extern 读它算 mtime */
+
+/* ---- R1 资源调配：硬件唤醒频率 与 软件 tick 分频解耦 --------------------------------
+ * 背景：全局 tick 被写死成 10Hz（fs mtime=tick/10、EL0 看门狗 300ticks=30s、
+ *   task1 心跳、抢占轮转、桌面时钟/10 秒超时都依赖它），不能直接提频。
+ *   但 GUI 需要 1ms 级的唤醒来及时收割 xHCI（纯轮询、无 IRQ），且空闲要能 wfi
+ *   真正睡眠省电 —— 两者矛盾，用「分频」解耦：
+ *     硬件 timer 以 wake_hz 触发 IRQ；每 div=wake_hz/10 次 IRQ 才 tick++ 一次，
+ *     于是 tick 恒为 10Hz，所有消费者语义零变化。
+ *   默认 wake_hz=10 / div=1 → 与原版逐字节等价（串口 shell 永远走这条路）。
+ *   桌面期间把 wake_hz 提到 250~1000Hz：wfi 被高频 IRQ 及时唤醒去 poll 输入，
+ *   输入延迟从 100ms 降到 1~4ms；CPU 在两次 IRQ 间真正睡眠 → 空闲占用大幅下降。
+ *
+ * ⚠️ 这些变量显式初始化落 .data（不进 .bss，避免上轮 P3「.bss 中段插入变量
+ *    推移 4KB 对齐锚点」的连锁）。.data 平移是否仍让 fw_cfg DMA 缓冲出画面，
+ *    由 test_framebuffer.py 的真实 screendump 判据在回归中守住。 */
+static u64 timer_freq = 0;          /* cntfrq 缓存 */
+static u64 timer_interval = 0;      /* 当前硬件唤醒周期 = timer_freq / wake_hz */
+volatile u32 g_wake_hz = 10;        /* 当前硬件唤醒频率（res 命令可见） */
+volatile u32 g_desktop_active = 0;  /* 桌面态：抑制抢占轮转，GUI 独占 CPU0 */
+volatile u64 g_timer_irqs = 0;      /* 诊断：TIMER IRQ 累计（硬件唤醒次数） */
+volatile u64 g_wfi_hits = 0;        /* 诊断：桌面 wfi 命中次数 */
+
+/* ⚠️ tick 由【硬件计数器真实经过的 cycle】驱动，不数 IRQ 个数。
+ * 原因：QEMU TCG 下 cntp_tval_el0 按 freq/hz 设定后，实际 IRQ 触发率并不精确等于
+ *   hz（实测设 1000Hz 只触发 ~558Hz），且 cntpct_el0 虚拟时间也不等于墙钟。
+ *   若用「每 div 次 IRQ 才 tick++」分频，tick 会随唤醒档位漂移（fs mtime、
+ *   EL0 看门狗、桌面时钟全被带偏）。改为：每次 IRQ 读 cntpct_el0，按累计
+ *   cycle 差推进整数个 10Hz 节拍，唤醒频率再怎么变 tick 都恒 10Hz。
+ *   last_tick_cyc 记录「上次推进到某个 tick 时的计数器」，tick_cyc_acc 累计余数。 */
+static u64 g_tick_last_cyc = 0;     /* 上次结算 tick 时的 cntpct */
+static u64 g_tick_cyc_acc = 0;      /* 未满一个 10Hz 周期的余量 cycle */
+static u64 g_tick_period = 0;       /* = timer_freq/10，一个软件 tick 的 cycle 数 */
+
+/* 动态设置硬件唤醒频率。tick 用物理 cycle 结算，与 hz 无关，故无需分频相位。
+   可在桌面主循环里随时调用；只在频率真变化时重写，避免每次循环都碰 MSR。 */
+void timer_set_wake_hz(u32 hz)
+{
+    if (hz < 10) hz = 10;
+    if (hz > 1000) hz = 1000;
+    hz = (hz / 10) * 10;
+    if (hz == g_wake_hz) return;
+    g_wake_hz   = hz;
+    timer_interval = timer_freq / hz;
+    if (!timer_interval) timer_interval = 1;
+    __asm__ volatile("msr cntp_tval_el0, %0" :: "r"(timer_interval));
+}
+void res_wfi_inc(void) { g_wfi_hits++; }   /* 桌面每次 wfi 前调，供 res 统计 */
 
 static void timer_init(u32 hz)
 {
@@ -1215,7 +1272,12 @@ static void timer_init(u32 hz)
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
     if (freq == 0)
         freq = 62500000UL;                        /* QEMU virt 兜底 62.5MHz */
+    timer_freq = freq;
     timer_interval = freq / hz;
+    g_tick_period = freq / 10;             /* 一个软件 tick(10Hz) 的 cycle 数 */
+    if (!g_tick_period) g_tick_period = 1;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(g_tick_last_cyc));
+    g_tick_cyc_acc = 0;
     if (gic_ver == 3) {
         /* PPI30 挂在 redistributor 上（GICD 的 ISENABLER0 管不到 PPI） */
         for (volatile int i = 0; i < 1000000 && (GICR_CTLR & (1u << 31)); i++) { }
@@ -1290,18 +1352,41 @@ struct regs *handle_irq(struct regs *f)
             ring_push((char)(io_rd32(UART0_BASE + 0x00) & 0xFF), 0);  /* 0 = 串口控制台 */
     } else if (id == TIMER_IRQ) {
         timer_rearm();                 /* 重装计数 = 清挂起 */
-        tick++;
-        /* EL0 看门狗（2026-10-28 修）：原来 enter_el0_at 把 DAIF 全屏蔽，EL0 里死循环
-           连中断都进不来 → 整机挂死只能重启。现在 EL0 开着 IRQ，这里才有机会插手：
-           用户程序 30 秒没进任何系统调用就强杀回着陆点，shell 立刻回来。 */
-        if (user_running && (f->spsr & 0xF) == 0 &&
-            (u32)(tick - el0_enter_tick) > EL0_TIMEOUT_TICKS) {
-            uart_puts("\n[run] EL0 看门狗：程序 30 秒没有任何系统调用，强杀回 shell\n");
-            user_running = 0;
-            f->spsr = 0x345;
-            f->elr  = (u64)el1_landing;
+        g_timer_irqs++;                /* 诊断：硬件唤醒 IRQ 累计 */
+        /* R1：用硬件计数器真实经过的 cycle 结算 tick，恒 10Hz、与唤醒频率无关。
+           每次 IRQ 把「距上次结算」的 cycle 差累加，够 g_tick_period(=freq/10)
+           就推进一个 tick；一次 IRQ 间隔若跨过多个周期（低频/调度延迟）会补多个
+           tick，绝不丢拍。串口 shell 下 timer 本就 10Hz，每 IRQ 恰好一个周期，
+           与原版「每次 IRQ tick++」逐字节等价。 */
+        u64 cyc;
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(cyc));
+        g_tick_cyc_acc += cyc - g_tick_last_cyc;
+        g_tick_last_cyc = cyc;
+        int advanced = 0;
+        while (g_tick_cyc_acc >= g_tick_period) {
+            g_tick_cyc_acc -= g_tick_period;
+            tick++;
+            advanced++;
         }
-        f = task_switch(f);            /* 抢占：换到下一个任务的帧 */
+        if (advanced) {
+            /* EL0 看门狗（2026-10-28 修）：原来 enter_el0_at 把 DAIF 全屏蔽，EL0 里死循环
+               连中断都进不来 → 整机挂死只能重启。现在 EL0 开着 IRQ，这里才有机会插手：
+               用户程序 30 秒没进任何系统调用就强杀回着陆点，shell 立刻回来。 */
+            if (user_running && (f->spsr & 0xF) == 0 &&
+                (u32)(tick - el0_enter_tick) > EL0_TIMEOUT_TICKS) {
+                uart_puts("\n[run] EL0 看门狗：程序 30 秒没有任何系统调用，强杀回 shell\n");
+                user_running = 0;
+                f->spsr = 0x345;
+                f->elr  = (u64)el1_landing;
+            }
+            /* 桌面态抑制抢占：GUI 主循环跑在 task0，若此时 task_switch 到 task1(worker)，
+               桌面要等下个 10Hz 边界才切回 → wfi 优化会被 100ms 抢占卡死（P3 当初
+               去掉 wfi 的深层原因之一）。桌面期间让 GUI 独占 CPU0，退出后自动恢复轮转。
+               注：advanced 可能 >1（低频唤醒一次补多拍），但只在推进 tick 时轮转一次，
+               保持「一个抢占点/节拍」的语义。 */
+            if (!g_desktop_active)
+                f = task_switch(f);    /* 抢占：换到下一个任务的帧 */
+        }
     }
     if (id >= 16) {                    /* PPI(30) 和 SPI(33) 都要 EOI；SGI 0~15 我们不用 */
         if (gic_ver == 3) icc_eoir1_write(iar);
@@ -2339,6 +2424,32 @@ static void cmd_cpu(char *args)
     }
 }
 
+/* res —— R 轮资源调配账：把 CPU 唤醒/休眠、tick 频率、内存余量、SMP 在线核数
+   一次性打到串口，便于真机核对「桌面空闲是否真省电、tick 是否恒 10Hz」。
+   刻意不写进 help 文本 / 不进行为基线命令集：那两处逐字比对会因此失败。 */
+static void cmd_res(char *args)
+{
+    (void)args;
+    extern u64 smp_pcpu_tick(int cpu);
+    uart_puts("[res ] ==== 系统资源账 ====\n");
+    uart_puts("[res ] 软件 tick(10Hz)="); uart_putdec((u32)tick);
+    uart_puts("  硬件唤醒="); uart_putdec(g_wake_hz); uart_puts("Hz");
+    uart_puts("  分频="); uart_putdec(g_wake_hz / 10);
+    uart_puts("  桌面态="); uart_putdec(g_desktop_active); uart_puts("\n");
+    uart_puts("[res ] TIMER IRQ 累计="); uart_putdec((u32)g_timer_irqs);
+    uart_puts("  桌面 wfi 命中="); uart_putdec((u32)g_wfi_hits);
+    uart_puts("  (wfi/IRQ 越高=空闲越省 CPU)\n");
+    uart_puts("[res ] 内核上界余量="); uart_putdec((u32)(USER_BASE - (u64)__nvmedma_end));
+    uart_puts(" B  .nvmedma_end="); uart_puthex((u64)__nvmedma_end);
+    uart_puts("  USER_BASE="); uart_puthex(USER_BASE); uart_puts("\n");
+    uart_puts("[res ] SMP 在线:");
+    for (int i = 0; i < 4; i++) {
+        uart_puts(" cpu"); uart_putdec((u32)i);
+        uart_puts(smp_online[i] ? "=Y" : "=N");
+    }
+    uart_puts("  本核 tick="); uart_putdec((u32)smp_pcpu_tick(0)); uart_puts("\n");
+}
+
 /* tcp get <ip> <端口> —— 连上去读最多 3 秒（80 端口自动发一个 GET，其余当纯读，比如 22 端口读 SSH 横幅） */
 static void cmd_tcp(char *args)
 {
@@ -2457,6 +2568,7 @@ static const struct cmdent CMDS[] = {
     { "touch", cmd_touch }, { "mv", cmd_mv }, { "stat", cmd_stat },
     { "wc", cmd_wc }, { "grep", cmd_grep }, { "head", cmd_head },
     { "desktop", cmd_desktop }, { "mousecal", cmd_mousecal },
+    { "res", cmd_res },        /* R 轮资源账诊断（刻意不写进 help，保行为基线逐字一致） */
     { 0, 0 }
 };
 

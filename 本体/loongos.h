@@ -139,7 +139,18 @@ extern void smp_tick_inc(void);
 extern void smp_secondary_entry(void);
 extern volatile unsigned long smp_online[4];
 extern volatile unsigned long smp_counter[4];
-extern volatile u64 tick;                /* kernel.c 的 10Hz 全局节拍 */
+extern volatile u64 tick;                /* kernel.c 的 10Hz 全局节拍（软件，恒 10Hz） */
+
+/* ===================== 资源调配 / 时钟（R 轮） =====================
+ * timer_set_wake_hz：桌面动态调整硬件唤醒频率（tick 仍恒 10Hz）。
+ * g_desktop_active：桌面态标志，抑制抢占轮转让 GUI 独占 CPU0。
+ * res 命令用的诊断计数：g_wake_hz / g_timer_irqs / g_wfi_hits。 */
+extern void timer_set_wake_hz(u32 hz);
+extern void res_wfi_inc(void);
+extern volatile u32 g_wake_hz;
+extern volatile u32 g_desktop_active;
+extern volatile u64 g_timer_irqs;
+extern volatile u64 g_wfi_hits;
 
 /* ===================== 链接器符号（linker.ld） =====================
  * 以数组形式声明，取地址即得段边界；不要改成标量，调用处按数组用。 */

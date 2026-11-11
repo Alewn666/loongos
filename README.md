@@ -32,7 +32,9 @@
 | 安装 | `build_iso.sh` / `build_image.sh` | 生成可写入硬盘的 ISO 与磁盘镜像；五方 md5 校验保证 ISO 内嵌内核与源码构建一致 |
 | 内核接口 | `loongos.h` | 跨模块声明的唯一事实来源；收敛散落在各 `.c` 的 127 处重复 `extern`，修掉类型漂移与幽灵声明 |
 | 块设备抽象 | `blkdev.h` / `blkdev.c` | `struct blkdev_ops` + `blk_drivers[]` 统一优先级表；新增驱动只改 3 处，不再动 `kernel.c` |
-| 构建与空间守卫 | `build.sh` / `bss_budget.txt` | `KERN_SRCS` 单一编译单元来源 + 未登记源文件守卫 + 每次构建打印分段预算与上界余量 |
+| 资源调配 R | `kernel.c` / `desktop.c` / `test_resource_live.py` | 硬件唤醒频率与 `tick`(恒10Hz) 按 cycle 解耦；桌面空闲 `wfi` + 自适应调频（1000/250/120Hz），宿主 CPU **50%→0.6%**；`res` 命令看资源账 |
+| 构建与空间守卫 | `build.sh` / `bss_budget.txt` | `KERN_SRCS` 单一编译单元来源 + 未登记源文件守卫 + 分段预算/上界余量 + fw_cfg DMA 缓冲**段归属 + 地址≥镜像起点**守卫 |
+| 真实画面判据 | `test_framebuffer.py` | 直接对 QEMU screendump 做像素级判定（尺寸 800×600 / 颜色数 / 非背景占比），杜绝「串口一切正常但屏幕全黑」的静默假绿 |
 
 ## 内核结构优化（2026-11-10）：为后续功能铺路，功能零变化
 
@@ -65,6 +67,39 @@
 > 关于「测延迟」的诚实说明：QMP `input-send-event` / `sendkey` 是异步注入（自带 60ms~数百 ms 抖动），`screendump` 又会在 60fps 局部重绘下抓到半帧，**测试通道测不了内核微秒级延迟**。所以「输入即时化」用确定性的边沿事件判据（T2）证明，不靠「发完立刻截屏」这类不可复现的数字；架构层根因与修复见 `desktop.c` 主循环注释。
 
 闪烁光标是**共用绘图层能力**，同时同步到 X86 分支：`x86/desktop_x86.c` 用 PIT `g_ticks`(100Hz) 驱动同一 `gfx_draw_caret()`，`x86/test_x86_blink.py` 实测相邻帧差异 0.205（在闪），X86 端到端 6/6 全通过。
+
+## 系统资源调配优化 R（2026-11-11）：从「忙等烧一核」到「事件驱动休眠」
+
+P3 把输入延迟修好了，但代价是桌面主循环 `yield` 忙等、**占满一整核**（实测宿主 CPU 50%）。本轮在**不改任何用户可见功能**的前提下，把 CPU、时钟、内存三类资源的调配系统化整理。
+
+### 1. CPU：50.0% → 0.6%（宿主侧 `/proc` jiffies 实测，约 83 倍）
+
+| | 旧（P3 忙等） | 新（R 轮事件驱动） |
+| --- | --- | --- |
+| 空闲 | 全速轮询 `yield`，占满 CPU0 | 空闲 `wfi` 真正睡眠，被唤醒 IRQ 叫醒即 `poll` |
+| 有输入 | 全速 | **仍全速不睡**，P3 跟手感原样保留 |
+| 唤醒节奏 | 只有 10Hz timer | 按负载自适应：活跃 1000Hz / 短闲 250Hz / 久静 120Hz |
+| 宿主 CPU | **50.0%** | **0.6%**（DEEP 档） |
+
+关键设计：**硬件唤醒频率与软件 `tick` 分频解耦**。`tick` 被 fs mtime、EL0 看门狗、task1 心跳、抢占轮转、桌面时钟/超时写死成 10Hz，不能提频；现在它由 `cntpct_el0` 的真实 cycle 结算（恒 10Hz、自动补拍），硬件 timer 可以独立跑 120~1000Hz 只负责把 CPU 从 `wfi` 叫醒。桌面期间 `g_desktop_active=1` 抑制抢占轮转（否则 `wfi` 醒来会被切到 worker 卡 100ms，正是 P3 当初去掉 `wfi` 的深层原因）。
+
+> 三个实测踩坑（都写进代码注释）：① 用「每 N 次 IRQ 才 tick++」分频在 QEMU TCG 下会让 tick 漂移（设定 1000Hz 实际只触发 ~558Hz）→ 改用 cycle 结算；② `cntpct_el0` 虚拟时间 ≠ 墙钟，空闲计时改用 `tick`；③ 空闲起点只认**真实键鼠事件** `real_input`，若复用被闪烁/时钟污染的 `input` 会永远降不到 DEEP 档。
+
+### 2. 内存：DMA 缓冲段归属守卫 + 「真实画面」判据（含一次重要勘误）
+
+上一轮（P3）把图形启动挂死归因为「fw_cfg DMA 缓冲必须留在 `.data`」，加了段归属守卫。本轮一开始想把地址**钉到固定物理页 `0x4007E000`** 以彻底解耦浮动段链，7 组实验用「串口出现『图形桌面已就绪』/『fwcfg ramfb 已配置』」当成功判据，一度以为成功。
+
+**但这是一次「串口假绿」**：那两句日志是内核无条件打印的，QEMU 的 fw_cfg DMA 其实没建立 ramfb surface（固定地址落在内核加载起点 `0x40080000` 之前的低 RAM / loader-DTB 暂存区），`screendump` 恒为 **640×480 纯黑**。全套图形回归里 P2/P2.1/P2.2 因「画面差异全 0.000」而红，却没有任何一个测试直接说「屏幕是黑的」。用**真实画面**重做 A/B 才看清：静态数组 `.data`（`0x400ae480`）→ 800×600 彩色桌面；固定低地址 → 黑屏。
+
+最终方案（比固定地址约定稳健）：**保持静态数组 `.data`（显式 `={1}` 落 PROGBITS，让 QEMU 加载器实际把该 RAM 页纳入镜像）**，不引入新段/宏；`build.sh` 守卫校验两符号段类型 `d/D` 且绝对地址 ≥ `0x40080000`（镜像内已映射 RAM，禁止退回 `.bss` 或改绝对地址宏）；并新增 `test_framebuffer.py`，**每次回归直接用 screendump 做像素级判定**（尺寸必须 800×600、颜色数 >16、非背景占比 >1%），用行为测试兜底「新增代码后 `.data` 平移是否仍出画面」，而不是靠脆弱的地址约定。`diag_res.py` 可在图形链路异常时读 guest 计数判定「wfi 是真省电还是睡死」。
+
+### 3. 可观测性：`res` 命令 + 在线验证
+
+串口敲 `res` 打印系统资源账（软件 tick / 当前唤醒档位 / 分频 / 桌面态 / TIMER IRQ 累计 / wfi 命中 / 内核上界余量 / SMP 在线核）。刻意**不写进 `help` 文本、不进基线命令集**，保行为基线逐字一致。
+
+`test_resource_live.py` 用 QMP 直接读 guest 内存，在线验证：桌面态=1、TIMER IRQ 与 wfi 命中持续增长（证明**省电不是靠冻住画面**）、自适应降到 DEEP 120Hz、tick 恒 10Hz（3.2s 精确 +32）——全部 ALL PASS。`test_idle_cpu.py` 用宿主 `/proc/<qemu-pid>/task/*/stat` 的 jiffies 测 CPU 时间，guest 无法伪造。
+
+> 诚实边界：CPU 数字来自 QEMU TCG 沙箱，真机 KVM 下 `wfi`/timer 语义更接近硬件，降幅方向一致但绝对值不同；xHCI 仍是纯轮询（未加 MSI 中断），高频唤醒是为此付出的固定小成本；本轮未做内存池 / 动态分配 / SMP 主逻辑分工，静态预算模型不变。
 
 ## 从源码到开机
 
@@ -158,6 +193,8 @@ python3 test_desktop_p3.py         # P3 手感验收：快速点击边沿 / 白�
 bash test_drivers.sh               # 直启 TCG 抓设备识别
 cd ../x86 && python3 test_x86.py           # X86 端到端 6/6（Linux 风格输入 + 桌面）
 cd ../x86 && python3 test_x86_blink.py     # X86 白色闪烁光标专项（共用绘图层）
+python3 test_idle_cpu.py           # R 轮：宿主侧 /proc jiffies 测桌面空闲 CPU（50%->0.6%）
+python3 test_resource_live.py      # R 轮：QMP 读 guest 内存验证 wfi/tick/自适应调频 ALL PASS
 ```
 
 另外还有 `bench_boot.py` 启动耗时基准，以及 `diag_serial.py`、`probe_mmio.py`、`probe_pte.py`、`probe_drag.py` 等一批排障脚本——写内核时踩过的坑基本都留了可复现的工具。测试脚本均用 `cd "$(dirname "$0")"`，clone 到任意目录都能跑。
@@ -180,6 +217,7 @@ loongos/
 │   ├── run.sh run_full.sh make_disk.sh   # 最简 / 满配启动 / 磁盘镜像
 │   ├── test_stage*.py test_desktop_p2.py test_nvme_install.py
 │   ├── test_behavior.py  # 行为基线采集/逐字比对
+│   ├── test_idle_cpu.py test_resource_live.py  # R 轮资源调配量化/在线验证
 │   ├── test_uefi.sh test_drivers.sh test_wm_host.c test_net_host.c
 │   ├── LOONGOS_*_TODO.md  # 各阶段任务清单（内核演进档案）
 │   └── docs/             # 桌面架构、检查与修复记录、内核空间预算与扩容指引、实测截图
@@ -194,7 +232,7 @@ loongos/
 - **AAVMF 没有 NVMe 引导驱动**：NVMe 盘只能由内核起来后识别，不能作为 UEFI 启动盘；安装仍从 ISO/光盘引导。
 - **字库有已知缺陷**：`font_cjk.h` 里 `·`(U+00B7) 字形本身是两条竖线，部分框形字（口/回/窗）缺底横——是 885 个字形的历史数据问题，尚未整体更换；桌面文案已避开这些字。
 - **桌面与鼠标只在 TCG 下实测**：沙箱无 `/dev/kvm`，`test_desktop_p2.py` 8/8 全在 QEMU TCG 完成；真机是 KVM，装机后建议确认一次「进桌面 → 鼠标拖拽 → Ctrl+Shift+F1 → install/net」。
-- 输入是**连续轮询式事件处理**（P3 起桌面主循环已去掉 `wfi`，xHCI 无 IRQ 只能靠轮询；键鼠立即收割、60fps 帧节流），没有触摸 / 多点触控 / 手势；窗口缩放、最小化、右键菜单仍在 P3+ 清单里。桌面主循环忙等（用 `yield` hint 不用 `wfi`），空闲也会占满一个核，单核 TCG 下无碍。
+- 输入是**事件驱动 + 连续轮询的混合**（R 轮）：xHCI 无 IRQ，键鼠仍靠 `usb_kbd_poll()` 轮询收割，但 R 轮起桌面空闲会 `wfi` 睡眠、由 120~1000Hz 自适应唤醒 IRQ 叫醒（有输入时全速不睡），宿主 CPU 从 50% 降到 0.6%；没有触摸 / 多点触控 / 手势；窗口缩放、最小化、右键菜单仍在后续清单里。xHCI 未接 MSI 中断，高频唤醒是为「纯轮询设备要低延迟」付出的固定小成本；CPU 数字来自 QEMU TCG 沙箱，真机 KVM 下绝对值会不同。
 - **网页 VNC 的鼠标固定偏移**来自客户端画布留白 / 缩放没扣（VNC 走相对模式时，内核光标从屏幕中心累加位移，与客户端物理光标起点本就不同），内核改不了 VNC：`开始菜单 → 鼠标校准` 点一次靶心即可补偿，`mousecal` 命令可查询 / 手设 / 清零，并打印绝对/相对报告数判断 VNC 走哪种模式。偏移存 `/etc/mousecal`，未装盘（内存盘）时重启会丢。P2.2 已修复「相对位移被吞、鼠标不跟随」的回归。
 - 目标平台是 QEMU `virt` 与标准 UEFI aarch64，未适配具体实体 ARM 板卡的板级驱动。
 - 仓库里的 `BOOTAA64.EFI`、`kernel.elf` 与若干 `.o` 是构建产物，便于直接体验；源码以 `build.sh` 为准，新增编译产物不再纳入版本控制（见 `.gitignore`）。
@@ -205,7 +243,8 @@ loongos/
 - [本体/LOONGOS_DESKTOP_TODO.md](本体/LOONGOS_DESKTOP_TODO.md) — 桌面 P1/P2 验收清单与 P3+ 待办
 - [本体/docs/桌面系统_架构与路线.md](本体/docs/桌面系统_架构与路线.md) — 早期图形化架构与分期清单（其中「只有 write/exit 两个系统调用」的现状描述已过时）
 - [本体/docs/内核空间预算与扩容指引.md](本体/docs/内核空间预算与扩容指引.md) — 内核链接布局、BSS 余量 ±4 KB 对齐碎片根因、预算守卫与扩容路径
-- [本体/docs/检查与修复记录.md](本体/docs/检查与修复记录.md) — 逐轮设计取舍与排障实录
+- [本体/docs/系统资源调配.md](本体/docs/系统资源调配.md) — R 轮：CPU/时钟/内存三类资源的调配设计、7 组 DMA 地址对照实验、`res` 资源账与量化验收
+- [本体/docs/检查与修复记录.md](本体/docs/检查与修复记录.md) — 逐轮设计取舍与排障实录（第三十一轮 = R 轮）
 - `LOONGOS_*_TODO.md` 与 `docs/检查与修复记录*.md` — 各阶段任务清单
 
 ## 许可证

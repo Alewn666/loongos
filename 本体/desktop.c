@@ -729,17 +729,18 @@ void desktop_run(void)
     kputs("[desktop] 图形桌面已就绪：鼠标点击/拖动，开始菜单进入全部功能，终端可跑所有命令\n");
     kputs("[desktop] 退出请按 Ctrl+Shift+F1（串口输入会自动让位）\n");
 
-    /* ---- P3.1 输入即时化帧循环 --------------------------------------------
-     * 旧版每轮 __asm__("wfi")：整机只使能了 UART(33) 与 TIMER(30) 两个 IRQ，
-     * xHCI 是纯轮询设备、不产生中断。于是 wfi 只能被 10Hz 定时器（或串口
-     * 字符）唤醒 —— 鼠标位移、键盘按键全要排队等到下一个 100ms 拍子才被
-     * 收割、才 gfx_present()。这就是「滑动不跟手」「输入有延迟」的共同根因，
-     * 也让任何闪烁动画都不可能（画面只有 10fps）。
-     *
-     * 现在：① 连续轮询输入，有输入立刻 present（零排队）；
-     *       ② 空闲按 60fps 出帧，专门驱动闪烁光标与时钟；
-     *       ③ 原来挂在 wfi 节拍上的 10Hz 任务按 tick 变化执行，语义不变；
-     *       ④ yield 只是 hint、不睡眠（这里绝不能用 wfi）。
+    /* ---- P3.1 输入即时化 + R2 事件驱动休眠 / 自适应调频 ----------------------
+     * 演进：
+     *  - P3 之前每轮 wfi，只能被 10Hz timer 唤醒 → 键鼠排队 100ms、10fps。
+     *  - P3 去掉 wfi 改连续轮询 yield：输入即时了，但忙等占满一整核（实测宿主
+     *    CPU 50%，另一半时间片被 task1 的 wfi 吃掉）。
+     *  - R 轮（本次）：硬件 timer 与软件 tick 分频解耦（kernel.c R1），桌面把
+     *    唤醒频率提到 250~1000Hz 并抑制抢占轮转，于是可以安全地 wfi 睡眠：
+     *      * 有输入 → 不睡，连续轮询，P3 的跟手感原样保留；
+     *      * 无输入 → wfi，被高频 IRQ 唤醒即回顶部 poll，输入延迟 1~4ms；
+     *      * CPU 在两次 IRQ 间真正睡眠 → 空闲占用从 50% 降到个位数。
+     *    按连续空闲时长自适应调频（活跃 1000Hz / 短闲 250Hz / 久静 120Hz），
+     *    久静仍满足 60fps 闪烁与 10Hz tick；任意输入立刻回到高频。
      */
     u64 freq = dsk_cntfrq();
     if (!freq) freq = 24000000ull;              /* 读不到 cntfrq 时兜底 */
@@ -750,8 +751,21 @@ void desktop_run(void)
     u64 next_frame = dsk_cntpct() + frame_cyc;
     u64 last_tick = tick;
 
+    /* R2：进入桌面 → 高频唤醒 + 声明桌面态（抑制抢占轮转，GUI 独占 CPU0）。
+       退出时务必恢复 10Hz + 撤销桌面态，否则串口 shell 的调度语义会变。 */
+    #define WAKE_ACTIVE_HZ 1000
+    #define WAKE_IDLE_HZ    250
+    #define WAKE_DEEP_HZ    120
+    g_desktop_active = 1;
+    timer_set_wake_hz(WAKE_ACTIVE_HZ);
+    u32 cur_wake = WAKE_ACTIVE_HZ;
+    /* 空闲计时用全局 tick（恒 10Hz，由硬件 cycle 真实结算），不用 cntpct_el0：
+       QEMU TCG 下虚拟计数器与墙钟不一致，会让降档判据永远算不到阈值。
+       1 tick = 100ms，阈值 200ms/2000ms → 2/20 个 tick。 */
+    u64 last_input_tick = tick;
+
     for (;;) {
-        /* ① 零等待收割：xHCI 没有 IRQ，绝不能睡 */
+        /* ① 零等待收割：本轮从 wfi 醒来后第一件事就是 poll（或连续有输入不睡） */
         usb_kbd_poll();                /* 键盘 + 鼠标 + 组合键都在这里收割 */
 
         /* 串口控制台优先：只要有串口字符就退出桌面，且**不消费**它，
@@ -761,6 +775,7 @@ void desktop_run(void)
         if (desktop_exit_requested()) break;
 
         int input = 0;
+        int real_input = 0;        /* 只认真实键鼠事件；呈现/闪烁/时钟置的 input 不算 */
         char c;
         while (desktop_ring_pop_kbd(&c)) {
             if (G_focus == W_TERM) {
@@ -769,9 +784,9 @@ void desktop_run(void)
             } else {
                 handle_key(c);
             }
-            input = 1;
+            input = 1; real_input = 1;
         }
-        if (poll_mouse()) input = 1;
+        if (poll_mouse()) { input = 1; real_input = 1; }
 
         /* ② 原 10Hz 任务：只在全局 tick 前进时跑一次，保持原有频率与语义 */
         if (tick != last_tick) {
@@ -812,9 +827,28 @@ void desktop_run(void)
         }
         if (input || frame_due) gfx_present();
 
-        __asm__ volatile("yield");     /* hint，不睡眠 */
+        /* ---- R2 自适应调频 + 事件驱动休眠 ----------------------------------
+         * 有输入：不睡，立刻下一轮继续全速收割（拖拽/连打时完全不降速）。
+         * 无输入：按连续空闲时长降唤醒频率，然后 wfi 真正睡眠；被高频 timer
+         *   IRQ 或 UART IRQ 唤醒即回循环顶部 poll。tick 恒 10Hz 不受影响。
+         */
+        /* 只用真实键鼠事件刷新空闲起点：闪烁光标/时钟/二次确认超时都会置 input，
+           若用 input 会不断刷新 last_input_tick，导致永远降不到 DEEP 档。 */
+        if (real_input) last_input_tick = tick;
+        u64 idle_ticks = tick - last_input_tick;      /* 1 tick = 100ms */
+        u32 want = idle_ticks < 2  ? WAKE_ACTIVE_HZ     /* <200ms  活跃 */
+                 : idle_ticks < 20 ? WAKE_IDLE_HZ       /* <2s     短闲 */
+                 :                    WAKE_DEEP_HZ;     /* >=2s    久静 */
+        if (want != cur_wake) { timer_set_wake_hz(want); cur_wake = want; }
+        if (!input) {
+            res_wfi_inc();
+            __asm__ volatile("wfi");   /* 睡到下一个唤醒 IRQ；醒来回顶部 poll */
+        }
     }
 
+    /* R2：退出桌面 → 恢复 10Hz 唤醒 + 撤销桌面态（抢占轮转照旧）。 */
+    timer_set_wake_hz(10);
+    g_desktop_active = 0;
     gfxterm_stop();
     gfx_release_screen();              /* 恢复 uart_putc → fb_putc 的文字镜像 */
     fb_console_reset();
