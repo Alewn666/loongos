@@ -989,15 +989,18 @@ static void gic_init(void)
 #define PROT_DEV_BLK  (PROT_DEV  & ~PTE_TABLE)
 #define PROT_RAM_BLK  (PROT_RAM  & ~PTE_TABLE)
 
-/* —— 阶段5②：用户程序区（0x40210000-0x403FFFFF，恒等映射） ——
+/* —— 阶段5②：用户程序区（0x40218000-0x403FFFFF，恒等映射） ——
    历史：起点几次上移都是因为 .bss 变胖（字库/网络栈），见 docs/检查与修复记录.md。
-   2026-11-08：NVMe 驱动需要 5 个 4KB 页对齐的队列/DMA 页（共 20KB 连续对齐区），
-   而 0x40200000 处只剩 4080B 余量，放不下 → USER_BASE 再上移 64KB 到 0x40210000，
+   2026-11-08：NVMe 驱动需要 6 个 4KB 页对齐的队列/DMA 页（共 24KB 连续对齐区），
+   而 0x40200000 处只剩 4080B 余量，放不下 → USER_BASE 上移 64KB 到 0x40210000，
    给内核 .bss 让出 0x40200000-0x4020FFFF；用户区仍有约 1.94MB，ELF 与 fork 都够用。
    ⚠️ 副作用：内核 .bss 会跨过 0x40200000 这个 2MB 块边界，因此 fill_pt 改为
    「按地址属于哪个 2MB 块」选 l3_kern / l3_user，不再按 USER_BASE 判断（见下）。
+   2026-11-11：desktop.c 新增 GUI 应用生态（App 注册表 + 11 个 App + 多窗口状态），
+   .bss 又涨约 4KB，把内核上界 __nvmedma_end 顶到 0x40211000、越过旧 USER_BASE，
+   构建期 BSS 预算守卫越界 FAIL → USER_BASE 再上移 0x40210000→0x40218000（留 28KB 余量）。
    代码段=EL0 可执行可读（PXN，EL1 不执行用户代码）；data/栈=EL0 可读写（UXN） */
-#define USER_BASE 0x40210000UL       /* 用户区 0x40210000-0x403FFFFF，独立 L3（l3_user）。
+#define USER_BASE 0x40218000UL       /* 用户区 0x40218000-0x403FFFFF，独立 L3（l3_user）。
                                         内核 .bss 可延伸到 0x40200000 起的那几页（PROT_RAM，EL1 专用），
                                         用户区权限只从 USER_BASE 起覆盖，互不干扰。 */
 #define USER_END  0x40400000UL
@@ -1017,7 +1020,7 @@ __attribute__((aligned(4096), section(".bss.align4k"))) static u64 l2_dev[512]; 
 __attribute__((aligned(4096), section(".bss.align4k"))) static u64 l2_ram[512];    /* 第1个GB：RAM 0x40000000+ */
 __attribute__((aligned(4096), section(".bss.align4k"))) static u64 l3_kern[512];   /* 内核所在 2MB：细分成 4KB 页 */
 __attribute__((aligned(4096), section(".bss.align4k"))) static u64 l3_user[512];   /* 第二个 2MB 块(0x40200000-0x403FFFFF)的 L3：低 16 页给内核 .bss/栈(PROT_RAM)，
-                                                            其余给用户区(0x40210000 起，PROT_USERRW)。整表复制即换地址空间 */
+                                                            其余给用户区(0x40218000 起，PROT_USERRW)。整表复制即换地址空间 */
 __attribute__((aligned(4096), section(".bss.align4k"))) static u64 l2_pcie_hi[512];/* 第257个GB：PCIe ECAM(0x4010000000) */
 __attribute__((aligned(4096), section(".bss.align4k"))) static u64 l1_hi[512];     /* 阶段6②：64 位 MMIO 窗口（L0[1] → 0x8000000000 起 256GB） */
 
@@ -1036,7 +1039,7 @@ __attribute__((aligned(4096), section(".bss.align4k"))) static u8 el0_stack[4096
    ⚠️ 2026-11-08：为给 NVMe 队列腾 4KB 对齐空间，内核 .bss 已跨过 0x40200000 延伸进
    第二个 2MB 块（低 16 页）。那段是内核镜像，由 fill_pt(__data_start,__bss_end,PROT_RAM)
    映射成 EL1 专用；用户区权限另由 fill_pt(USER_BASE,USER_END,PROT_USERRW) 只覆盖
-   0x40210000 起，两者页索引不重叠。若仍按 USER_BASE 分界，0x40200000 那段会被错写进
+   0x40218000 起，两者页索引不重叠。若仍按 USER_BASE 分界，0x40200000 那段会被错写进
    l3_kern（索引回绕覆盖 0x40000xxx 的映射）→ 开机即 data abort。 */
 static void fill_pt(u64 start, u64 end, u64 prot)
 {
@@ -1459,7 +1462,7 @@ static const char *ec_name(u64 ec)
 static int path_resolve(const char *in, char *out, int cap);
 
 /* ---------------- 阶段5②：ELF 加载器 + 用户程序系统调用 ---------------- */
-/* 用户程序由 build.sh 编成独立 ELF（-Ttext=0x40100000），再用 objcopy -I binary
+/* 用户程序由 build.sh 编成独立 ELF（-Ttext=0x40219000，见 build.sh UCFLAGS），再用 objcopy -I binary
    把 ELF 文件本身嵌进内核镜像（符号 _binary_<名>_start/_end），开机写进 /bin */
 
 static u8 elf_buf[65536];           /* 装载缓冲：用户程序最大 64KB */

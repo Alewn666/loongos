@@ -1,23 +1,24 @@
 #include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
-/* LoongOS 桌面路线 P2 · 桌面外壳（desktop.c）
+#include "fs.h"        /* 文件系统 API：文件管理器 / 文本编辑器 直接读写 */
+/* LoongOS 桌面路线 P4 · GUI 应用生态（desktop.c）
  *
- * 用户要求（2026-11-08）：
- *   1) 保留喜欢的 P1 页面风格；
- *   2) 能用鼠标操作（点击 / 拖拽窗口 / 开始菜单 / 按钮）；
- *   3) 在图形页面上能操作电脑的**所有功能**，包括安装系统；
- *   4) 退出桌面必须按 Ctrl+Shift+F1（Q / Esc 不再是退出键）。
+ * 用户诉求（2026-11-11）：
+ *   1) 之前那个系统的「开始按钮」根本没用 —— 点开是个空壳菜单，背后没有任何应用。
+ *   2) 把 GUI 应用生态做出来。
  *
- * 实现要点：
- *   - 鼠标：usb_kbd.c 枚举 USB 相对鼠标 + 绝对平板，kernel.c 汇总成 (x,y,btn,wheel)。
- *     本文件每轮取快照，用 gfx_pick_top() 做命中、按 z 序分派点击、拖标题栏移动窗口。
- *   - 「所有功能」：新增终端窗口，键盘输入与开始菜单的快捷命令都走 gfxterm_exec()
- *     → kernel.c 的 shell_dispatch_line()，所以 help / ls / net / install yes / 管道 /
- *     重定向等全部命令都能在图形界面里跑，输出显示在窗口内（uart_putc 挂钩）。
- *   - 安装系统：开始菜单 + 独立「安装系统」窗口，二次确认后执行 install yes。
- *   - 退出：usb_kbd.c 在 HID 报告层识别 Ctrl+Shift+F1 并置标志，这里每轮检查；
- *     串口字符仍自动让位（不消费），保证全套自动化回归不受影响。
+ * 本轮做法：把「窗口」重新定义为「一个 App 的实例」，所有窗口由统一的 App 注册表驱动：
+ *   - struct gapp：每个应用含 name / accent / single（单实例）/ init / draw / press / key / scroll；
+ *   - 开始按钮 → 动态开始菜单（列出全部 App + 关机/重启），点应用即开窗口；
+ *   - 任务栏：每个打开的窗口一个按钮，可聚焦/还原；窗口数超出时自动均分宽度；
+ *   - 多窗口：打开/聚焦/关闭、标题栏拖动、关闭按钮、z 序、脏矩形重绘全部复用既有机制。
  *
- * 预算：静态状态为窗口池 + 按钮表 + 少量标量（< 2KB），不引 kmalloc。
+ * 应用清单（共 NAPP 个，开始菜单全列）：
+ *   终端 / 安装系统 / 系统信息 / 图形演示 / 操作说明（原硬编码窗口迁移）
+ *   计算器 / 系统监视器 / 设置 / 关于（新增轻量 App）
+ *   文件管理器 / 文本编辑器（新增，直接吃 fs.h 的读写 API）
+ *
+ * 预算：静态状态为窗口池 + App 注册表 + 每 App 小状态（编辑器缓冲 ~1.5KB 为主），
+ * 不引 kmalloc。App 缓冲尽量小，避免顶穿 4KB BSS 守卫。
  * 绘图复用 gfx.c 的裁剪栈 / 脏矩形；字形走 kernel.c 的 fb_query_glyph()。
  */
 #include <stdint.h>
@@ -43,10 +44,6 @@ static inline u64 dsk_cntfrq(void)
 {
     u64 v; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v)); return v;
 }
-
-/* ---- kernel.c / 驱动提供的桥 ---- */
-#ifdef DESKTOP_MOUSE_DEBUG
-#endif
 
 /* ---- 配色 ---- */
 #define C_WALL_A    GFX_RGB(16, 30, 52)
@@ -79,25 +76,26 @@ static inline u64 dsk_cntfrq(void)
 #define STEP       16
 #define CURSOR_W   12
 #define CURSOR_H   16
+#define MENU_W     232
+#define MENU_ROW   26
 
-/* ---- 窗口 ---- */
-enum { W_TERM = 0, W_INSTALL, W_INFO, W_GFX, W_HELP, NWIN };
-enum { K_TEXT = 0, K_TERM, K_INSTALL };
+/* ---- 窗口 = 一个 App 实例 ---- */
+#define NWIN 12   /* 桌面同时最多开 12 个窗口（单实例 App 下即 12 个不同 App） */
 
 struct dwin {
     struct gfx_rect r;
     int z;
-    const char *title;
-    int kind;
-    u32 accent;
-    const char *l1, *l2, *l3, *l4;
+    int app_id;       /* 指向 G_apps[] 的应用定义 */
     int visible;
+    int data;         /* 每实例小状态（滚动偏移等） */
+    int seq;          /* 同 App 多实例序号（单实例下恒 0） */
 };
 
 static struct dwin G_win[NWIN];
-static int G_focus;
+static int G_focus = -1;
 static int G_inited;
 static u64 G_last_sec;
+static int G_open_seq;
 
 /* ---- 鼠标状态 ---- */
 static int G_mx, G_my, G_mprev;
@@ -110,45 +108,32 @@ static int G_cal_on;                    /* 鼠标校准覆盖层是否显示 */
 static int G_cal_done;                  /* 已算出偏移，等待用户点一下返回 */
 static char G_cal_msg[64];              /* 校准结果（ASCII，字库必定有） */
 
-/* ---- 按钮 ---- */
-enum { ACT_EXEC, ACT_FOCUS, ACT_INSTALL, ACT_CLEAR, ACT_CLOSE, ACT_SCROLL, ACT_CAL };
-#define BT_MENU  (-1)
-struct btn {
-    int owner;                          /* BT_MENU 或窗口索引 */
-    int dx, dy, w, h;                   /* 相对 owner 左上角 */
-    const char *label;
-    int act;
-    int param;                          /* ACT_FOCUS 的窗口索引 */
-    const char *arg;                    /* ACT_EXEC 的命令 */
+/* ---- App 框架 ---- */
+struct gapp {
+    const char *name;          /* 开始菜单 / 任务栏显示名 */
+    u32 accent;
+    int  single;               /* 1 = 单实例（已开则聚焦，不新建） */
+    void (*init)(int win);     /* 开窗时调用一次（可 NULL） */
+    void (*draw)(struct gfx_rect cr, int focused, int win);
+    void (*press)(struct gfx_rect cr, int lx, int ly, int win);  /* 内容区局部坐标 */
+    void (*key)(char c, int win);
+    void (*scroll)(int dy, int win);
 };
-
-#define MENU_W   220
-#define MENU_ROW 26
-#define MENU_N   13
-#define MENU_H   (8 + MENU_N * MENU_ROW + 8)
-
-static const struct btn G_btns[] = {
-    /* 开始菜单：常用功能都有图形入口，全部命令仍可在终端里敲 */
-    { BT_MENU,   8,   8 + 0*MENU_ROW, 204, 22, "图形终端",   ACT_FOCUS,   W_TERM,    0 },
-    { BT_MENU,   8,   8 + 1*MENU_ROW, 204, 22, "安装系统",   ACT_FOCUS,   W_INSTALL, 0 },
-    { BT_MENU,   8,   8 + 2*MENU_ROW, 204, 22, "系统信息",   ACT_FOCUS,   W_INFO,    0 },
-    { BT_MENU,   8,   8 + 3*MENU_ROW, 204, 22, "操作说明",   ACT_FOCUS,   W_HELP,    0 },
-    { BT_MENU,   8,   8 + 4*MENU_ROW, 204, 22, "命令清单",   ACT_EXEC,    0, "help" },
-    { BT_MENU,   8,   8 + 5*MENU_ROW, 204, 22, "查看磁盘",   ACT_EXEC,    0, "disks" },
-    { BT_MENU,   8,   8 + 6*MENU_ROW, 204, 22, "连接网络",   ACT_EXEC,    0, "net dhcp" },
-    { BT_MENU,   8,   8 + 7*MENU_ROW, 204, 22, "网络状态",   ACT_EXEC,    0, "ifconfig" },
-    { BT_MENU,   8,   8 + 8*MENU_ROW, 204, 22, "磁盘用量",   ACT_EXEC,    0, "df" },
-    { BT_MENU,   8,   8 + 9*MENU_ROW, 204, 22, "清空终端",   ACT_CLEAR,   0, 0 },
-    { BT_MENU,   8,   8 +10*MENU_ROW, 204, 22, "鼠标校准",   ACT_CAL,     0, 0 },
-    { BT_MENU,   8,   8 +11*MENU_ROW, 204, 22, "关机",       ACT_EXEC,    0, "poweroff" },
-    { BT_MENU,   8,   8 +12*MENU_ROW, 204, 22, "重启",       ACT_EXEC,    0, "reboot" },
-    /* 安装系统窗口内 */
-    { W_INSTALL, 14,  88, 162, 26, "检查磁盘",   ACT_EXEC,    0, "disks" },
-    { W_INSTALL, 14, 122, 162, 26, "一键安装",   ACT_INSTALL, 0, 0 },
-    /* 系统信息窗口内 */
-    { W_INFO,    14, 108, 162, 26, "刷新状态",   ACT_EXEC,    0, "df" },
+/* App 编号（同时是 G_apps 下标） */
+enum {
+    A_TERM = 0, A_INSTALL, A_INFO, A_DEMO, A_HELP,
+    A_CALC, A_MON, A_SET, A_ABOUT, A_FILES, A_EDIT, NAPP
 };
-#define NBTN ((int)(sizeof G_btns / sizeof G_btns[0]))
+static const struct gapp *G_apps[NAPP];
+static char G_launch_path[96];   /* open_app 前由调用方填：编辑器/文件管理器打开的目标 */
+
+/* ---- 开始菜单项（动态生成） ---- */
+#define MAX_MENU 24
+struct menuitem { const char *label; int type; int app_id; const char *cmd; };
+#define MI_APP  0
+#define MI_EXEC 1
+static struct menuitem G_menu[MAX_MENU];
+static int G_menu_n;
 
 /* ---- 小工具 ---- */
 static u32 mix(u32 a, u32 b, int t)
@@ -159,6 +144,18 @@ static u32 mix(u32 a, u32 b, int t)
     u32 g  = (ag * (255u - (u32)t) + bg * (u32)t) / 255u;
     u32 bl = (ab * (255u - (u32)t) + bb * (u32)t) / 255u;
     return GFX_RGB(r, g, bl);
+}
+static int my_strlen(const char *s){ int n=0; while(*s) n++; return n; }
+static void my_strcpy(char *d, const char *s){ while(*s){*d++=*s++;} *d=0; }
+static int my_atoi(const char *s){ int v=0,neg=0; while(*s==' '||*s=='-'){ if(*s=='-')neg=1; s++; } while(*s>='0'&&*s<='9'){ v=v*10+(*s-'0'); s++; } return neg?-v:v; }
+static int my_itoa(char *b, long v)
+{
+    int n=0; char t[16]; int m=0;
+    if (v < 0) { b[n++]='-'; v=-v; }
+    if (v == 0) t[m++]='0';
+    while (v) { t[m++] = (char)('0' + v%10); v/=10; }
+    while (m) b[n++] = t[--m];
+    b[n]=0; return n;
 }
 static void fmt2(char *p, int v)
 {
@@ -188,6 +185,30 @@ static int fmt_signed(char *p, int v)
     while (m) p[n++] = t[--m];
     return n;
 }
+
+/* 前向声明（函数定义顺序在下方） */
+static int my_strcmp(const char *a, const char *b);
+static int my_strcmp_eq(const char *a, const char *b);
+static void raise_focus_shim(void);
+static void refocus(void);
+static void fm_draw(struct gfx_rect cr, int f, int w);
+
+/* 内容区内画一个按钮（base=内容矩形；x/y/w/h 为内容内局部坐标） */
+static void app_button(struct gfx_rect base, int x, int y, int w, int h,
+                       const char *label, u32 bg)
+{
+    struct gfx_rect br = {base.x + x, base.y + y, w, h};
+    gfx_fill(br, bg);
+    gfx_rect_draw(br, GFX_RGB(90, 120, 160), 1);
+    int tw = gfx_text_w(label);
+    gfx_text(br.x + (br.w - tw)/2, br.y + (br.h - 16)/2, label, C_WHITE, C_TRANSP);
+}
+/* 判定内容区局部坐标 (lx,ly) 是否落在 (x,y,w,h) 内 */
+static int app_hit(int lx, int ly, int x, int y, int w, int h)
+{
+    return lx >= x && lx < x + w && ly >= y && ly < y + h;
+}
+
 static struct gfx_rect full_screen(void)
 {
     return (struct gfx_rect){0, 0, gfx_width(), gfx_height()};
@@ -201,15 +222,6 @@ static struct gfx_rect start_rect(void)
 {
     return (struct gfx_rect){10, gfx_height() - TASKBAR_H + 8, 78, 26};
 }
-static struct gfx_rect menu_rect(void)
-{
-    return (struct gfx_rect){10, gfx_height() - TASKBAR_H - MENU_H,
-                             MENU_W, MENU_H};
-}
-static struct gfx_rect taskbtn_rect(int i)
-{
-    return (struct gfx_rect){96 + i * 96, gfx_height() - TASKBAR_H + 8, 90, 26};
-}
 static struct gfx_rect cursor_rect(int x, int y)
 {
     return (struct gfx_rect){x, y, CURSOR_W + 2, CURSOR_H + 2};
@@ -218,21 +230,33 @@ static struct gfx_rect close_rect(struct gfx_rect r)
 {
     return (struct gfx_rect){r.x + r.w - 24, r.y + 4, 20, 22};
 }
-static struct gfx_rect btn_rect(const struct btn *b)
+
+/* ---- 开始菜单：动态列出全部 App + 关机/重启 ---- */
+static void menu_build(void)
 {
-    struct gfx_rect r;
-    if (b->owner == BT_MENU) {
-        struct gfx_rect m = menu_rect();
-        r = (struct gfx_rect){m.x + b->dx, m.y + b->dy, b->w, b->h};
-    } else {
-        struct gfx_rect w = G_win[b->owner].r;
-        r = (struct gfx_rect){w.x + b->dx, w.y + b->dy, b->w, b->h};
+    G_menu_n = 0;
+    for (int i = 0; i < NAPP && G_menu_n < MAX_MENU; i++) {
+        if (!G_apps[i] || !G_apps[i]->name) continue;
+        G_menu[G_menu_n].label  = G_apps[i]->name;
+        G_menu[G_menu_n].type   = MI_APP;
+        G_menu[G_menu_n].app_id = i;
+        G_menu[G_menu_n].cmd    = 0;
+        G_menu_n++;
     }
-    return r;
+    if (G_menu_n < MAX_MENU) {
+        G_menu[G_menu_n].label = "关机"; G_menu[G_menu_n].type = MI_EXEC;
+        G_menu[G_menu_n].cmd = "poweroff"; G_menu_n++;
+    }
+    if (G_menu_n < MAX_MENU) {
+        G_menu[G_menu_n].label = "重启"; G_menu[G_menu_n].type = MI_EXEC;
+        G_menu[G_menu_n].cmd = "reboot"; G_menu_n++;
+    }
 }
-static int btn_visible(const struct btn *b)
+static struct gfx_rect menu_rect(void)
 {
-    return (b->owner == BT_MENU) ? G_menu_on : G_win[b->owner].visible;
+    menu_build();
+    int h = 8 + G_menu_n * MENU_ROW + 8;
+    return (struct gfx_rect){10, gfx_height() - TASKBAR_H - h, MENU_W, h};
 }
 
 /* ---- 窗口池 ---- */
@@ -251,268 +275,541 @@ static void clamp_win(struct gfx_rect *r)
     if (r->y > y1 - r->h)     r->y = y1 - r->h;
 }
 
-static void wins_init(void)
+/* 打开一个 App（单实例已开则聚焦）；返回窗口槽位 */
+static int open_app(int app_id)
 {
-    int w = gfx_width(), h = gfx_height();
-    int y0 = TOPBAR_H + 6, y1 = h - TASKBAR_H - 6;
-    int ah = y1 - y0;
-    int lw = (w - 24 * 2 - 12) * 68 / 100;
-    int rx = 24 + lw + 12;
-    int rw = w - rx - 24;
-    int th = ah * 66 / 100;
-    int bh = ah - th - 10;
-
-    G_win[W_TERM] = (struct dwin){
-        {24, y0, lw, th}, 10, "图形终端", K_TERM, C_BLUE,
-        0, 0, 0, 0, 1 };
-    G_win[W_INSTALL] = (struct dwin){
-        {rx, y0, rw, th / 2}, 9, "安装系统", K_INSTALL, C_ORANGE,
-        0, 0, 0, 0, 1 };
-    G_win[W_INFO] = (struct dwin){
-        {rx, y0 + th / 2 + 10, rw, th / 2}, 8, "系统信息", K_TEXT, C_TEAL,
-        "内核  LoongOS AArch64", "屏幕  32bpp 图形界面",
-        "鼠标  点击 / 拖动窗口", "终端  可执行全部命令", 1 };
-    G_win[W_GFX] = (struct dwin){
-        {24, y0 + th + 10, lw / 2 - 6, bh}, 7, "图形窗口", K_TEXT, C_VIOLET,
-        "裁剪 / 命中 / z 序", "脏矩形局部重绘",
-        "按 W A S D 移动窗口", "按 1 2 3 4 5 选中", 1 };
-    G_win[W_HELP] = (struct dwin){
-        {24 + lw / 2 + 6, y0 + th + 10, lw / 2 - 6, bh}, 6, "操作说明", K_TEXT, C_TEAL,
-        "鼠标左键  点击 / 拖动", "开始菜单  全部功能入口",
-        "终端窗口  直接敲命令", "Ctrl+Shift+F1  返回终端", 1 };
-
-    for (int i = 0; i < NWIN; i++) clamp_win(&G_win[i].r);
-    G_focus = W_TERM;
-    G_last_sec = (u64)-1;
-    G_menu_on = 0;
-    G_install_armed = 0;
-    G_drag = -1;
-    G_inited = 1;
+    if (app_id < 0 || app_id >= NAPP || !G_apps[app_id]) return -1;
+    if (G_apps[app_id]->single) {
+        for (int i = 0; i < NWIN; i++)
+            if (G_win[i].visible && G_win[i].app_id == app_id) {
+                G_focus = i; raise_focus_shim(); return i;
+            }
+    }
+    int slot = -1;
+    for (int i = 0; i < NWIN; i++)
+        if (!G_win[i].visible) { slot = i; break; }
+    if (slot < 0) {            /* 全开满：复用 z 最小的可见窗口 */
+        slot = 0;
+        for (int i = 1; i < NWIN; i++)
+            if (G_win[i].z < G_win[slot].z) slot = i;
+    }
+    int big = (app_id == A_TERM);
+    struct gfx_rect r = {
+        40 + (G_open_seq % 6) * 26, TOPBAR_H + 6 + (G_open_seq % 5) * 24,
+        big ? 460 : 380, big ? 340 : 300 };
+    clamp_win(&r);
+    G_win[slot].r = r;
+    G_win[slot].app_id = app_id;
+    G_win[slot].visible = 1;
+    G_win[slot].data = 0;
+    G_win[slot].seq = G_open_seq++;
+    G_focus = slot;
+    raise_focus_shim();
+    if (G_apps[app_id]->init) G_apps[app_id]->init(slot);
+    return slot;
 }
 
-static void raise_focus(void)
+/* z 序提升（gfx 纯函数版，避免重复依赖） */
+static int top_z(void)
 {
-    struct gfx_win zs[NWIN];
-    for (int i = 0; i < NWIN; i++) { zs[i].r = G_win[i].r; zs[i].z = G_win[i].z; }
-    G_win[G_focus].z = gfx_top_z(zs, NWIN);
+    int m = 0;
+    for (int i = 0; i < NWIN; i++) if (G_win[i].z > m) m = G_win[i].z;
+    return m + 1;
+}
+static void raise_focus_shim(void)
+{
+    if (G_focus < 0) return;
+    G_win[G_focus].z = top_z();
     gfx_damage(full_screen());
+}
+static void refocus(void)
+{
+    for (int i = 0; i < NWIN; i++)
+        if (G_win[i].visible) { G_focus = i; return; }
+    G_focus = -1;
 }
 static void focus_win(int i)
 {
-    if (i < 0 || i >= NWIN) return;
-    G_win[i].visible = 1;
+    if (i < 0 || i >= NWIN || !G_win[i].visible) return;
     G_focus = i;
-    raise_focus();
+    raise_focus_shim();
 }
 static void move_focus(int dx, int dy)
 {
+    if (G_focus < 0) return;
     G_win[G_focus].r.x += dx;
     G_win[G_focus].r.y += dy;
     clamp_win(&G_win[G_focus].r);
-    gfx_damage(full_screen());      /* 整屏重画，杜绝移动残影（P1 实测结论） */
+    gfx_damage(full_screen());      /* 整屏重画，杜绝移动残影 */
 }
 static int top_win_at(int x, int y)
 {
-    struct gfx_win zs[NWIN];
+    int best = -1, best_z = 0;
     for (int i = 0; i < NWIN; i++) {
-        zs[i].r = G_win[i].r;
-        zs[i].z = G_win[i].visible ? G_win[i].z : -1000;
+        if (!G_win[i].visible) continue;
+        if (!gfx_hit(G_win[i].r, x, y)) continue;
+        if (best < 0 || G_win[i].z > best_z) { best = i; best_z = G_win[i].z; }
     }
-    return gfx_pick_top(zs, NWIN, x, y);
+    return best;
 }
 
-/* ---- 动作 ---- */
-static void do_action(const struct btn *b)
+/* =================== App 实现 =================== */
+
+/* —— 终端（复用 gfxterm） —— */
+static void term_draw(struct gfx_rect cr, int f, int w){ (void)f;(void)w; gfxterm_draw(cr, f); }
+static void term_key(char c, int w){ (void)w; gfxterm_key(c); }
+static void term_scroll(int dy, int w){ (void)w; gfxterm_scroll(dy > 0 ? 2 : -2); }
+
+/* —— 安装系统 —— */
+static void install_draw(struct gfx_rect cr, int f, int w)
 {
-    switch (b->act) {
-    case ACT_EXEC:
-        gfxterm_exec(b->arg);
-        focus_win(W_TERM);
-        break;
-    case ACT_FOCUS:
-        focus_win(b->param);
-        break;
-    case ACT_INSTALL:
+    (void)f;(void)w;
+    gfx_clip_push(cr);
+    gfx_fill((struct gfx_rect){cr.x + 1, cr.y + 1, cr.w - 2, 2}, G_apps[A_INSTALL]->accent);
+    gfx_text(cr.x + 14, cr.y + 12, "把系统装到本机硬盘", C_WIN_TEXT, C_TRANSP);
+    gfx_text(cr.x + 14, cr.y + 34, "会清空目标磁盘", C_WIN_DIM, C_TRANSP);
+    if (G_install_armed)
+        gfx_text(cr.x + 14, cr.y + 58, "再点一次确认安装", C_RED, C_TRANSP);
+    else
+        gfx_text(cr.x + 14, cr.y + 58, "先点检查磁盘", C_WIN_DIM, C_TRANSP);
+    app_button(cr, 14, 88, 162, 26, "检查磁盘", C_BTN);
+    app_button(cr, 14, 122, 162, 26,
+               G_install_armed ? "确认清空并安装" : "一键安装",
+               G_install_armed ? C_RED : C_BTN);
+    gfx_clip_pop();
+}
+static void install_press(struct gfx_rect cr, int lx, int ly, int w)
+{
+    (void)w;
+    if (app_hit(lx, ly, 14, 88, 162, 26)) {
+        gfxterm_exec("disks"); focus_win(open_app(A_TERM));
+    } else if (app_hit(lx, ly, 14, 122, 162, 26)) {
         if (!G_install_armed) {
-            G_install_armed = 1;
-            G_arm_tick = tick;
-            gfxterm_exec("disks");          /* 先看一眼目标盘再决定 */
-            gfx_damage(full_screen());      /* 按钮变「确认」+ 警告文字 */
+            G_install_armed = 1; G_arm_tick = tick;
+            gfxterm_exec("disks"); gfx_damage(full_screen());
         } else {
             G_install_armed = 0;
-            gfxterm_exec("install yes");    /* 真正装盘，输出在终端里 */
-            focus_win(W_TERM);
+            gfxterm_exec("install yes"); focus_win(open_app(A_TERM));
         }
-        break;
-    case ACT_CLEAR:
-        gfxterm_init();                     /* 重新初始化 = 清空历史 */
-        focus_win(W_TERM);
-        break;
-    case ACT_CAL:
-        G_cal_on = 1;
-        G_cal_done = 0;
-        G_cal_msg[0] = 0;
-        G_menu_on = 0;
-        gfx_damage(full_screen());
-        break;
-    default: break;
     }
 }
 
-/* ---- 鼠标事件 ---- */
-static void handle_press(void)
+/* —— 系统信息 / 图形演示 / 操作说明（静态文本） —— */
+static void info_draw(struct gfx_rect cr, int f, int w)
 {
-    int x = G_mx, y = G_my;
+    (void)f;(void)w;
+    const char *lines[] = {
+        "内核  LoongOS AArch64（自研 EL1）",
+        "屏幕  32bpp 图形界面 800x600",
+        "鼠标  点击 / 拖动窗口 / 校准",
+        "终端  可执行全部 shell 命令",
+        "电源  PSCI 优雅关机 / 重启",
+        "App   开始菜单全列，点开即用",
+    };
+    for (int i = 0; i < 6; i++)
+        gfx_text(cr.x + 16, cr.y + 12 + i * 22, lines[i], C_WIN_TEXT, C_TRANSP);
+}
+static void demo_draw(struct gfx_rect cr, int f, int w)
+{
+    (void)f;(void)w;
+    const char *lines[] = {
+        "图形栈特性演示：",
+        "裁剪 / 命中 / z 序",
+        "脏矩形局部重绘",
+        "按 W A S D 移动窗口",
+        "按 1..9 聚焦窗口",
+        "Ctrl+Shift+F1 返回终端",
+    };
+    for (int i = 0; i < 6; i++)
+        gfx_text(cr.x + 16, cr.y + 12 + i * 22, lines[i], C_WIN_TEXT, C_TRANSP);
+}
+static void help_draw(struct gfx_rect cr, int f, int w)
+{
+    (void)f;(void)w;
+    const char *lines[] = {
+        "鼠标左键  点击 / 拖动窗口",
+        "开始菜单  全部功能入口",
+        "终端窗口  直接敲命令",
+        "Tab / 1..9 切换窗口",
+        "W A S D 移动聚焦窗口",
+        "Ctrl+Shift+F1 返回终端",
+    };
+    for (int i = 0; i < 6; i++)
+        gfx_text(cr.x + 16, cr.y + 12 + i * 22, lines[i], C_WIN_TEXT, C_TRANSP);
+}
 
-    /* 校准覆盖层优先：用户把「真实鼠标」移到正中靶心后点下，
-       收到的坐标与靶心的差就是固定偏移，立刻保存并退出校准。 */
-    if (G_cal_on) {
-        /* 第二次点击：带着结果显示返回桌面 */
-        if (G_cal_done) {
-            G_cal_on = 0; G_cal_done = 0;
-            gfx_damage(full_screen());
-            return;
+/* —— 计算器 —— */
+static char  calc_s[24] = "0";
+static long  calc_acc;
+static int   calc_op;       /* 0 无 / 1 + / 2 - / 3 * / 4 / */
+static int   calc_fresh;    /* 1 = 当前显示是新数（下一数字键起新数） */
+static int   calc_err;
+
+static long calc_apply(long a, long b, int op)
+{
+    if (op == 1) return a + b;
+    if (op == 2) return a - b;
+    if (op == 3) return a * b;
+    if (op == 4) { if (b == 0) { calc_err = 1; return 0; } return a / b; }
+    return b;
+}
+static void calc_reset(void)
+{
+    calc_s[0]='0'; calc_s[1]=0; calc_acc=0; calc_op=0; calc_fresh=1; calc_err=0;
+}
+static void calc_digit(char k)
+{
+    if (calc_fresh) { calc_s[0]=k; calc_s[1]=0; calc_fresh=0; }
+    else if (my_strlen(calc_s) < 15) { int n=my_strlen(calc_s); calc_s[n]=k; calc_s[n+1]=0; }
+}
+static void calc_op_do(int op)
+{
+    long v = my_atoi(calc_s);
+    if (calc_op == 0) calc_acc = v;
+    else calc_acc = calc_apply(calc_acc, v, calc_op);
+    calc_op = op;
+    if (calc_err) { calc_reset(); return; }
+    my_itoa(calc_s, calc_acc); calc_fresh = 1;
+}
+static void calc_eq(void)
+{
+    if (calc_op != 0) {
+        long v = my_atoi(calc_s);
+        long r = calc_apply(calc_acc, v, calc_op);
+        calc_acc = 0; calc_op = 0;
+        if (calc_err) { calc_reset(); return; }
+        my_itoa(calc_s, r);
+    }
+    calc_fresh = 1;
+}
+static void calc_key(char k, int w)
+{
+    (void)w;
+    if (k >= '0' && k <= '9') calc_digit(k);
+    else if (k == '+') calc_op_do(1);
+    else if (k == '-') calc_op_do(2);
+    else if (k == '*') calc_op_do(3);
+    else if (k == '/') calc_op_do(4);
+    else if (k == '=') calc_eq();
+    else if (k == 'C' || k == 'c') calc_reset();
+}
+static const char calc_keys[4][5] = { "789/", "456*", "123-", "C0=+" };
+static struct gfx_rect calc_key_rect(struct gfx_rect cr, int col, int row)
+{
+    int pad = 8, gap = 6, disp_h = 44;
+    int gw = (cr.w - 2*pad - 3*gap) / 4;
+    int gh = (cr.h - disp_h - pad*2 - 4*gap) / 4;
+    return (struct gfx_rect){cr.x + pad + col*(gw+gap),
+                             cr.y + disp_h + pad + row*(gh+gap), gw, gh};
+}
+static void calc_draw(struct gfx_rect cr, int f, int w)
+{
+    (void)f;(void)w;
+    gfx_clip_push(cr);
+    gfx_fill((struct gfx_rect){cr.x + 8, cr.y + 8, cr.w - 16, 40},
+             GFX_RGB(228, 234, 244));
+    gfx_rect_draw((struct gfx_rect){cr.x + 8, cr.y + 8, cr.w - 16, 40},
+                  GFX_RGB(150, 170, 200), 1);
+    const char *disp = calc_err ? "Err" : calc_s;
+    int tw = gfx_text_w(disp);
+    gfx_text(cr.x + cr.w - 12 - tw, cr.y + 8 + 12, disp, C_WIN_TEXT, C_TRANSP);
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) {
+            struct gfx_rect br = calc_key_rect(cr, c, r);
+            char k = calc_keys[r][c];
+            u32 bg = (k=='+'||k=='-'||k=='*'||k=='/') ? C_TEAL
+                   : (k=='='||k=='C') ? C_ORANGE : C_BTN;
+            gfx_fill(br, bg);
+            gfx_rect_draw(br, GFX_RGB(90,120,160), 1);
+            int tw2 = gfx_text_w(&k);
+            gfx_text(br.x + (br.w - tw2)/2, br.y + (br.h - 16)/2, &k, C_WHITE, C_TRANSP);
         }
-        int cx = gfx_width() / 2, cy = gfx_height() / 2;
-        int dx = x - cx, dy = y - cy;
-        mouse_cal_set(dx, dy);
-        char b[64]; int n = 0;
-        const char *p = "mousecal: dx=";
-        while (*p) b[n++] = *p++;
-        n += fmt_signed(b + n, dx);
-        p = " dy=";
-        while (*p) b[n++] = *p++;
-        n += fmt_signed(b + n, dy);
-        p = " (saved)";
-        while (*p) b[n++] = *p++;
-        b[n] = 0;
-        for (int i = 0; i <= n && i < (int)sizeof G_cal_msg; i++)
-            G_cal_msg[i] = b[i];
-        G_cal_done = 1;
-        G_mx = cx; G_my = cy;             /* 立刻把光标放回靶心，反馈对齐 */
-        gfx_damage(full_screen());
-        return;
-    }
-
-    /* 1. 任务栏：开始按钮 */
-    if (gfx_hit(start_rect(), x, y)) {
-        G_menu_on = !G_menu_on;
-        gfx_damage(full_screen());
-        return;
-    }
-    /* 2. 任务栏：窗口按钮 */
-    for (int i = 0; i < NWIN; i++) {
-        if (gfx_hit(taskbtn_rect(i), x, y)) { focus_win(i); G_menu_on = 0; return; }
-    }
-    /* 3. 开始菜单（打开时优先吃点击） */
-    if (G_menu_on) {
-        for (int i = 0; i < NBTN; i++) {
-            const struct btn *b = &G_btns[i];
-            if (b->owner != BT_MENU) continue;
-            if (gfx_hit(btn_rect(b), x, y)) {
-                G_menu_on = 0;
-                do_action(b);
+    gfx_clip_pop();
+}
+static void calc_press(struct gfx_rect cr, int lx, int ly, int w)
+{
+    (void)w;
+    if (ly < 52) return;
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) {
+            struct gfx_rect br = calc_key_rect(cr, c, r);
+            if (gfx_hit(br, lx + cr.x, ly + cr.y)) {
+                calc_key(calc_keys[r][c], w);
+                gfx_damage(full_screen());
                 return;
             }
         }
-        if (!gfx_hit(menu_rect(), x, y)) {
-            G_menu_on = 0;
-            gfx_damage(full_screen());
-        }
-        return;
-    }
-    /* 4. 最顶层命中的窗口 */
-    int wi = top_win_at(x, y);
-    if (wi < 0) return;
-    struct gfx_rect r = G_win[wi].r;
+}
+static void calc_init(int w){ (void)w; calc_reset(); }
 
-    /* 4a. 标题栏关闭按钮 */
-    if (gfx_hit(close_rect(r), x, y) && y < r.y + TITLE_H) {
-        G_win[wi].visible = 0;
-        if (G_focus == wi) G_focus = W_TERM;
+/* —— 系统监视器 —— */
+static void mon_draw(struct gfx_rect cr, int f, int w)
+{
+    (void)f;(void)w;
+    u32 used=0, total=0; fs_statfs(&used, &total);
+    int ncpu = 0; for (int i = 0; i < 4; i++) if (smp_online[i]) ncpu++;
+    char buf[48];
+    gfx_text(cr.x + 12, cr.y + 10, "系统监视器（实时）", C_WIN_TEXT, C_TRANSP);
+    int row = 0;
+    #define MON(label, val) do { \
+        int n = 0; const char *p = label; while (*p) buf[n++] = *p++; \
+        buf[n++] = ' '; n += my_itoa(buf + n, (long)(val)); \
+        gfx_text(cr.x + 12, cr.y + 36 + row*20, buf, C_WIN_TEXT, C_TRANSP); row++; \
+    } while (0)
+    MON("运行时长(s)", (long)(tick / 10));
+    MON("唤醒频率(Hz)", (long)g_wake_hz);
+    MON("Timer IRQ",   (long)g_timer_irqs);
+    MON("在线核",      (long)ncpu);
+    MON("桌面态",      (long)g_desktop_active);
+    MON("磁盘块已用",  (long)used);
+    MON("磁盘块总计",  (long)total);
+    #undef MON
+}
+
+/* —— 设置 —— */
+static void set_draw(struct gfx_rect cr, int f, int w)
+{
+    (void)f;(void)w;
+    gfx_clip_push(cr);
+    gfx_text(cr.x + 14, cr.y + 12, "设置", C_WIN_TEXT, C_TRANSP);
+    gfx_text(cr.x + 14, cr.y + 36, "鼠标偏移不对？点下面重新校准", C_WIN_DIM, C_TRANSP);
+    app_button(cr, 14, 60, 162, 26, "鼠标校准", C_BTN);
+    app_button(cr, 14, 94, 162, 26, "关于本机", C_BTN);
+    app_button(cr, 14, 128, 162, 26, "系统监视器", C_BTN);
+    app_button(cr, 14, 162, 162, 26, "文件管理器", C_BTN);
+    gfx_clip_pop();
+}
+static void set_press(struct gfx_rect cr, int lx, int ly, int w)
+{
+    (void)w;
+    if (app_hit(lx, ly, 14, 60, 162, 26)) {
+        G_cal_on = 1; G_cal_done = 0; G_cal_msg[0] = 0; G_menu_on = 0;
         gfx_damage(full_screen());
-        return;
-    }
-    /* 4b. 窗口内按钮 */
-    for (int i = 0; i < NBTN; i++) {
-        const struct btn *b = &G_btns[i];
-        if (b->owner != wi || !btn_visible(b)) continue;
-        if (gfx_hit(btn_rect(b), x, y)) { do_action(b); return; }
-    }
-    /* 4c. 标题栏 → 拖动；内容区 → 只聚焦 */
-    focus_win(wi);
-    if (y < r.y + TITLE_H) {
-        G_drag = wi;
-        G_drag_dx = x - r.x;
-        G_drag_dy = y - r.y;
+    } else if (app_hit(lx, ly, 14, 94, 162, 26)) {
+        open_app(A_ABOUT);
+    } else if (app_hit(lx, ly, 14, 128, 162, 26)) {
+        open_app(A_MON);
+    } else if (app_hit(lx, ly, 14, 162, 162, 26)) {
+        open_app(A_FILES);
     }
 }
 
-/* 返回 1 表示这一轮有指针输入（坐标 / 滚轮 / 按钮边沿），主循环据此立刻呈现。
- * P3.2：按钮改用离散边沿事件，不再拿状态快照与上次比较 —— 一批 HID 报告里
- * 「按下→松开」都发生时也能完整分派，快速点击不会丢。坐标永远读最新值，
- * 这就是「滑动就是滑动，点击就是点击」。
- */
-static int poll_mouse(void)
+/* —— 关于 —— */
+static void about_draw(struct gfx_rect cr, int f, int w)
 {
-    int nx, ny, wh;
-    int changed = 0;
-
-    if (mouse_get(&nx, &ny, 0, &wh)) {
-        struct gfx_rect old = cursor_rect(G_mx, G_my);
-        int moved = (nx != G_mx || ny != G_my);
-        G_mx = nx; G_my = ny;
-        gfx_damage(gfx_union(old, cursor_rect(G_mx, G_my)));
-        changed = 1;
-
-#ifdef DESKTOP_MOUSE_DEBUG
-        kputs("[mdbg] x="); kputdec((u32)nx);
-        kputs(" y="); kputdec((u32)ny);
-        kputs(" drag="); kputdec((u32)(G_drag + 1));
-        kputs("\n");
-#endif
-        if (wh) {
-            gfxterm_scroll(wh > 0 ? 2 : -2);
-            gfx_damage(G_win[W_TERM].r);
-        }
-        /* 拖拽：只在坐标真变了才移窗口并整屏重画（旧版每 100ms 无脑重画一次） */
-        if (G_drag >= 0 && moved) {
-            struct gfx_rect *r = &G_win[G_drag].r;
-            r->x = G_mx - G_drag_dx;
-            r->y = G_my - G_drag_dy;
-            clamp_win(r);
-            gfx_damage(full_screen());
-        }
-    }
-
-    int st;
-    while (mouse_pop_btn(&st)) {
-        int pressed  = (st & 1) && !(G_mprev & 1);
-        int released = !(st & 1) && (G_mprev & 1);
-        if (pressed)  handle_press();
-        if (released) G_drag = -1;
-        G_mprev = st;
-        changed = 1;
-    }
-    return changed;
+    (void)f;(void)w;
+    const char *lines[] = {
+        "灵珑系统 · LoongOS",
+        "自研 64 位 ARM(AArch64) 操作系统",
+        "从 boot.S 第一行手写内核：",
+        "GIC / 调度 / FS / ELF / 多设备HID",
+        "NVMe · virtio · TCP · 图形桌面",
+        "GUI 应用生态（开始菜单启动器）",
+    };
+    for (int i = 0; i < 6; i++)
+        gfx_text(cr.x + 16, cr.y + 14 + i * 22,
+                 i==0 ? lines[0] : lines[i], i==0 ? C_BLUE : C_WIN_TEXT, C_TRANSP);
 }
 
-/* ---- 键盘 ---- */
-static void handle_key(char c)
+/* —— 文件管理器 —— */
+static char fm_path[96] = "/";
+static int  fm_scroll;
+static int my_strcmp(const char *a, const char *b){ while(*a&&*a==*b){a++;b++;} return (int)(unsigned char)*a-(int)(unsigned char)*b; }
+static int my_strcmp_eq(const char *a, const char *b){ return my_strcmp(a,b)==0; }
+static void fm_full(char *out, const char *child)
 {
-    if (c == '\t' || c == 'n' || c == 'N') {
-        int n = G_focus;
-        for (int k = 1; k <= NWIN; k++) {
-            int i = (n + k) % NWIN;
-            if (G_win[i].visible) { focus_win(i); break; }
-        }
+    if (my_strcmp_eq(fm_path, "/")) { out[0]='/'; my_strcpy(out+1, child); }
+    else { my_strcpy(out, fm_path); int n=my_strlen(out); out[n]='/'; my_strcpy(out+n+1, child); }
+}
+
+/* 枚举当前目录，对第 idx 项回调；返回找到的项信息 */
+struct fm_find { int idx; int got; int ino; int isdir; char name[64]; };
+static void fm_find_cb(const struct dirent *d, int ino, void *arg)
+{
+    struct fm_find *f = arg;
+    if (!d || d->inum == 0) return;
+    if (d->name[0] == 0) return;
+    int cur = f->idx++;
+    if (cur == f->got) {
+        f->ino = ino; f->isdir = fs_isdir(ino);
+        int i=0; while (d->name[i] && i<63) { f->name[i]=d->name[i]; i++; } f->name[i]=0;
+    }
+}
+struct fm_draw_ctx { struct gfx_rect cr; int y0; int rowh; int scroll; int has_up; int cnt; };
+static void fm_draw_cb(const struct dirent *d, int ino, void *arg)
+{
+    struct fm_draw_ctx *c = arg;
+    if (!d || d->inum == 0 || d->name[0]==0) return;
+    int ri = c->cnt + (c->has_up ? 1 : 0);
+    c->cnt++;
+    if (ri < c->scroll) return;
+    int yy = c->y0 + (ri - c->scroll) * c->rowh;
+    if (yy > c->cr.y + c->cr.h - 16) return;
+    int isdir = fs_isdir(ino);
+    char nm[72]; int n=0; nm[n++]=' ';
+    if (isdir) nm[n++]='[';
+    int i=0; while (d->name[i] && n<70) nm[n++]=d->name[i++];
+    if (isdir) nm[n++]=']';
+    nm[n]=0;
+    gfx_text(c->cr.x + 16, yy, nm, isdir ? C_BLUE : C_WIN_TEXT, C_TRANSP);
+}
+static void fm_draw(struct gfx_rect cr, int f, int w)
+{
+    (void)f;(void)w;
+    gfx_clip_push(cr);
+    gfx_text(cr.x + 10, cr.y + 6, fm_path, C_WIN_TEXT, C_TRANSP);
+    gfx_rect_draw((struct gfx_rect){cr.x+8, cr.y+24, cr.w-16, cr.h-32}, GFX_RGB(200,210,224),1);
+    int y0 = cr.y + 30, rowh = 20;
+    int ino = fs_lookup(fm_path);
+    int has_up = my_strcmp_eq(fm_path, "/") ? 0 : 1;
+    if (has_up)
+        gfx_text(cr.x + 16, y0, ".. (上级)", C_VIOLET, C_TRANSP);
+    if (ino > 0) {
+        struct fm_draw_ctx ctx;
+        ctx.cr = cr; ctx.y0 = y0; ctx.rowh = rowh;
+        ctx.scroll = fm_scroll; ctx.has_up = has_up; ctx.cnt = 0;
+        fs_list(ino, fm_draw_cb, &ctx);
+    }
+    gfx_clip_pop();
+}
+static void fm_press(struct gfx_rect cr, int lx, int ly, int w)
+{
+    (void)w;
+    if (lx < 8 || lx > cr.w - 8 || ly < 30) return;
+    int row = fm_scroll + (ly - 30) / 20;
+    int ino = fs_lookup(fm_path);
+    int has_up = my_strcmp_eq(fm_path, "/") ? 0 : 1;
+    if (has_up && row == 0) {                 /* 上级目录 */
+        char tmp[96];
+        /* 计算父路径字符串 */
+        my_strcpy(tmp, fm_path);
+        int len = my_strlen(tmp);
+        while (len > 1 && tmp[len-1] != '/') len--;
+        if (len > 1) tmp[len-1]=0; else { tmp[0]='/'; tmp[1]=0; }
+        my_strcpy(fm_path, tmp); fm_scroll = 0; gfx_damage(full_screen());
         return;
     }
-    if (c >= '1' && c <= '5') { focus_win(c - '1'); return; }
-    if (c == 'w' || c == 'W') { move_focus(0, -STEP); return; }
-    if (c == 's' || c == 'S') { move_focus(0,  STEP); return; }
-    if (c == 'a' || c == 'A') { move_focus(-STEP, 0); return; }
-    if (c == 'd' || c == 'D') { move_focus( STEP, 0); return; }
+    int target = has_up ? row - 1 : row;
+    if (target < 0 || ino <= 0) return;
+    struct fm_find f = {.idx=0, .got=target};
+    fs_list(ino, fm_find_cb, &f);
+    if (f.ino <= 0) return;
+    if (f.isdir) {
+        fm_full(fm_path, f.name); fm_scroll = 0;
+    } else {
+        char full[160]; fm_full(full, f.name);
+        my_strcpy(G_launch_path, full);
+        open_app(A_EDIT);
+    }
+    gfx_damage(full_screen());
+}
+static void fm_scroll_h(int dy, int w){ (void)w; fm_scroll += (dy>0?-3:3); if(fm_scroll<0) fm_scroll=0; gfx_damage(full_screen()); }
+
+/* —— 文本编辑器 / 查看器 —— */
+static char ed_path[96] = "/未命名.txt";
+static char ed_buf[1500];
+static int  ed_len;
+static int  ed_cur;
+static int  ed_scroll;
+static int  ed_dirty;
+static int  ed_msg_t;     /* >0 时显示「已保存」 */
+static void ed_load(void)
+{
+    ed_len = 0; ed_buf[0] = 0; ed_cur = 0; ed_dirty = 0; ed_msg_t = 0;
+    if (G_launch_path[0]) my_strcpy(ed_path, G_launch_path);
+    else my_strcpy(ed_path, "/未命名.txt");
+    G_launch_path[0] = 0;
+    int ino = fs_lookup(ed_path);
+    if (ino > 0 && fs_filetype(ino) == FS_T_FILE) {
+        int n = fs_readfile(ino, (u8*)ed_buf, sizeof(ed_buf) - 1);
+        if (n > 0) { ed_len = n; ed_buf[n] = 0; ed_cur = n; }
+    }
+}
+static void ed_save(void)
+{
+    int ino = fs_lookup(ed_path);
+    if (ino <= 0) fs_createfile(ed_path);
+    ino = fs_lookup(ed_path);
+    if (ino > 0) { fs_setfile(ino, (u8*)ed_buf, (u32)ed_len); ed_dirty = 0; ed_msg_t = 1; }
+}
+static void ed_draw(struct gfx_rect cr, int f, int w)
+{
+    (void)f;(void)w;
+    gfx_clip_push(cr);
+    gfx_text(cr.x + 8, cr.y + 6, ed_path, C_WIN_TEXT, C_TRANSP);
+    if (ed_dirty) gfx_text(cr.x + cr.w - 20, cr.y + 6, "*", C_RED, C_TRANSP);
+    if (ed_msg_t) gfx_text(cr.x + cr.w - 70, cr.y + 6, "已保存", C_TEAL, C_TRANSP);
+    app_button(cr, cr.w - 78, 2, 70, 22, "保存", C_BTN);
+    int x0 = cr.x + 8, y0 = cr.y + 32, maxw = cr.w - 16;
+    int cpl = maxw / 8;
+    int row = 0, start = 0, curx = -1, cury = -1;
+    for (int i = 0; i <= ed_len; i++) {
+        if (i == ed_len || ed_buf[i] == '\n') {
+            if (row >= ed_scroll) {
+                int yy = y0 + (row - ed_scroll) * 18;
+                if (yy > cr.y + cr.h - 18) break;
+                int n = i - start; if (n > cpl) n = cpl;
+                /* 计算光标位置（若在本行） */
+                if (ed_cur >= start && ed_cur <= i) {
+                    curx = x0 + (ed_cur - start) * 8;
+                    cury = yy;
+                }
+                for (int k = 0; k < n; k++)
+                    gfx_text(x0 + k*8, yy, &ed_buf[start + k], C_WIN_TEXT, C_TRANSP);
+            }
+            start = i + 1; row++;
+        }
+    }
+    if (curx >= 0 && cury >= 0)
+        gfx_fill((struct gfx_rect){curx, cury, 8, 16}, C_BLUE);
+    gfx_clip_pop();
+}
+static void ed_press(struct gfx_rect cr, int lx, int ly, int w)
+{
+    (void)w;
+    if (app_hit(lx, ly, cr.w - 78, 2, 70, 22)) { ed_save(); gfx_damage(full_screen()); }
+}
+static void ed_key(char c, int w)
+{
+    (void)w;
+    if (c == '\b' || c == 0x7f) {                 /* 退格 */
+        if (ed_cur > 0) {
+            for (int i = ed_cur; i < ed_len; i++) ed_buf[i-1] = ed_buf[i];
+            ed_len--; ed_cur--; ed_dirty = 1; ed_msg_t = 0;
+        }
+    } else if (c == '\n' || c == '\r') {
+        if (ed_len < (int)sizeof(ed_buf) - 1) {
+            for (int i = ed_len; i > ed_cur; i--) ed_buf[i] = ed_buf[i-1];
+            ed_buf[ed_cur++] = '\n'; ed_len++; ed_dirty = 1; ed_msg_t = 0;
+        }
+    } else if (c >= 0x20 && c < 0x7f) {          /* 可打印 ASCII */
+        if (ed_len < (int)sizeof(ed_buf) - 1) {
+            for (int i = ed_len; i > ed_cur; i--) ed_buf[i] = ed_buf[i-1];
+            ed_buf[ed_cur++] = c; ed_len++; ed_dirty = 1; ed_msg_t = 0;
+        }
+    }
+    gfx_damage(full_screen());
+}
+static void ed_scroll_h(int dy, int w){ (void)w; ed_scroll += (dy>0?-3:3); if(ed_scroll<0)ed_scroll=0; gfx_damage(full_screen()); }
+static void ed_init(int w){ (void)w; ed_load(); }
+
+/* =================== App 注册表 =================== */
+static const struct gapp G_app_defs[NAPP] = {
+    [A_TERM]    = {"终端",       C_BLUE,   1, 0, term_draw,   0,          term_key, term_scroll},
+    [A_INSTALL] = {"安装系统",   C_ORANGE, 1, 0, install_draw,install_press,0,0},
+    [A_INFO]    = {"系统信息",   C_TEAL,   1, 0, info_draw,   0, 0, 0},
+    [A_DEMO]    = {"图形演示",   C_VIOLET, 1, 0, demo_draw,   0, 0, 0},
+    [A_HELP]    = {"操作说明",   C_TEAL,   1, 0, help_draw,   0, 0, 0},
+    [A_CALC]    = {"计算器",     C_BLUE,   1, calc_init, calc_draw, calc_press, calc_key, 0},
+    [A_MON]     = {"系统监视器", C_TEAL,   1, 0, mon_draw,    0, 0, 0},
+    [A_SET]     = {"设置",       C_VIOLET, 1, 0, set_draw,    set_press, 0, 0},
+    [A_ABOUT]   = {"关于",       C_BLUE,   1, 0, about_draw,  0, 0, 0},
+    [A_FILES]   = {"文件管理器", C_ORANGE, 1, 0, fm_draw,     fm_press, 0, fm_scroll_h},
+    [A_EDIT]    = {"文本编辑器", C_BLUE,   1, ed_init, ed_draw, ed_press, ed_key, ed_scroll_h},
+};
+static void apps_register(void)
+{
+    for (int i = 0; i < NAPP; i++) G_apps[i] = &G_app_defs[i];
 }
 
 /* ---- 各层绘制 ---- */
@@ -523,8 +820,7 @@ static void draw_wallpaper(void)
         gfx_fill((struct gfx_rect){0, y, w, 1},
                  mix(C_WALL_A, C_WALL_B, h > 1 ? (y * 255) / (h - 1) : 0));
     for (int i = 0; i < 7; i++)
-        gfx_line(w - 260 + i * 22, h - TASKBAR_H, w - 90 + i * 22, TOPBAR_H + 56,
-                 C_DECO);
+        gfx_line(w - 260 + i * 22, h - TASKBAR_H, w - 90 + i * 22, TOPBAR_H + 56, C_DECO);
 }
 static void draw_topbar(void)
 {
@@ -532,14 +828,13 @@ static void draw_topbar(void)
     gfx_fill((struct gfx_rect){0, 0, w, TOPBAR_H}, C_TOPBAR);
     gfx_fill((struct gfx_rect){0, TOPBAR_H - 2, w, 2}, C_BLUE);
     gfx_text(16, 11, "灵珑系统  LoongOS", C_WHITE, C_TRANSP);
-    const char *hint = "图形界面 P2   |   Ctrl+Shift+F1 返回终端";
+    const char *hint = "图形桌面 P4 · GUI 应用生态   |   Ctrl+Shift+F1 返回终端";
     int hw = gfx_text_w(hint);
     if (w - hw - 16 > 260)
         gfx_text(w - hw - 16, 11, hint, C_ACCENT, C_TRANSP);
 }
 
-static void draw_button_rect(struct gfx_rect r, const char *label,
-                             u32 bg, u32 fg)
+static void draw_button_rect(struct gfx_rect r, const char *label, u32 bg, u32 fg)
 {
     gfx_fill(r, bg);
     gfx_rect_draw(r, GFX_RGB(90, 120, 160), 1);
@@ -547,62 +842,31 @@ static void draw_button_rect(struct gfx_rect r, const char *label,
     gfx_text(r.x + (r.w - tw) / 2, r.y + (r.h - 16) / 2, label, fg, C_TRANSP);
 }
 
-static void draw_one_win(const struct dwin *w, int focused, int idx)
+static void draw_one_win(int k, int focused)
 {
+    struct dwin *w = &G_win[k];
     struct gfx_rect r = w->r;
     gfx_fill((struct gfx_rect){r.x + 4, r.y + 4, r.w, r.h}, C_SHADOW);
     gfx_fill(r, C_WIN_BG);
     gfx_rect_draw(r, C_BORDER, 1);
     gfx_fill((struct gfx_rect){r.x, r.y, r.w, TITLE_H},
-             focused ? w->accent : C_TITLE_DIM);
-    /* 标题栏关闭按钮 */
+             focused ? G_apps[w->app_id]->accent : C_TITLE_DIM);
     struct gfx_rect cr = close_rect(r);
-    gfx_fill((struct gfx_rect){cr.x + 3, cr.y + 6, 14, 12},
-             focused ? C_WHITE : C_WIN_BG);
-    gfx_text(cr.x + 5, cr.y + 4, "X", focused ? w->accent : C_TITLE_DIM, C_TRANSP);
-    gfx_text(r.x + 12, r.y + 6, w->title, C_WHITE, C_TRANSP);
+    gfx_fill((struct gfx_rect){cr.x + 3, cr.y + 6, 14, 12}, focused ? C_WHITE : C_WIN_BG);
+    gfx_text(cr.x + 5, cr.y + 4, "X", focused ? G_apps[w->app_id]->accent : C_TITLE_DIM, C_TRANSP);
+    gfx_text(r.x + 12, r.y + 6, G_apps[w->app_id]->name, C_WHITE, C_TRANSP);
 
-    struct gfx_rect content = (struct gfx_rect){r.x + 1, r.y + TITLE_H,
-                                                r.w - 2, r.h - TITLE_H - 1};
-    if (w->kind == K_TERM) {
-        gfxterm_draw(content, focused);
-        return;
-    }
+    struct gfx_rect content = (struct gfx_rect){r.x + 1, r.y + TITLE_H, r.w - 2, r.h - TITLE_H - 1};
     gfx_clip_push(content);
-    gfx_fill((struct gfx_rect){r.x + 1, r.y + TITLE_H, r.w - 2, 2}, w->accent);
-    if (w->kind == K_INSTALL) {
-        gfx_text(r.x + 14, r.y + TITLE_H + 10, "把系统装到本机硬盘", C_WIN_TEXT, C_TRANSP);
-        gfx_text(r.x + 14, r.y + TITLE_H + 32, "会清空目标磁盘", C_WIN_DIM, C_TRANSP);
-        if (G_install_armed)
-            gfx_text(r.x + 14, r.y + TITLE_H + 56, "再点一次确认安装", C_RED, C_TRANSP);
-        else
-            gfx_text(r.x + 14, r.y + TITLE_H + 56, "先点检查磁盘", C_WIN_DIM, C_TRANSP);
-    } else {
-        gfx_text(r.x + 16, r.y + TITLE_H + 8,  w->l1, C_WIN_TEXT, C_TRANSP);
-        gfx_text(r.x + 16, r.y + TITLE_H + 26, w->l2, C_WIN_TEXT, C_TRANSP);
-        gfx_text(r.x + 16, r.y + TITLE_H + 44, w->l3, C_WIN_DIM,  C_TRANSP);
-        gfx_text(r.x + 16, r.y + TITLE_H + 62, w->l4, C_WIN_DIM,  C_TRANSP);
-    }
-    /* 窗口内按钮 */
-    for (int i = 0; i < NBTN; i++) {
-        const struct btn *b = &G_btns[i];
-        if (b->owner != idx) continue;
-        const char *label = b->label;
-        u32 bg = C_BTN;
-        if (b->act == ACT_INSTALL) {
-            if (G_install_armed) { label = "确认清空并安装"; bg = C_RED; }
-            else                 { label = "一键安装"; }
-        }
-        struct gfx_rect br = btn_rect(b);
-        if (gfx_hit(br, G_mx, G_my)) bg = C_BTN_HI;
-        draw_button_rect(br, label, bg, C_WHITE);
-    }
+    gfx_fill((struct gfx_rect){r.x + 1, r.y + TITLE_H, r.w - 2, 2}, G_apps[w->app_id]->accent);
+    if (G_apps[w->app_id]->draw) G_apps[w->app_id]->draw(content, focused, k);
     gfx_clip_pop();
 }
 
 static void draw_windows(void)
 {
-    int order[NWIN] = {0, 1, 2, 3, 4};
+    int order[NWIN];
+    for (int i = 0; i < NWIN; i++) order[i] = i;
     for (int i = 0; i < NWIN; i++)
         for (int j = i + 1; j < NWIN; j++)
             if (G_win[order[j]].z < G_win[order[i]].z) {
@@ -610,10 +874,25 @@ static void draw_windows(void)
             }
     for (int i = 0; i < NWIN; i++) {
         int k = order[i];
-        if (G_win[k].visible) draw_one_win(&G_win[k], k == G_focus, k);
+        if (G_win[k].visible) draw_one_win(k, k == G_focus);
     }
 }
 
+static int visible_count(void)
+{
+    int n = 0; for (int i = 0; i < NWIN; i++) if (G_win[i].visible) n++;
+    return n;
+}
+/* 任务栏按钮：均分宽度，永远不溢出 */
+static struct gfx_rect taskbtn_rect_dyn(int vis_idx)
+{
+    int n = visible_count();
+    int W = gfx_width();
+    int bw = n > 0 ? (W - 100) / n : 90;
+    if (bw > 96) bw = 96;
+    if (bw < 56) bw = 56;
+    return (struct gfx_rect){96 + vis_idx * bw, gfx_height() - TASKBAR_H + 8, bw - 6, 26};
+}
 static void draw_taskbar(void)
 {
     int w = gfx_width(), h = gfx_height();
@@ -622,11 +901,12 @@ static void draw_taskbar(void)
     gfx_fill((struct gfx_rect){0, ty, w, 1}, C_TB_LINE);
     struct gfx_rect sr = start_rect();
     draw_button_rect(sr, "开始", G_menu_on ? C_TEAL : C_BLUE, C_WHITE);
+    int vi = 0;
     for (int i = 0; i < NWIN; i++) {
-        struct gfx_rect br = taskbtn_rect(i);
+        if (!G_win[i].visible) continue;
+        struct gfx_rect br = taskbtn_rect_dyn(vi++);
         u32 bg = (i == G_focus) ? C_BTN_HI : GFX_RGB(28, 44, 70);
-        draw_button_rect(br, G_win[i].title, bg,
-                         G_win[i].visible ? C_WHITE : C_WIN_DIM);
+        draw_button_rect(br, G_apps[G_win[i].app_id]->name, bg, C_WHITE);
     }
     char tb[32];
     fmt_time(tb, tick / 10);
@@ -636,28 +916,26 @@ static void draw_taskbar(void)
 static void draw_menu(void)
 {
     if (!G_menu_on) return;
+    menu_build();
     struct gfx_rect m = menu_rect();
     gfx_fill((struct gfx_rect){m.x + 3, m.y + 3, m.w, m.h}, C_SHADOW);
     gfx_fill(m, C_MENU_BG);
     gfx_rect_draw(m, C_TB_LINE, 1);
     gfx_fill((struct gfx_rect){m.x, m.y, m.w, 2}, C_TEAL);
-    for (int i = 0; i < NBTN; i++) {
-        const struct btn *b = &G_btns[i];
-        if (b->owner != BT_MENU) continue;
-        struct gfx_rect br = btn_rect(b);
-        u32 bg = gfx_hit(br, G_mx, G_my) ? C_BTN_HI : C_BTN;
-        draw_button_rect(br, b->label, bg, C_WHITE);
+    gfx_text(m.x + 10, m.y + 8, "开始", C_ACCENT, C_TRANSP);
+    for (int i = 0; i < G_menu_n; i++) {
+        struct gfx_rect br = {m.x + 8, m.y + 8 + i * MENU_ROW, m.w - 16, 22};
+        int hover = gfx_hit(br, G_mx, G_my);
+        u32 bg = hover ? C_BTN_HI : C_BTN;
+        draw_button_rect(br, G_menu[i].label, bg, C_WHITE);
     }
 }
 
-/* 光标：白箭头 + 深色描边。redraw 末尾调用，受裁剪栈限制 —— 只有脏区
-   覆盖光标当前位置时才会被画出来；旧位置重画时背景会把它擦掉。 */
 static void draw_cursor(void)
 {
     for (int i = 0; i < CURSOR_H; i++) {
         int half = i / 2;
-        gfx_fill((struct gfx_rect){G_mx, G_my + i, half + 2, 1},
-                 GFX_RGB(8, 12, 20));
+        gfx_fill((struct gfx_rect){G_mx, G_my + i, half + 2, 1}, GFX_RGB(8, 12, 20));
     }
     for (int i = 1; i < CURSOR_H - 2; i++) {
         int half = i / 2;
@@ -665,9 +943,7 @@ static void draw_cursor(void)
     }
 }
 
-/* 鼠标校准覆盖层：靶心固定在屏幕正中，用户按「真实鼠标」（VNC 本地指针）
-   去点它，内核用收到的坐标减靶心得到固定偏移并写进 /etc/mousecal。
-   仍画出内核认为的光标位置，方便直观看到补偿前后差多少。 */
+/* 鼠标校准覆盖层：靶心固定在屏幕正中，用户点它，内核用收到坐标减靶心得偏移并保存。 */
 static void draw_calibrate(void)
 {
     int w = gfx_width(), h = gfx_height();
@@ -683,7 +959,6 @@ static void draw_calibrate(void)
                                 : "点任意位置完成 | Ctrl Shift F1 放弃";
     gfx_text((w - gfx_text_w(t4)) / 2, 132, t4,
              G_cal_done ? C_ACCENT : C_WIN_DIM, C_TRANSP);
-    /* 十字准线 + 三层靶心 */
     gfx_fill((struct gfx_rect){cx - 1, cy - 70, 2, 140}, C_WHITE);
     gfx_fill((struct gfx_rect){cx - 70, cy - 1, 140, 2}, C_WHITE);
     gfx_fill((struct gfx_rect){cx - 16, cy - 16, 32, 32}, C_RED);
@@ -706,6 +981,152 @@ static void redraw(struct gfx_rect r)
     draw_cursor();
 }
 
+/* ---- 鼠标事件 ---- */
+static void handle_press(void)
+{
+    int x = G_mx, y = G_my;
+
+    if (G_cal_on) {
+        if (G_cal_done) { G_cal_on = 0; G_cal_done = 0; gfx_damage(full_screen()); return; }
+        int cx = gfx_width() / 2, cy = gfx_height() / 2;
+        int dx = x - cx, dy = y - cy;
+        mouse_cal_set(dx, dy);
+        char b[64]; int n = 0;
+        const char *p = "mousecal: dx=";
+        while (*p) b[n++] = *p++;
+        n += fmt_signed(b + n, dx);
+        p = " dy="; while (*p) b[n++] = *p++;
+        n += fmt_signed(b + n, dy);
+        p = " (saved)"; while (*p) b[n++] = *p++;
+        b[n] = 0;
+        for (int i = 0; i <= n && i < (int)sizeof G_cal_msg; i++) G_cal_msg[i] = b[i];
+        G_cal_done = 1; G_mx = cx; G_my = cy;
+        gfx_damage(full_screen());
+        return;
+    }
+
+    /* 1. 任务栏：开始按钮 */
+    if (gfx_hit(start_rect(), x, y)) {
+        G_menu_on = !G_menu_on;
+        gfx_damage(full_screen());
+        return;
+    }
+    /* 2. 任务栏：已打开窗口按钮 */
+    {
+        int vi = 0;
+        for (int i = 0; i < NWIN; i++) {
+            if (!G_win[i].visible) continue;
+            if (gfx_hit(taskbtn_rect_dyn(vi), x, y)) {
+                focus_win(i); G_menu_on = 0; gfx_damage(full_screen()); return;
+            }
+            vi++;
+        }
+    }
+    /* 3. 开始菜单（打开时优先吃点击） */
+    if (G_menu_on) {
+        menu_build();
+        struct gfx_rect m = menu_rect();
+        for (int i = 0; i < G_menu_n; i++) {
+            struct gfx_rect br = {m.x + 8, m.y + 8 + i * MENU_ROW, m.w - 16, 22};
+            if (gfx_hit(br, x, y)) {
+                G_menu_on = 0;
+                if (G_menu[i].type == MI_APP) open_app(G_menu[i].app_id);
+                else gfxterm_exec(G_menu[i].cmd);
+                gfx_damage(full_screen());
+                return;
+            }
+        }
+        if (!gfx_hit(m, x, y)) { G_menu_on = 0; gfx_damage(full_screen()); }
+        return;
+    }
+    /* 4. 最顶层命中的窗口 */
+    int wi = top_win_at(x, y);
+    if (wi < 0) return;
+    struct gfx_rect r = G_win[wi].r;
+
+    if (gfx_hit(close_rect(r), x, y) && y < r.y + TITLE_H) {
+        G_win[wi].visible = 0;
+        if (G_focus == wi) refocus();
+        gfx_damage(full_screen());
+        return;
+    }
+    focus_win(wi);
+    if (y < r.y + TITLE_H) {
+        G_drag = wi; G_drag_dx = x - r.x; G_drag_dy = y - r.y;
+        return;
+    }
+    /* 内容区：交给 App 处理 */
+    struct gfx_rect cr = {r.x + 1, r.y + TITLE_H, r.w - 2, r.h - TITLE_H - 1};
+    int lx = x - cr.x, ly = y - cr.y;
+    if (G_apps[G_win[wi].app_id]->press)
+        G_apps[G_win[wi].app_id]->press(cr, lx, ly, wi);
+}
+
+static int poll_mouse(void)
+{
+    int nx, ny, wh;
+    int changed = 0;
+    if (mouse_get(&nx, &ny, 0, &wh)) {
+        struct gfx_rect old = cursor_rect(G_mx, G_my);
+        int moved = (nx != G_mx || ny != G_my);
+        G_mx = nx; G_my = ny;
+        gfx_damage(gfx_union(old, cursor_rect(G_mx, G_my)));
+        changed = 1;
+        if (wh) {
+            int dy = wh > 0 ? -1 : 1;
+            if (G_focus >= 0 && G_apps[G_win[G_focus].app_id]->scroll)
+                G_apps[G_win[G_focus].app_id]->scroll(dy, G_focus);
+            else gfxterm_scroll(wh > 0 ? 2 : -2);
+            gfx_damage(G_win[G_focus >= 0 ? G_focus : 0].r);
+        }
+        if (G_drag >= 0 && moved) {
+            struct gfx_rect *r = &G_win[G_drag].r;
+            r->x = G_mx - G_drag_dx; r->y = G_my - G_drag_dy;
+            clamp_win(r); gfx_damage(full_screen());
+        }
+    }
+    int st;
+    while (mouse_pop_btn(&st)) {
+        int pressed  = (st & 1) && !(G_mprev & 1);
+        int released = !(st & 1) && (G_mprev & 1);
+        if (pressed)  handle_press();
+        if (released) G_drag = -1;
+        G_mprev = st;
+        changed = 1;
+    }
+    return changed;
+}
+
+/* ---- 键盘 ---- */
+static void cycle_focus(void)
+{
+    int n = G_focus;
+    for (int k = 1; k <= NWIN; k++) {
+        int i = (n + k) % NWIN;
+        if (G_win[i].visible) { focus_win(i); return; }
+    }
+}
+static void focus_nth_visible(int nth)
+{
+    int seen = 0;
+    for (int i = 0; i < NWIN; i++)
+        if (G_win[i].visible) {
+            if (++seen == nth) { focus_win(i); return; }
+        }
+}
+static void handle_key(char c)
+{
+    if (c == '\t') { cycle_focus(); return; }
+    if (c >= '1' && c <= '9') { focus_nth_visible(c - '0'); return; }
+    if (c == 'w' || c == 'W') { move_focus(0, -STEP); return; }
+    if (c == 's' || c == 'S') { move_focus(0,  STEP); return; }
+    if (c == 'a' || c == 'A') { move_focus(-STEP, 0); return; }
+    if (c == 'd' || c == 'D') { move_focus( STEP, 0); return; }
+    /* 否则交给聚焦 App 的键盘处理（终端输入 / 计算器按键 / 编辑器打字） */
+    if (G_focus >= 0 && G_apps[G_win[G_focus].app_id]->key)
+        G_apps[G_win[G_focus].app_id]->key(c, G_focus);
+}
+
 /* ---- 桌面主循环 ---- */
 void desktop_run(void)
 {
@@ -713,146 +1134,101 @@ void desktop_run(void)
         kputs("[desktop] 无帧缓冲，保持串口 shell\n");
         return;
     }
-
-    gfx_take_screen();                 /* uart_putc 不再把日志镜像到帧缓冲 */
+    gfx_take_screen();
     gfx_set_redraw(redraw);
-    G_cal_on = 0;                      /* 每次进桌面都不停留在校准层 */
-    G_cal_done = 0;
+    G_cal_on = 0; G_cal_done = 0;
+
     if (!G_inited) {
-        wins_init();
-        mouse_reset(gfx_width() / 2, gfx_height() / 2);
+        apps_register();
+        G_focus = -1;
+        G_open_seq = 0;
         G_mx = gfx_width() / 2; G_my = gfx_height() / 2;
         G_mprev = 0;
+        /* 默认打开几个窗口（与旧版布局一致） */
+        open_app(A_TERM);
+        open_app(A_INFO);
+        open_app(A_DEMO);
+        open_app(A_HELP);
+        open_app(A_INSTALL);
+        G_inited = 1;
     }
-    gfxterm_init();                    /* 每次进入给一份干净的终端历史 */
+    gfxterm_init();
     fb_console_reset();
     gfx_damage(full_screen());
     gfx_present();
-    kputs("[desktop] 图形桌面已就绪：鼠标点击/拖动，开始菜单进入全部功能，终端可跑所有命令\n");
+    kputs("[desktop] 图形桌面已就绪：点「开始」打开应用，终端可跑所有命令\n");
     kputs("[desktop] 退出请按 Ctrl+Shift+F1（串口输入会自动让位）\n");
 
-    /* ---- P3.1 输入即时化 + R2 事件驱动休眠 / 自适应调频 ----------------------
-     * 演进：
-     *  - P3 之前每轮 wfi，只能被 10Hz timer 唤醒 → 键鼠排队 100ms、10fps。
-     *  - P3 去掉 wfi 改连续轮询 yield：输入即时了，但忙等占满一整核（实测宿主
-     *    CPU 50%，另一半时间片被 task1 的 wfi 吃掉）。
-     *  - R 轮（本次）：硬件 timer 与软件 tick 分频解耦（kernel.c R1），桌面把
-     *    唤醒频率提到 250~1000Hz 并抑制抢占轮转，于是可以安全地 wfi 睡眠：
-     *      * 有输入 → 不睡，连续轮询，P3 的跟手感原样保留；
-     *      * 无输入 → wfi，被高频 IRQ 唤醒即回顶部 poll，输入延迟 1~4ms；
-     *      * CPU 在两次 IRQ 间真正睡眠 → 空闲占用从 50% 降到个位数。
-     *    按连续空闲时长自适应调频（活跃 1000Hz / 短闲 250Hz / 久静 120Hz），
-     *    久静仍满足 60fps 闪烁与 10Hz tick；任意输入立刻回到高频。
-     */
     u64 freq = dsk_cntfrq();
-    if (!freq) freq = 24000000ull;              /* 读不到 cntfrq 时兜底 */
-    u64 frame_cyc = freq / 60;
-    if (!frame_cyc) frame_cyc = 1;
-    u64 ms_cyc = freq / 1000;
-    if (!ms_cyc) ms_cyc = 1;
+    if (!freq) freq = 24000000ull;
+    u64 frame_cyc = freq / 60; if (!frame_cyc) frame_cyc = 1;
+    u64 ms_cyc = freq / 1000; if (!ms_cyc) ms_cyc = 1;
     u64 next_frame = dsk_cntpct() + frame_cyc;
     u64 last_tick = tick;
 
-    /* R2：进入桌面 → 高频唤醒 + 声明桌面态（抑制抢占轮转，GUI 独占 CPU0）。
-       退出时务必恢复 10Hz + 撤销桌面态，否则串口 shell 的调度语义会变。 */
     #define WAKE_ACTIVE_HZ 1000
     #define WAKE_IDLE_HZ    250
     #define WAKE_DEEP_HZ    120
     g_desktop_active = 1;
     timer_set_wake_hz(WAKE_ACTIVE_HZ);
     u32 cur_wake = WAKE_ACTIVE_HZ;
-    /* 空闲计时用全局 tick（恒 10Hz，由硬件 cycle 真实结算），不用 cntpct_el0：
-       QEMU TCG 下虚拟计数器与墙钟不一致，会让降档判据永远算不到阈值。
-       1 tick = 100ms，阈值 200ms/2000ms → 2/20 个 tick。 */
     u64 last_input_tick = tick;
 
     for (;;) {
-        /* ① 零等待收割：本轮从 wfi 醒来后第一件事就是 poll（或连续有输入不睡） */
-        usb_kbd_poll();                /* 键盘 + 鼠标 + 组合键都在这里收割 */
-
-        /* 串口控制台优先：只要有串口字符就退出桌面，且**不消费**它，
-           让 shell_loop() 原样取走。全套自动化回归不受影响。 */
+        usb_kbd_poll();
         if (desktop_ring_peek_uart()) break;
-        /* 用户指定：只有 Ctrl+Shift+F1 能主动退出桌面 */
         if (desktop_exit_requested()) break;
 
-        int input = 0;
-        int real_input = 0;        /* 只认真实键鼠事件；呈现/闪烁/时钟置的 input 不算 */
+        int input = 0, real_input = 0;
         char c;
         while (desktop_ring_pop_kbd(&c)) {
-            if (G_focus == W_TERM) {
-                if (c == '\t') handle_key('\t');   /* Tab 仍可切窗口 */
-                else gfxterm_key(c);
-            } else {
-                handle_key(c);
-            }
+            handle_key(c);
             input = 1; real_input = 1;
         }
         if (poll_mouse()) { input = 1; real_input = 1; }
 
-        /* ② 原 10Hz 任务：只在全局 tick 前进时跑一次，保持原有频率与语义 */
         if (tick != last_tick) {
             last_tick = tick;
             smp_tick_inc();
             net_poll();
-            /* 二次确认 10 秒后自动撤销（tick 仍是 10Hz，逻辑不变） */
             if (G_install_armed && tick - G_arm_tick > 100) {
-                G_install_armed = 0;
-                gfx_damage(full_screen());
-                input = 1;
+                G_install_armed = 0; gfx_damage(full_screen()); input = 1;
             }
             u64 sec = tick / 10;
-            if (sec != G_last_sec) {
-                G_last_sec = sec; gfx_damage(clock_rect()); input = 1;
-            }
+            if (sec != G_last_sec) { G_last_sec = sec; gfx_damage(clock_rect()); input = 1; }
+            if (ed_msg_t) { ed_msg_t = 0; gfx_damage(full_screen()); }
         }
 
-        /* ③ 闪烁相位：按真实毫秒推进，空闲帧也要走 */
         u64 now = dsk_cntpct();
         int frame_due = (now >= next_frame);
-        if (frame_due) {
-            next_frame = now + frame_cyc;
-            gfxterm_blink(now / ms_cyc);
-        }
+        if (frame_due) { next_frame = now + frame_cyc; gfxterm_blink(now / ms_cyc); }
 
-        /* ④ 脏区呈现：有输入立刻画；空闲按 60fps 画（闪烁 / 时钟）。
-           光标相位切换只脏输入行那 22px，不重绘 64 行历史。 */
         int d = gfxterm_dirty();
-        if (d == 2) {
-            gfx_damage(G_win[W_TERM].r);
-            input = 1;
-        } else if (d == 1) {
+        if (d == 2) { gfx_damage(G_win[G_focus >= 0 ? G_focus : 0].r); input = 1; }
+        else if (d == 1) {
             struct gfx_rect ir = gfxterm_input_rect();
             if (gfx_rect_valid(ir)) gfx_damage(ir);
-            else gfx_damage(G_win[W_TERM].r);   /* 首帧未 draw 过时兜底整窗 */
+            else gfx_damage(G_win[G_focus >= 0 ? G_focus : 0].r);
             input = 1;
         }
         if (input || frame_due) gfx_present();
 
-        /* ---- R2 自适应调频 + 事件驱动休眠 ----------------------------------
-         * 有输入：不睡，立刻下一轮继续全速收割（拖拽/连打时完全不降速）。
-         * 无输入：按连续空闲时长降唤醒频率，然后 wfi 真正睡眠；被高频 timer
-         *   IRQ 或 UART IRQ 唤醒即回循环顶部 poll。tick 恒 10Hz 不受影响。
-         */
-        /* 只用真实键鼠事件刷新空闲起点：闪烁光标/时钟/二次确认超时都会置 input，
-           若用 input 会不断刷新 last_input_tick，导致永远降不到 DEEP 档。 */
         if (real_input) last_input_tick = tick;
-        u64 idle_ticks = tick - last_input_tick;      /* 1 tick = 100ms */
-        u32 want = idle_ticks < 2  ? WAKE_ACTIVE_HZ     /* <200ms  活跃 */
-                 : idle_ticks < 20 ? WAKE_IDLE_HZ       /* <2s     短闲 */
-                 :                    WAKE_DEEP_HZ;     /* >=2s    久静 */
+        u64 idle_ticks = tick - last_input_tick;
+        u32 want = idle_ticks < 2  ? WAKE_ACTIVE_HZ
+                 : idle_ticks < 20 ? WAKE_IDLE_HZ
+                 :                    WAKE_DEEP_HZ;
         if (want != cur_wake) { timer_set_wake_hz(want); cur_wake = want; }
         if (!input) {
             res_wfi_inc();
-            __asm__ volatile("wfi");   /* 睡到下一个唤醒 IRQ；醒来回顶部 poll */
+            __asm__ volatile("wfi");
         }
     }
 
-    /* R2：退出桌面 → 恢复 10Hz 唤醒 + 撤销桌面态（抢占轮转照旧）。 */
     timer_set_wake_hz(10);
     g_desktop_active = 0;
     gfxterm_stop();
-    gfx_release_screen();              /* 恢复 uart_putc → fb_putc 的文字镜像 */
+    gfx_release_screen();
     fb_console_reset();
     kputs("[desktop] 已返回串口终端（Ctrl+Shift+F1 可再按一次）\n");
 }
