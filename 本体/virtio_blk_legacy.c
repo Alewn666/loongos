@@ -65,10 +65,10 @@ static inline void lbar(void)        { __asm__ volatile("dsb sy" ::: "memory"); 
 static u64  l_io;
 static u64  l_cap;
 static u16  l_qnum;
-static u8   l_ring[8192] __attribute__((aligned(4096)));
+static u8   l_ring[8192] __attribute__((aligned(4096), section(".bss.align4k")));
 static u8   l_hdr[16] __attribute__((aligned(16)));
 static u8   l_st[16] __attribute__((aligned(16)));
-static u8   l_buf[4096] __attribute__((aligned(4096)));
+static u8   l_buf[4096] __attribute__((aligned(4096), section(".bss.align4k")));
 static u16  l_avail_idx, l_used_idx;
 
 static volatile u32 *lecam(int b, int d, int f, int r)

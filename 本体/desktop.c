@@ -124,7 +124,7 @@ struct btn {
 
 #define MENU_W   220
 #define MENU_ROW 26
-#define MENU_N   11
+#define MENU_N   13
 #define MENU_H   (8 + MENU_N * MENU_ROW + 8)
 
 static const struct btn G_btns[] = {
@@ -140,6 +140,8 @@ static const struct btn G_btns[] = {
     { BT_MENU,   8,   8 + 8*MENU_ROW, 204, 22, "磁盘用量",   ACT_EXEC,    0, "df" },
     { BT_MENU,   8,   8 + 9*MENU_ROW, 204, 22, "清空终端",   ACT_CLEAR,   0, 0 },
     { BT_MENU,   8,   8 +10*MENU_ROW, 204, 22, "鼠标校准",   ACT_CAL,     0, 0 },
+    { BT_MENU,   8,   8 +11*MENU_ROW, 204, 22, "关机",       ACT_EXEC,    0, "poweroff" },
+    { BT_MENU,   8,   8 +12*MENU_ROW, 204, 22, "重启",       ACT_EXEC,    0, "reboot" },
     /* 安装系统窗口内 */
     { W_INSTALL, 14,  88, 162, 26, "检查磁盘",   ACT_EXEC,    0, "disks" },
     { W_INSTALL, 14, 122, 162, 26, "一键安装",   ACT_INSTALL, 0, 0 },

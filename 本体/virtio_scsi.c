@@ -128,17 +128,17 @@ static u8   vs_lun[8];               /* 目标 LUN（SAM 简单寻址：lun[1]=t
 static int  vs_tgt, vs_lunid;
 
 /* 同步请求一次只用 3 个描述符，8 条足够；数组越小 BSS 越省（BSS 撞用户区会停机） */
-static struct vdesc vs_desc[128] __attribute__((aligned(4096)));  /* 与 virtio_blk.c 同规格：4KB 对齐、足量槽位 */
+static struct vdesc vs_desc[128] __attribute__((aligned(4096), section(".bss.align4k")));  /* 与 virtio_blk.c 同规格：4KB 对齐、足量槽位 */
 static struct {
     u16 flags, idx;
     u16 ring[128];
     u16 used_event;
-} vs_avail __attribute__((aligned(4096)));
+} vs_avail __attribute__((aligned(4096), section(".bss.align4k")));
 static struct {
     u16 flags, idx;
     struct vused_elem ring[128];
     u16 avail_event;
-} vs_used __attribute__((aligned(4096)));
+} vs_used __attribute__((aligned(4096), section(".bss.align4k")));
 
 static struct vs_req  vs_reqbuf __attribute__((aligned(64)));
 static struct vs_resp vs_respbuf __attribute__((aligned(64)));
@@ -198,7 +198,7 @@ static void vs_notify_queue(void)
 static u64 vs_lbase;                 /* BAR1 基址 */
 static int vs_legacy;
 static u16 vs_lqnum;
-static u8  vs_lq[8192] __attribute__((aligned(4096)));
+static u8  vs_lq[8192] __attribute__((aligned(4096), section(".bss.align4k")));
 static struct vdesc  *vs_ldesc;
 static volatile u16  *vs_lavail_idx;
 static volatile u16  *vs_lused_idx;

@@ -88,7 +88,7 @@ static inline void sbar(void)         { __asm__ volatile("dsb sy" ::: "memory");
 static int    rng_ok;
 static u64    rng_common, rng_notify, rng_isr, rng_devcfg;
 static u32    rng_notify_mul, rng_notify_off;
-static u8     rng_page[RNG_PAGE_SZ] __attribute__((aligned(4096)));
+static u8     rng_page[RNG_PAGE_SZ] __attribute__((aligned(4096), section(".bss.align4k")));
 
 struct rng_desc { u64 addr; u32 len; u16 flags; u16 next; };
 static struct rng_desc *rng_desc = (struct rng_desc *)(rng_page + OFF_DESC);

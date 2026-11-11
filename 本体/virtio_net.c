@@ -91,13 +91,13 @@ static int  vn_link_up;
 static u64  vn_tx_last_used, vn_rx_seen_used;
 
 /* 队列 0 = RX，队列 1 = TX，desc/avail/used 三块独立内存 */
-static struct vdesc vn_rx_desc[VN_QNUM] __attribute__((aligned(4096)));
-static struct { u16 flags, idx; u16 ring[VN_QNUM]; u16 used_event; } vn_rx_avail __attribute__((aligned(4096)));
-static struct { u16 flags, idx; struct vused_elem ring[VN_QNUM]; u16 avail_event; } vn_rx_used __attribute__((aligned(4096)));
+static struct vdesc vn_rx_desc[VN_QNUM] __attribute__((aligned(4096), section(".bss.align4k")));
+static struct { u16 flags, idx; u16 ring[VN_QNUM]; u16 used_event; } vn_rx_avail __attribute__((aligned(4096), section(".bss.align4k")));
+static struct { u16 flags, idx; struct vused_elem ring[VN_QNUM]; u16 avail_event; } vn_rx_used __attribute__((aligned(4096), section(".bss.align4k")));
 
-static struct vdesc vn_tx_desc[VN_QNUM] __attribute__((aligned(4096)));
-static struct { u16 flags, idx; u16 ring[VN_QNUM]; u16 used_event; } vn_tx_avail __attribute__((aligned(4096)));
-static struct { u16 flags, idx; struct vused_elem ring[VN_QNUM]; u16 avail_event; } vn_tx_used __attribute__((aligned(4096)));
+static struct vdesc vn_tx_desc[VN_QNUM] __attribute__((aligned(4096), section(".bss.align4k")));
+static struct { u16 flags, idx; u16 ring[VN_QNUM]; u16 used_event; } vn_tx_avail __attribute__((aligned(4096), section(".bss.align4k")));
+static struct { u16 flags, idx; struct vused_elem ring[VN_QNUM]; u16 avail_event; } vn_tx_used __attribute__((aligned(4096), section(".bss.align4k")));
 
 /* RX 缓冲：每块 = 12 字节头 + 帧区；TX 缓冲同布局 */
 static u8 vn_rx_buf[VN_RXBUF][VN_HDRLEN + VN_PKTMAX] __attribute__((aligned(16)));

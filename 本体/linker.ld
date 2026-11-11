@@ -47,6 +47,12 @@ SECTIONS
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
+        /* 阶段三扩容方案1（治本）：所有 4KB 对齐的设备缓冲（页表 / virtio 队列 /
+         * NVMe 之外的 DMA 页）统一收进 .bss.align4k，置于普通小变量之后、内核栈之前。
+         * 这样小变量再怎么重排都不会把整条对齐链顶后一页，±4KB 敏感度消除，
+         * 上界余量可预期（见 docs/内核空间预算与扩容指引.md 第六节）。 */
+        . = ALIGN(4096);
+        *(.bss.align4k)
         . = ALIGN(16);
         _stack_bottom = .;
         . += 32 * 1024;        /* 32KB 内核栈（64KB→40KB→32KB；阶段6③ 加了 virtio 队列 8KB+4KB 缓冲，给 bss 让出余量，

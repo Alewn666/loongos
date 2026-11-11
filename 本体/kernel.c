@@ -1011,21 +1011,21 @@ static void gic_init(void)
 /* 链接脚本给的节区边界（linker.ld） */
 
 /* 页表（4KB 对齐，放在 .bss 里，随内核一起被映射为 RW） */
-__attribute__((aligned(4096))) static u64 l0_table[512];  /* 阶段6①：48 位 VA 的 L0（只有 [0] 有用） */
-__attribute__((aligned(4096))) static u64 l1_table[512];  /* 管 512×1GB */
-__attribute__((aligned(4096))) static u64 l2_dev[512];    /* 第0个GB：设备 */
-__attribute__((aligned(4096))) static u64 l2_ram[512];    /* 第1个GB：RAM 0x40000000+ */
-__attribute__((aligned(4096))) static u64 l3_kern[512];   /* 内核所在 2MB：细分成 4KB 页 */
-__attribute__((aligned(4096))) static u64 l3_user[512];   /* 第二个 2MB 块(0x40200000-0x403FFFFF)的 L3：低 16 页给内核 .bss/栈(PROT_RAM)，
+__attribute__((aligned(4096), section(".bss.align4k"))) static u64 l0_table[512];  /* 阶段6①：48 位 VA 的 L0（只有 [0] 有用） */
+__attribute__((aligned(4096), section(".bss.align4k"))) static u64 l1_table[512];  /* 管 512×1GB */
+__attribute__((aligned(4096), section(".bss.align4k"))) static u64 l2_dev[512];    /* 第0个GB：设备 */
+__attribute__((aligned(4096), section(".bss.align4k"))) static u64 l2_ram[512];    /* 第1个GB：RAM 0x40000000+ */
+__attribute__((aligned(4096), section(".bss.align4k"))) static u64 l3_kern[512];   /* 内核所在 2MB：细分成 4KB 页 */
+__attribute__((aligned(4096), section(".bss.align4k"))) static u64 l3_user[512];   /* 第二个 2MB 块(0x40200000-0x403FFFFF)的 L3：低 16 页给内核 .bss/栈(PROT_RAM)，
                                                             其余给用户区(0x40210000 起，PROT_USERRW)。整表复制即换地址空间 */
-__attribute__((aligned(4096))) static u64 l2_pcie_hi[512];/* 第257个GB：PCIe ECAM(0x4010000000) */
-__attribute__((aligned(4096))) static u64 l1_hi[512];     /* 阶段6②：64 位 MMIO 窗口（L0[1] → 0x8000000000 起 256GB） */
+__attribute__((aligned(4096), section(".bss.align4k"))) static u64 l2_pcie_hi[512];/* 第257个GB：PCIe ECAM(0x4010000000) */
+__attribute__((aligned(4096), section(".bss.align4k"))) static u64 l1_hi[512];     /* 阶段6②：64 位 MMIO 窗口（L0[1] → 0x8000000000 起 256GB） */
 
 /* EL0 演示页：独占一页（数组 4KB 对齐 + 4KB 大小），页表单独标 EL0 可读写 */
-__attribute__((aligned(4096))) static volatile u8 el0_page[4096];
+__attribute__((aligned(4096), section(".bss.align4k"))) static volatile u8 el0_page[4096];
 /* EL0 演示专用栈（2026-10-28 修：原来拿 el0_page 顶部当栈——数据页和栈挤在同一页，
    演示代码多写几个变量就会互踩；现在各占一页，映射见 mmu_init） */
-__attribute__((aligned(4096))) static u8 el0_stack[4096];
+__attribute__((aligned(4096), section(".bss.align4k"))) static u8 el0_stack[4096];
 
 /* 把 [start,end) 的 4KB 页填进 L3（VA=PA 恒等）
    ⚠️ 起止必须各自对齐到页：__data_start 之类是 0x...4c0 这种值，
@@ -2556,6 +2556,57 @@ static void cmd_mousecal(char *a)
     uart_puts("           或桌面「开始菜单 → 鼠标校准」点靶心自动校准\n");
 }
 
+/* ---- 系统电源：PSCI SYSTEM_OFF / SYSTEM_RESET ----
+ * 虚拟机管理器的「关机/重启」按钮通常发 ACPI 电源键事件；本内核是自己写的 EL1 内核、
+ * 用 -kernel 直启、没有 ACPI / guest-agent，收不到这类信号，所以只能从系统内主动触发。
+ * QEMU -machine virt 在「EL1 且 EL3/EL2 都不可用」时 smc 是 UNDEFINED，因此先读
+ * ID_AA64PFR0_EL1 确认有可用 conduit，再尝试 HVC（虚拟/真实 EL2 经 HVC 提供 PSCI，
+ * 真实 KVM 虚拟机走这条）或 SMC（裸机 EL3 固件；QEMU 加 virtualization=on 也走 SMC）。
+ * 两条都试，命中即返回；无 conduit 时优雅返回 -1，绝不执行会 UNDEF 的指令导致崩。 */
+#define PSCI_FID_SYSTEM_OFF   0x84000008UL
+#define PSCI_FID_SYSTEM_RESET 0x84000009UL
+
+static long psci_call(u64 fn)
+{
+    u64 pfr0;
+    __asm__ volatile("mrs %0, ID_AA64PFR0_EL1" : "=r"(pfr0));
+    int has_el2 = (int)((pfr0 >> 8)  & 0xF);   /* EL2 是否存在（虚拟或真实） */
+    int has_el3 = (int)((pfr0 >> 12) & 0xF);   /* EL3 是否存在 */
+    if (!has_el2 && !has_el3)
+        return -1;                              /* 无 PSCI conduit，避免 UNDEF */
+
+    register long x0 __asm__("x0") = (long)fn;
+    if (has_el2) {                              /* 先试 HVC（KVM / QEMU EL2） */
+        __asm__ volatile("hvc #0" : "+r"(x0) : : "memory");
+        if (x0 == 0) return 0;
+    }
+    if (has_el2 || has_el3) {                   /* EL2 下 SMC 也陷入 EL2；裸机走 EL3 SMC */
+        x0 = (long)fn;
+        __asm__ volatile("smc #0" : "+r"(x0) : : "memory");
+        if (x0 == 0) return 0;
+    }
+    return (long)x0;                            /* 返回 PSCI 错误码（非 0） */
+}
+
+static void do_poweroff(void)
+{
+    uart_puts("\n[power] 正在关机…\n");
+    psci_call(PSCI_FID_SYSTEM_OFF);
+    for (;;) __asm__ volatile("wfi");           /* PSCI 未实现时自旋，绝不崩 */
+}
+
+static void do_reboot(void)
+{
+    uart_puts("\n[power] 正在重启…\n");
+    psci_call(PSCI_FID_SYSTEM_RESET);
+    for (;;) __asm__ volatile("wfi");
+}
+
+static void cmd_poweroff(char *a) { (void)a; do_poweroff(); }
+static void cmd_reboot(char *a)   { (void)a; do_reboot(); }
+static void cmd_shutdown(char *a) { (void)a; do_poweroff(); }
+static void cmd_halt(char *a)     { (void)a; do_poweroff(); }
+
 static const struct cmdent CMDS[] = {
     { "ls",    cmd_ls    }, { "cat",   cmd_cat   }, { "write", cmd_write },
     { "mkdir", cmd_mkdir }, { "rm",    cmd_rm    }, { "df",    cmd_df    },
@@ -2569,6 +2620,8 @@ static const struct cmdent CMDS[] = {
     { "wc", cmd_wc }, { "grep", cmd_grep }, { "head", cmd_head },
     { "desktop", cmd_desktop }, { "mousecal", cmd_mousecal },
     { "res", cmd_res },        /* R 轮资源账诊断（刻意不写进 help，保行为基线逐字一致） */
+    { "poweroff", cmd_poweroff }, { "shutdown", cmd_shutdown },
+    { "halt", cmd_halt },         { "reboot", cmd_reboot },
     { 0, 0 }
 };
 
@@ -3193,6 +3246,7 @@ static void cmd_help(char *a)
         "  cpu                  看多核：哪几颗在线 / 计数是否在涨\n"
         "  desktop             进图形桌面（开机默认；Ctrl+Shift+F1 返回终端）\n"
         "  mousecal            看/设鼠标偏移（桌面开始菜单可点靶心自动校准）\n"
+        "  poweroff|reboot      关机 / 重启（等价虚拟机管理器的关机/重启按钮）\n"
         "  help                 本清单\n");
 }
 

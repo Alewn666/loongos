@@ -110,21 +110,21 @@ static u16  vb_qnum = 128;
 static u16  vb_notify_off;
 
 /* 队列内存（modern：三块独立） */
-static struct vdesc vb_desc[128] __attribute__((aligned(4096)));
+static struct vdesc vb_desc[128] __attribute__((aligned(4096), section(".bss.align4k")));
 static struct {
     u16 flags, idx;
     u16 ring[128];
     u16 used_event;
-} vb_avail __attribute__((aligned(4096)));
+} vb_avail __attribute__((aligned(4096), section(".bss.align4k")));
 static struct {
     u16 flags, idx;
     struct vused_elem ring[128];
     u16 avail_event;
-} vb_used __attribute__((aligned(4096)));
+} vb_used __attribute__((aligned(4096), section(".bss.align4k")));
 
 static u8 vb_hdr_buf[16] __attribute__((aligned(16)));
 static u8 vb_st_buf[16]  __attribute__((aligned(16)));
-static u8 vb_io_buf[4096] __attribute__((aligned(4096)));
+static u8 vb_io_buf[4096] __attribute__((aligned(4096), section(".bss.align4k")));
 
 /* ---------------- PCI 小工具 ---------------- */
 static volatile u32 *ecam(int bus, int dev, int fn, int reg)

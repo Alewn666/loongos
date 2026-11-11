@@ -19,7 +19,7 @@
 | 中断与调度 | `kernel.c` / `smp.c` | GICv2/v3 运行时探测（读 PIDR2）、10Hz tick、抢占式多任务；SMP 代码已具备但**默认关闭**（见「诚实的边界」） |
 | 显示 | `kernel.c` / `font8x16.h` / `font_cjk.h` / `gfx.c` | 8×16 英文 + 16×16 中文点阵；UEFI GOP **或** QEMU ramfb（裸 ELF 启动经 fw_cfg DMA 自建 800×600 显示底座）；渐变壁纸、顶栏、任务栏时钟、脏矩形重画 |
 | 输入 | `usb_kbd.c` | xHCI **多设备** HID：boot 键盘(8B) + 相对鼠标(4B) + 绝对平板(6B) 可同挂一个控制器；报告层识别 Ctrl+Shift+F1 |
-| 图形桌面 | `gfx.c` / `gfx.h` / `gfx_draw.h` / `desktop.c` | 裁剪 / 命中 / z 序 / 脏矩形纯函数层 + 5 窗口、鼠标指针、点击提焦点、拖标题栏、点 × 关闭、任务栏切换；**开始菜单 11 项**、安装系统向导（二次确认，10 秒超时自动撤销） |
+| 图形桌面 | `gfx.c` / `gfx.h` / `gfx_draw.h` / `desktop.c` | 裁剪 / 命中 / z 序 / 脏矩形纯函数层 + 5 窗口、鼠标指针、点击提焦点、拖标题栏、点 × 关闭、任务栏切换；**开始菜单 13 项**（含关机/重启）、安装系统向导（二次确认，10 秒超时自动撤销） |
 | 桌面手感 P3 | `desktop.c` / `kernel.c` / `gfxterm.c` / `gfx_draw.h` | 去掉主循环 `wfi`（改连续轮询 + 硬件计数器 60fps 帧节流），键鼠输入不再排队等 100ms 拍子；按钮**边沿事件队列**保证极短快速点击 / 短拖拽不丢；**白色闪烁插入光标**（打字后常亮 500ms，之后 500ms 亮/灭） |
 | 鼠标校准 | `kernel.c` / `desktop.c` | VNC 客户端送坐标带固定偏移时，`开始菜单 → 鼠标校准` 点靶心自动补偿；`mousecal` 命令查询/手设/清零，偏移存 `/etc/mousecal`，装盘重启仍生效 |
 | 图形终端 | `gfxterm.c` | 窗口内可跑**全部** shell 命令（含 `install yes`）；`uart_putc` 输出捕获进 12KB 历史缓冲，中英混排、UTF-8 输入、退格、滚轮翻页、白色闪烁光标 |
@@ -33,6 +33,7 @@
 | 内核接口 | `loongos.h` | 跨模块声明的唯一事实来源；收敛散落在各 `.c` 的 127 处重复 `extern`，修掉类型漂移与幽灵声明 |
 | 块设备抽象 | `blkdev.h` / `blkdev.c` | `struct blkdev_ops` + `blk_drivers[]` 统一优先级表；新增驱动只改 3 处，不再动 `kernel.c` |
 | 资源调配 R | `kernel.c` / `desktop.c` / `test_resource_live.py` | 硬件唤醒频率与 `tick`(恒10Hz) 按 cycle 解耦；桌面空闲 `wfi` + 自适应调频（1000/250/120Hz），宿主 CPU **50%→0.6%**；`res` 命令看资源账 |
+| 电源管理 | `kernel.c` / `desktop.c` / `test_power.py` | 自研 EL1 内核无 ACPI/guest-agent，收不到虚拟机管理器的电源键；改用 **PSCI** `SYSTEM_OFF(0x84000008)` / `SYSTEM_RESET(0x84000009)` 主动触发，先于 `ID_AA64PFR0_EL1` 探测 conduit（HVC 优先、SMC 兜底、无则优雅返回）；`poweroff`/`shutdown`/`halt`/`reboot` 命令 + 桌面「关机/重启」按钮，等价管理器电源操作 |
 | 构建与空间守卫 | `build.sh` / `bss_budget.txt` | `KERN_SRCS` 单一编译单元来源 + 未登记源文件守卫 + 分段预算/上界余量 + fw_cfg DMA 缓冲**段归属 + 地址≥镜像起点**守卫 |
 | 真实画面判据 | `test_framebuffer.py` | 直接对 QEMU screendump 做像素级判定（尺寸 800×600 / 颜色数 / 非背景占比），杜绝「串口一切正常但屏幕全黑」的静默假绿 |
 
