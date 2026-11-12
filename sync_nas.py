@@ -34,6 +34,7 @@ FILES = [
     ('本体/docs/检查与修复记录.md', '本体/docs/检查与修复记录.md'),
     ('README.md',                 '本体/README.md'),
     ('本体/iso/loongos.iso',      'iso/自研内核ISO/loongos.iso'),
+    ('test_minimize.py',          '本体/test_minimize.py'),
 ]
 
 def md5_local(path):

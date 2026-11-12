@@ -87,6 +87,7 @@ struct dwin {
     int z;
     int app_id;       /* 指向 G_apps[] 的应用定义 */
     int visible;
+    int minimized;    /* 最小化：visible 仍=1（任务栏保留），绘制/命中/聚焦均跳过 */
     int data;         /* 每实例小状态（滚动偏移等） */
     int seq;          /* 同 App 多实例序号（单实例下恒 0） */
 };
@@ -230,6 +231,10 @@ static struct gfx_rect close_rect(struct gfx_rect r)
 {
     return (struct gfx_rect){r.x + r.w - 24, r.y + 4, 20, 22};
 }
+static struct gfx_rect min_rect(struct gfx_rect r)
+{
+    return (struct gfx_rect){r.x + r.w - 48, r.y + 4, 20, 22};
+}
 
 /* ---- 开始菜单：动态列出全部 App + 关机/重启 ---- */
 static void menu_build(void)
@@ -281,9 +286,10 @@ static int open_app(int app_id)
     if (app_id < 0 || app_id >= NAPP || !G_apps[app_id]) return -1;
     if (G_apps[app_id]->single) {
         for (int i = 0; i < NWIN; i++)
-            if (G_win[i].visible && G_win[i].app_id == app_id) {
-                G_focus = i; raise_focus_shim(); return i;
-            }
+        if (G_win[i].visible && G_win[i].app_id == app_id) {
+            G_win[i].minimized = 0;
+            G_focus = i; raise_focus_shim(); return i;
+        }
     }
     int slot = -1;
     for (int i = 0; i < NWIN; i++)
@@ -301,6 +307,7 @@ static int open_app(int app_id)
     G_win[slot].r = r;
     G_win[slot].app_id = app_id;
     G_win[slot].visible = 1;
+    G_win[slot].minimized = 0;
     G_win[slot].data = 0;
     G_win[slot].seq = G_open_seq++;
     G_focus = slot;
@@ -325,7 +332,7 @@ static void raise_focus_shim(void)
 static void refocus(void)
 {
     for (int i = 0; i < NWIN; i++)
-        if (G_win[i].visible) { G_focus = i; return; }
+        if (G_win[i].visible && !G_win[i].minimized) { G_focus = i; return; }
     G_focus = -1;
 }
 static void focus_win(int i)
@@ -346,7 +353,7 @@ static int top_win_at(int x, int y)
 {
     int best = -1, best_z = 0;
     for (int i = 0; i < NWIN; i++) {
-        if (!G_win[i].visible) continue;
+        if (!G_win[i].visible || G_win[i].minimized) continue;
         if (!gfx_hit(G_win[i].r, x, y)) continue;
         if (best < 0 || G_win[i].z > best_z) { best = i; best_z = G_win[i].z; }
     }
@@ -846,6 +853,7 @@ static void draw_one_win(int k, int focused)
 {
     struct dwin *w = &G_win[k];
     struct gfx_rect r = w->r;
+    if (w->minimized) return;          /* 最小化窗口不绘制 */
     gfx_fill((struct gfx_rect){r.x + 4, r.y + 4, r.w, r.h}, C_SHADOW);
     gfx_fill(r, C_WIN_BG);
     gfx_rect_draw(r, C_BORDER, 1);
@@ -854,6 +862,8 @@ static void draw_one_win(int k, int focused)
     struct gfx_rect cr = close_rect(r);
     gfx_fill((struct gfx_rect){cr.x + 3, cr.y + 6, 14, 12}, focused ? C_WHITE : C_WIN_BG);
     gfx_text(cr.x + 5, cr.y + 4, "X", focused ? G_apps[w->app_id]->accent : C_TITLE_DIM, C_TRANSP);
+    struct gfx_rect mr = min_rect(r);
+    gfx_fill((struct gfx_rect){mr.x + 3, mr.y + 14, 14, 4}, focused ? C_WHITE : C_WIN_BG);
     gfx_text(r.x + 12, r.y + 6, G_apps[w->app_id]->name, C_WHITE, C_TRANSP);
 
     struct gfx_rect content = (struct gfx_rect){r.x + 1, r.y + TITLE_H, r.w - 2, r.h - TITLE_H - 1};
@@ -905,7 +915,8 @@ static void draw_taskbar(void)
     for (int i = 0; i < NWIN; i++) {
         if (!G_win[i].visible) continue;
         struct gfx_rect br = taskbtn_rect_dyn(vi++);
-        u32 bg = (i == G_focus) ? C_BTN_HI : GFX_RGB(28, 44, 70);
+        u32 bg = (i == G_focus) ? C_BTN_HI
+               : (G_win[i].minimized ? GFX_RGB(20, 32, 52) : GFX_RGB(28, 44, 70));
         draw_button_rect(br, G_apps[G_win[i].app_id]->name, bg, C_WHITE);
     }
     char tb[32];
@@ -1017,7 +1028,10 @@ static void handle_press(void)
         for (int i = 0; i < NWIN; i++) {
             if (!G_win[i].visible) continue;
             if (gfx_hit(taskbtn_rect_dyn(vi), x, y)) {
-                focus_win(i); G_menu_on = 0; gfx_damage(full_screen()); return;
+                if (G_win[i].minimized)      { G_win[i].minimized = 0; G_focus = i; raise_focus_shim(); }
+                else if (i == G_focus)       { G_win[i].minimized = 1; refocus(); }
+                else                          focus_win(i);
+                G_menu_on = 0; gfx_damage(full_screen()); return;
             }
             vi++;
         }
@@ -1044,6 +1058,13 @@ static void handle_press(void)
     if (wi < 0) return;
     struct gfx_rect r = G_win[wi].r;
 
+    if (gfx_hit(min_rect(r), x, y) && y < r.y + TITLE_H) {
+        G_win[wi].minimized = !G_win[wi].minimized;
+        if (G_win[wi].minimized) { if (G_focus == wi) refocus(); }
+        else { G_focus = wi; raise_focus_shim(); }
+        gfx_damage(full_screen());
+        return;
+    }
     if (gfx_hit(close_rect(r), x, y) && y < r.y + TITLE_H) {
         G_win[wi].visible = 0;
         if (G_focus == wi) refocus();
@@ -1103,14 +1124,14 @@ static void cycle_focus(void)
     int n = G_focus;
     for (int k = 1; k <= NWIN; k++) {
         int i = (n + k) % NWIN;
-        if (G_win[i].visible) { focus_win(i); return; }
+        if (G_win[i].visible && !G_win[i].minimized) { focus_win(i); return; }
     }
 }
 static void focus_nth_visible(int nth)
 {
     int seen = 0;
     for (int i = 0; i < NWIN; i++)
-        if (G_win[i].visible) {
+        if (G_win[i].visible && !G_win[i].minimized) {
             if (++seen == nth) { focus_win(i); return; }
         }
 }
