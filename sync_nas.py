@@ -2,25 +2,27 @@
 # -*- coding: utf-8 -*-
 """
 同步本轮产物到 NAS（fnOS / 飞牛）。
-凭据走环境变量（不硬编码）：
-  NAS_HOST  默认 <NAS_HOST>
-  NAS_PORT  默认 <NAS_PORT>
-  NAS_USER  默认 <NAS_USER>   （root 在此穿透端口认证失败，用 <NAS_USER>）
-  NAS_PASS  默认 从环境变量读，未设则提示
-  NAS_BASE  默认 /vol1/1000/项目/loongos/arm   （ARM 项目根，对应本地 本体/）
+⚠️ 安全：所有连接信息必须走环境变量，禁止在源码/注释/文档里写明文密码或真实地址。
+   历史教训：早期版本曾在用法注释里写过真实口令并推送到 public 仓库，导致凭据泄露。
+   该口令必须视为已泄露、立即在 NAS 上更换，并清理 Git 历史（见 docs/安全审计报告.md）。
+
+  NAS_HOST  必填（无默认值）
+  NAS_PORT  必填（无默认值）
+  NAS_USER  必填（无默认值）
+  NAS_PASS  必填；未设则交互式提示
+  NAS_BASE  可选，默认 /vol1/1000/项目/loongos/arm
 
 用法：
-  NAS_PASS='<REDACTED_PASSWORD>' python3 sync_nas.py
-  NAS_HOST=新IP NAS_PORT=新端口 python3 sync_nas.py
-已上传文件做 md5 对账：相同则跳过，不同则临时文件 + 原子 mv 覆盖。
+  NAS_HOST=<主机> NAS_PORT=<端口> NAS_USER=<用户> NAS_PASS='<口令>' python3 sync_nas.py
+已上传文件做 md5 对账：相同则跳过，不同则直接覆盖写（fnOS 的 rename 不支持覆盖）。
 """
 import os, sys, hashlib, paramiko
 
-HOST  = os.environ.get('NAS_HOST', '<NAS_HOST>')
-PORT  = int(os.environ.get('NAS_PORT', '<NAS_PORT>'))
-USER  = os.environ.get('NAS_USER', '<NAS_USER>')
+HOST  = os.environ.get('NAS_HOST') or input('NAS 主机: ')
+PORT  = int(os.environ.get('NAS_PORT') or input('NAS SSH 端口: '))
+USER  = os.environ.get('NAS_USER') or input('NAS 用户: ')
 PASS  = os.environ.get('NAS_PASS') or input('NAS 密码: ')
-BASE  = os.environ.get('NAS_BASE', '/vol1/1000/项目/loongos/arm')  # ARM 项目根
+BASE  = os.environ.get('NAS_BASE', '/vol1/1000/项目/loongos/arm')  # ARM 项目根（非敏感）
 
 LOCAL_ROOT = os.path.dirname(os.path.abspath(__file__))  # /workspace/安卓/loongos
 
