@@ -13,6 +13,7 @@
  * 默认口令（教学演示，只写在注释和 docs 里、不进镜像）：root=loong2026 demo=demo2026。 */
 
 #include "fs.h"     /* fs.c 的接口（typedef 与本文件重复但同型，C11 允许） */
+#include "b64.h"    /* 批次2 文件进出通道：base64 纯函数层（无状态、带 cap） */
 #include "crypto.h" /* SHA-256 + 迭代哈希（口令校验） */
 #include "auth_cred.h" /* 默认账号凭据：盐/迭代数/预计算哈希（内核镜像零明文口令） */
 #include "usb_kbd.h"/* 阶段6①：xHCI + USB HID 键盘 */
@@ -852,7 +853,12 @@ static void hb_puthex(u64 v)
 }
 
 /* ---------------- 接收环形缓冲（中断塞字节，主循环取） ---------------- */
-#define RING_SZ 64
+/* 第三十七轮：64 → 256。原容量连一行标准 76 字符的 base64 折行都装不下，
+   终端一次性粘贴时 ring_push 会「满则丢弃」，把行中间的字符甚至行结束符 '\r'
+   一起丢掉 —— 表现为多行被拼成一行、内容静默损坏。256 可容 3 行折行 + 余量。
+   仍有溢出可能，故配套 ring_dropped：b64in 检测到丢字符就拒绝写文件。 */
+#define RING_SZ 1024
+static volatile u32  ring_dropped;      /* 输入溢出丢弃累计（b64in 每次进入清零） */
 static volatile char ring[RING_SZ];
 /* 来源标记（桌面 P1）：0 = UART 串口控制台，1 = USB 键盘。
    UART 中断和 usb_kbd_poll() 都往同一个 ring 塞字节（见 kbd_feed 注释），
@@ -865,8 +871,10 @@ static volatile u32 ring_head = 0, ring_tail = 0;
 static void ring_push(char c, u8 src)
 {
     u32 next = (ring_head + 1) % RING_SZ;
-    if (next == ring_tail)
-        return;                       /* 满则丢弃，简单粗暴 */
+    if (next == ring_tail) {
+        ring_dropped++;               /* 记下来，让交互命令能拒绝「半截输入」 */
+        return;
+    }
     ring[ring_head] = c;
     ring_src[ring_head] = src;
     ring_head = next;
@@ -2166,6 +2174,8 @@ static void cmd_wc(char *a);
 static void cmd_grep(char *a);
 static void cmd_head(char *a);
 static void cmd_desktop(char *a);
+static void cmd_b64out(char *a);
+static void cmd_b64in(char *a);
 
 struct cmdent { const char *name; void (*fn)(char *); };
 /* ================= kernel bench：内核态微基准 =================
@@ -2638,6 +2648,7 @@ static const struct cmdent CMDS[] = {
     { "touch", cmd_touch }, { "mv", cmd_mv }, { "stat", cmd_stat },
     { "wc", cmd_wc }, { "grep", cmd_grep }, { "head", cmd_head },
     { "desktop", cmd_desktop }, { "mousecal", cmd_mousecal },
+    { "b64out", cmd_b64out }, { "b64in", cmd_b64in },   /* 批次2：文件进出通道 */
     { "res", cmd_res },        /* R 轮资源账诊断（刻意不写进 help，保行为基线逐字一致） */
     { "poweroff", cmd_poweroff }, { "shutdown", cmd_shutdown },
     { "halt", cmd_halt },         { "reboot", cmd_reboot },
@@ -3228,6 +3239,95 @@ static void cmd_head(char *a)
     }
 }
 
+/* ---------------- 批次 2：base64 文件进出通道 ----------------
+   b64out：把文件编成 76 字符折行的纯文本，串口/图形终端复制即可带出系统。
+   b64in ：粘贴同样的文本还原成文件。
+   没有 U 盘驱动（USB 只做 HID）、没有应用层传输协议，这是最通用的通道。
+   BSS 预算：只加 4KB 静态解码缓冲；b64out 走流式分块，不再申请 5.5KB 编码缓冲。 */
+#define B64_LIMIT 4096
+static unsigned char b64_scratch[B64_LIMIT];
+
+static void cmd_b64out(char *a)
+{
+    if (!a || !*a) { uart_puts("用法: b64out <路径>\n"); return; }
+    char rp[128];
+    if (path_resolve(a, rp, sizeof rp) < 0) { uart_puts("路径太长\n"); return; }
+    int ino = fs_lookup(rp);
+    if (ino < 0) { uart_puts("没有这个文件: "); uart_puts(rp); uart_puts("\n"); return; }
+    if (fs_isdir(ino)) { uart_puts(a); uart_puts(" 是目录\n"); return; }
+    /* 流式：每 57 字节(=3*19) 编成 76 字符一行，只有末块带 '=' 填充。
+       输出走 uart_putc 唯一总闸，因此也支持 `b64out x > out.txt`（受 2KB 重定向缓冲限制）。 */
+    u8 raw[57];
+    char enc[80];
+    u32 off = 0, total = 0;
+    for (;;) {
+        if (off >= B64_LIMIT) { uart_puts("(已达 4KB 上限，其余未导出)\n"); break; }
+        u32 want = B64_LIMIT - off;
+        if (want > sizeof raw) want = (u32)sizeof raw;
+        int n = fs_readat(ino, off, raw, want);
+        if (n == FS_DENIED) { uart_puts("权限不够：私密文件，只有属主和 root 能看\n"); return; }
+        if (n < 0)  { uart_puts("读失败\n"); return; }
+        if (n == 0) break;
+        int e = b64_encode(raw, n, enc);
+        for (int i = 0; i < e; i++) uart_putc(enc[i]);
+        uart_puts("\n");
+        off += (u32)n; total += (u32)n;
+    }
+    uart_puts("-- "); uart_putdec(total);
+    uart_puts(" 字节文件的 base64；复制后 b64in 还原 --\n");
+}
+
+static void cmd_b64in(char *a)
+{
+    if (!a || !*a) { uart_puts("用法: b64in <路径>  （随后逐行粘贴 base64，空行或 . 结束）\n"); return; }
+    char rp[128];
+    if (path_resolve(a, rp, sizeof rp) < 0) { uart_puts("路径太长\n"); return; }
+    uart_puts("粘贴 base64（每行字符数为 4 的倍数；单独一行 . 或空行结束）：\n");
+    ring_dropped = 0;                /* 只统计本次粘贴，开机以来的旧溢出不算 */
+    unsigned char *dec = b64_scratch;
+    int got = 0, bad = 0;
+    char ln[160];
+    for (;;) {
+        /* hidden=1：粘贴期间**不回显**。回显要占用串口 TX，而 TX 是轮询等待
+           FR_TXFF 的——一旦 pty 输出缓冲被回显灌满，uart_putc 会自旋等 TX，
+           卡住 blocking_getline 取环，输入环被 ISR 持续灌入而溢出丢字符（表现为
+           长 base64 折行传到一半静默损坏）。不回显后取环极快，正常/快速粘贴都不丢。 */
+        blocking_getline(ln, sizeof ln, 1);
+        if (ln[0] == 0 || (ln[0] == '.' && ln[1] == 0)) break;
+        /* 传输中已有字符被输入环丢弃：宁可放弃也不写半截/坏文件 */
+        if (ring_dropped) {
+            uart_puts("输入在传输中丢失（请放慢 / 逐行粘贴），已放弃\n");
+            bad = 1; break;
+        }
+        /* 逐行解码要求行内有效字符数是 4 的倍数，否则跨行的 bit 会被静默丢掉、
+           还原出的文件是坏的。标准折行（64/76）都满足；不满足就明确拒绝。 */
+        int q = 0;
+        for (char *p = ln; *p; p++)
+            if (*p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') q++;
+        if ((q & 3) != 0) { uart_puts("本行字符数不是 4 的倍数，请按 76 字符折行粘贴\n"); bad = 1; break; }
+        int room = B64_LIMIT - got;
+        if (room <= 0) { uart_puts("超过 4KB 上限\n"); bad = 1; break; }
+        int r = b64_decode(ln, dec + got, room);   /* 带 cap：绝不越界写 */
+        if (r < 0) { uart_puts("含非法 base64 字符或超过 4KB 上限，已放弃\n"); bad = 1; break; }
+        got += r;
+    }
+    if (bad) return;
+    /* ring 溢出说明粘贴太快、丢过字符：宁可明确放弃，也绝不写出半截损坏文件。 */
+    if (ring_dropped) {
+        uart_puts("输入缓冲溢出，有字符丢失，已放弃（请分次少量粘贴）\n");
+        return;
+    }
+    /* 输入全部合法之后才动文件系统，避免粘贴失败留下一个空文件 */
+    int ino = fs_lookup(rp);
+    if (ino < 0) ino = fs_createfile(rp);
+    if (ino == FS_DENIED) { uart_puts("权限不够：父目录不是你的\n"); return; }
+    if (ino < 0) { uart_puts("建不了文件（父目录缺？）\n"); return; }
+    int w = fs_setfile(ino, dec, (u32)got);
+    if (w == FS_DENIED) { uart_puts("权限不够：这个文件不是你的，root 才能改\n"); return; }
+    if (w < 0) { uart_puts("写失败（盘满？）\n"); return; }
+    uart_puts("已写入 "); uart_putdec((u32)got); uart_puts(" 字节 -> "); uart_puts(rp); uart_puts("\n");
+}
+
 static void cmd_help(char *a)
 {
     (void)a;
@@ -3244,6 +3344,8 @@ static void cmd_help(char *a)
         "  touch <路径>         建空文件；已存在则刷新修改时间\n"
         "  mv <源> <目标>       改名 / 移动文件（不支持目录）\n"
         "  stat <路径>          看 inode / 类型 / 大小 / 属主 / 时间\n"
+        "  b64out <路径>        文件编成 base64 文本带出系统（<=4KB，76字符折行）\n"
+        "  b64in  <路径>        粘贴 base64 还原文件（串口终端用，. 或空行结束）\n"
         "  管道: a | b          单级；右段可用 cat / wc / grep <词> / head [n] / write\n"
         "        ls /etc | wc | cat    （左段不能带 > <，右段可再接 > 写文件）\n"
         "  whoami               当前身份\n"

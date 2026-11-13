@@ -23,6 +23,7 @@
 | 桌面手感 P3 | `desktop.c` / `kernel.c` / `gfxterm.c` / `gfx_draw.h` | 去掉主循环 `wfi`（改连续轮询 + 硬件计数器 60fps 帧节流），键鼠输入不再排队等 100ms 拍子；按钮**边沿事件队列**保证极短快速点击 / 短拖拽不丢；**白色闪烁插入光标**（打字后常亮 500ms，之后 500ms 亮/灭） |
 | 鼠标校准 | `kernel.c` / `desktop.c` | VNC 客户端送坐标带固定偏移时，`开始菜单 → 鼠标校准` 点靶心自动补偿；`mousecal` 命令查询/手设/清零，偏移存 `/etc/mousecal`，装盘重启仍生效 |
 | 图形终端 | `gfxterm.c` | 窗口内可跑**全部** shell 命令（含 `install yes`）；`uart_putc` 输出捕获进 12KB 历史缓冲，中英混排、UTF-8 输入、退格、滚轮翻页、白色闪烁光标 |
+| 文件进出通道 | `b64.h` / `kernel.c` / `test_b64_io.py` | `b64out <路径>` 把文件编成 76 字符折行的 base64 纯文本（复制即可带出系统），`b64in <路径>` 逐行粘贴还原成文件；任意字节 / UTF-8 中文均可往返，单文件上限 4KB；解码带 `cap`、输入溢出检测、非法输入拒绝且不写坏文件 |
 | 文件系统 | `fs.c` | 自带 fs，内存盘 / 磁盘持久化 |
 | 用户程序 | `kernel.c` / `user/*.c` | ELF 加载与 `run`；`write` / `open` / `read` / `close` / `lseek` / `exit` 等系统调用（`svc #0`）；`hello` `cat` `args` `bad` `hang` 五个样例 |
 | 存储 | `virtio_blk.c` / `virtio_blk_legacy.c` / `virtio_scsi.c` / `nvme.c` / `pci.c` | virtio-blk modern/legacy 双路径；**原生 NVMe**（Admin/IO SQ-CQ、PRP、CC/CSTS、Identify），`install yes` 装盘后重启文件仍在；virtio-scsi transitional 因 64 位 BAR 风险主动放弃 |
@@ -120,7 +121,7 @@ sh run_full.sh             # 满配：virtio-blk 磁盘 + ramfb 图形 + virtio-
 
 **有帧缓冲时开机默认直接进图形桌面**（UEFI GOP、QEMU ramfb 或真机显卡）：鼠标点击 / 拖标题栏 / 点开始菜单，终端窗口里可以直接敲命令，包括 `install yes` 装系统。**按 `Ctrl+Shift+F1` 返回串口终端**，在终端敲 `desktop` 可再次进入桌面。
 
-串口一旦有输入，桌面会自动让位且**不消费**该字符，原样交给 shell——纯串口启动（`run.sh`，无 GOP）因此优雅降级成命令行，出现 `> ` 提示符。`help` 列出全部内置命令：`ls /`、`cat`、`write`、`touch` / `mv` / `stat`、管道 `|`（可接 `wc` / `grep` / `head`）、重定向 `>` 与 `<`、`su demo` 切换用户（口令见 `docs`）都可以试。中文可以直接从串口输入并写入文件。
+串口一旦有输入，桌面会自动让位且**不消费**该字符，原样交给 shell——纯串口启动（`run.sh`，无 GOP）因此优雅降级成命令行，出现 `> ` 提示符。`help` 列出全部内置命令：`ls /`、`cat`、`write`、`touch` / `mv` / `stat`、管道 `|`（可接 `wc` / `grep` / `head`）、重定向 `>` 与 `<`、`su demo` 切换用户（口令见 `docs`）都可以试。中文可以直接从串口输入并写入文件。文件进出用 `b64out <路径>` 导出成可复制的 base64 文本、`b64in <路径>` 粘贴还原（单文件 ≤4KB，建议在串口终端操作，详见「诚实的边界」）。
 
 满配启动时，空白数据分区会首次自动格式化并挂载（日志里有 `MOUNTED-DISK`），之后写进 `/home` 的文件关机再开仍在；`ping 10.0.2.2 3` 前先敲 `net` 让 DHCP 拿地址。联网常用命令：`net`、`net dhcp`、`ifconfig`、`ping <ip>`、`tcp get <ip> <端口>`，静态兜底 `net static <ip> [mask] [gw]`。
 
@@ -235,6 +236,7 @@ loongos/
 - **桌面与鼠标只在 TCG 下实测**：沙箱无 `/dev/kvm`，`test_desktop_p2.py` 8/8 全在 QEMU TCG 完成；真机是 KVM，装机后建议确认一次「进桌面 → 鼠标拖拽 → Ctrl+Shift+F1 → install/net」。
 - 输入是**事件驱动 + 连续轮询的混合**（R 轮）：xHCI 无 IRQ，键鼠仍靠 `usb_kbd_poll()` 轮询收割，但 R 轮起桌面空闲会 `wfi` 睡眠、由 120~1000Hz 自适应唤醒 IRQ 叫醒（有输入时全速不睡），宿主 CPU 从 50% 降到 0.6%；没有触摸 / 多点触控 / 手势；**最小化已完成**（第三十五轮），窗口缩放、右键菜单仍在后续清单里。xHCI 未接 MSI 中断，高频唤醒是为「纯轮询设备要低延迟」付出的固定小成本；CPU 数字来自 QEMU TCG 沙箱，真机 KVM 下绝对值会不同。
 - **安全性按「教学/实验单机内核」评估，不是可联网日常系统**：`docs/安全审计报告.md` 记录了完整分级发现。第三十六轮已修 H1/H2/H3（文件管理器越界写、ELF `phoff` 回绕、`u_strcpy` 越过用户区上界，见 `path.h` 纯函数层 + `test_path_host.c` 24/24）；**仍存在**：开机即 root 无登录门禁、口令哈希非常量时间比较、网络栈无认证、EL0 用户程序继承 root 文件权限。另有 NAS SSH 明文口令曾进入 public 仓库历史（源码已止血，仍需轮换口令 + 清洗历史）。接公网前应视为裸奔。
+- **文件进出通道有明确上限**：`b64out`/`b64in` 单文件 ≤4KB，需在串口终端逐行粘贴（每行字符数为 4 的倍数，单独一行 `.` 或空行结束）。没有 U 盘驱动（USB 只做键鼠）、没有应用层文件传输协议（TCP 只有协议栈），这是目前唯一的通用进出方式；`b64in` 的交互提示走串口，图形终端里不建议用。一次性粘贴过快导致输入 ring 溢出时内核会**明确放弃写文件**，不会产出半截损坏文件；CSV/图片等大文件仍需分块或等后续更完整的通道。
 - **网页 VNC 的鼠标固定偏移**来自客户端画布留白 / 缩放没扣（VNC 走相对模式时，内核光标从屏幕中心累加位移，与客户端物理光标起点本就不同），内核改不了 VNC：`开始菜单 → 鼠标校准` 点一次靶心即可补偿，`mousecal` 命令可查询 / 手设 / 清零，并打印绝对/相对报告数判断 VNC 走哪种模式。偏移存 `/etc/mousecal`，未装盘（内存盘）时重启会丢。P2.2 已修复「相对位移被吞、鼠标不跟随」的回归。
 - 目标平台是 QEMU `virt` 与标准 UEFI aarch64，未适配具体实体 ARM 板卡的板级驱动。
 - 仓库里的 `BOOTAA64.EFI`、`kernel.elf` 与若干 `.o` 是构建产物，便于直接体验；源码以 `build.sh` 为准，新增编译产物不再纳入版本控制（见 `.gitignore`）。

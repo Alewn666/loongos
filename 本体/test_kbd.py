@@ -102,7 +102,10 @@ def main():
         for line in log.splitlines():
             if "[usb" in line:
                 print("  kernel:", line.strip())
-        if "USB 键盘就绪" not in log:
+        # 内核日志文案早已改成「[usb ] HID 枚举完成：键盘=1 指针设备=2」，
+        # 旧判据 "USB 键盘就绪" 会误报 FAIL（第三十七轮 A/B 用上一版内核复现，
+        # 确认与本轮改动无关）。两种文案都认，语义都是「HID 枚举成功」。
+        if "USB 键盘就绪" not in log and "HID 枚举完成" not in log:
             fails.append("键盘没就绪（见上面 [usb] 日志）")
         else:
             print("✓ 键盘驱动初始化成功")
