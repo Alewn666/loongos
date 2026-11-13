@@ -26,6 +26,7 @@
 #include "gfx_draw.h"
 #include "desktop.h"
 #include "gfxterm.h"
+#include "path.h"      /* 纯函数路径层：修 H1，所有拼接带 cap，见 path.h 注释 */
 
 typedef unsigned long u64;
 typedef unsigned int  u32;
@@ -126,7 +127,7 @@ enum {
     A_CALC, A_MON, A_SET, A_ABOUT, A_FILES, A_EDIT, NAPP
 };
 static const struct gapp *G_apps[NAPP];
-static char G_launch_path[96];   /* open_app 前由调用方填：编辑器/文件管理器打开的目标 */
+static char G_launch_path[PATH_CAP]; /* open_app 前由调用方填；统一 160，杜绝与 full/tmp 错配 */
 
 /* ---- 开始菜单项（动态生成） ---- */
 #define MAX_MENU 24
@@ -619,14 +620,15 @@ static void about_draw(struct gfx_rect cr, int f, int w)
 }
 
 /* —— 文件管理器 —— */
-static char fm_path[96] = "/";
+static char fm_path[PATH_CAP] = "/";
 static int  fm_scroll;
+static int  fm_overlong;   /* 上一次进目录因路径过长被拒 → 绘制时给用户可见提示 */
 static int my_strcmp(const char *a, const char *b){ while(*a&&*a==*b){a++;b++;} return (int)(unsigned char)*a-(int)(unsigned char)*b; }
 static int my_strcmp_eq(const char *a, const char *b){ return my_strcmp(a,b)==0; }
-static void fm_full(char *out, const char *child)
+/* 第三十六轮修 H1：统一走 path.h 的带 cap 拼接，返回 -1 表示会越界（拒绝，不写） */
+static int fm_full(char *out, int cap, const char *child)
 {
-    if (my_strcmp_eq(fm_path, "/")) { out[0]='/'; my_strcpy(out+1, child); }
-    else { my_strcpy(out, fm_path); int n=my_strlen(out); out[n]='/'; my_strcpy(out+n+1, child); }
+    return path_join(out, cap, fm_path, child);
 }
 
 /* 枚举当前目录，对第 idx 项回调；返回找到的项信息 */
@@ -655,8 +657,8 @@ static void fm_draw_cb(const struct dirent *d, int ino, void *arg)
     int isdir = fs_isdir(ino);
     char nm[72]; int n=0; nm[n++]=' ';
     if (isdir) nm[n++]='[';
-    int i=0; while (d->name[i] && n<70) nm[n++]=d->name[i++];
-    if (isdir) nm[n++]=']';
+    int i=0; while (d->name[i] && n<69) nm[n++]=d->name[i++];  /* 留 2 字节给 ']' 和 NUL */
+    if (isdir && n < 71) nm[n++]=']';
     nm[n]=0;
     gfx_text(c->cr.x + 16, yy, nm, isdir ? C_BLUE : C_WIN_TEXT, C_TRANSP);
 }
@@ -664,7 +666,10 @@ static void fm_draw(struct gfx_rect cr, int f, int w)
 {
     (void)f;(void)w;
     gfx_clip_push(cr);
-    gfx_text(cr.x + 10, cr.y + 6, fm_path, C_WIN_TEXT, C_TRANSP);
+    if (fm_overlong)
+        gfx_text(cr.x + 10, cr.y + 6, "路径过长，已拒绝进入（上限 160 字节）", C_RED, C_TRANSP);
+    else
+        gfx_text(cr.x + 10, cr.y + 6, fm_path, C_WIN_TEXT, C_TRANSP);
     gfx_rect_draw((struct gfx_rect){cr.x+8, cr.y+24, cr.w-16, cr.h-32}, GFX_RGB(200,210,224),1);
     int y0 = cr.y + 30, rowh = 20;
     int ino = fs_lookup(fm_path);
@@ -687,13 +692,11 @@ static void fm_press(struct gfx_rect cr, int lx, int ly, int w)
     int ino = fs_lookup(fm_path);
     int has_up = my_strcmp_eq(fm_path, "/") ? 0 : 1;
     if (has_up && row == 0) {                 /* 上级目录 */
-        char tmp[96];
-        /* 计算父路径字符串 */
-        my_strcpy(tmp, fm_path);
-        int len = my_strlen(tmp);
-        while (len > 1 && tmp[len-1] != '/') len--;
-        if (len > 1) tmp[len-1]=0; else { tmp[0]='/'; tmp[1]=0; }
-        my_strcpy(fm_path, tmp); fm_scroll = 0; gfx_damage(full_screen());
+        char tmp[PATH_CAP];
+        if (path_parent(tmp, sizeof tmp, fm_path) > 0) {
+            my_strcpy(fm_path, tmp); fm_scroll = 0; fm_overlong = 0;
+        }
+        gfx_damage(full_screen());
         return;
     }
     int target = has_up ? row - 1 : row;
@@ -701,11 +704,15 @@ static void fm_press(struct gfx_rect cr, int lx, int ly, int w)
     struct fm_find f = {.idx=0, .got=target};
     fs_list(ino, fm_find_cb, &f);
     if (f.ino <= 0) return;
+    char full[PATH_CAP];
+    if (fm_full(full, sizeof full, f.name) < 0) {   /* H1：超长拒绝，绝不越界写 */
+        fm_overlong = 1; gfx_damage(full_screen()); return;
+    }
+    fm_overlong = 0;
     if (f.isdir) {
-        fm_full(fm_path, f.name); fm_scroll = 0;
+        my_strcpy(fm_path, full); fm_scroll = 0;   /* full 与 fm_path 同为 PATH_CAP */
     } else {
-        char full[160]; fm_full(full, f.name);
-        my_strcpy(G_launch_path, full);
+        my_strcpy(G_launch_path, full);            /* 两者同为 PATH_CAP */
         open_app(A_EDIT);
     }
     gfx_damage(full_screen());
@@ -713,7 +720,7 @@ static void fm_press(struct gfx_rect cr, int lx, int ly, int w)
 static void fm_scroll_h(int dy, int w){ (void)w; fm_scroll += (dy>0?-3:3); if(fm_scroll<0) fm_scroll=0; gfx_damage(full_screen()); }
 
 /* —— 文本编辑器 / 查看器 —— */
-static char ed_path[96] = "/未命名.txt";
+static char ed_path[PATH_CAP] = "/未命名.txt";  /* 与 G_launch_path 同为 PATH_CAP，ed_load 拷贝安全 */
 static char ed_buf[1500];
 static int  ed_len;
 static int  ed_cur;

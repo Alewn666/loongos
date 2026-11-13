@@ -403,13 +403,19 @@ static void fwc_dma_write(u16 sel, const u8 *cfg, u32 len)
 
     u64 desc = (u64)(unsigned long)fwc_dma_desc;
     u32 hi = (u32)(desc >> 32), lo = (u32)desc;
-    /* dma region 是 DEVICE_BIG_ENDIAN：写两次 32 位，高半在 +0、低半在 +4（触发传输）。
-       两种字节序都发一遍，兼容不同 QEMU 构建的 endianness，失败的一次只会被 QEMU
-       标记为 DMA error，不会破坏已建立的 surface。 */
+    /* dma region 是 DEVICE_BIG_ENDIAN：写两次 32 位，高半在 +0、低半在 +4（+4 触发传输）。
+       设备按 BE 解释 guest 写入，因此 guest 必须写 bswap32(hi)/bswap32(lo)，
+       设备收到的才是 hi/lo —— 这才是唯一正确的一次触发。
+       第三十六轮修：原实现随后又用 hi/lo 直接写了第二遍，设备会把它解释成
+       bswap32(hi)/bswap32(lo)，即拿 bswap32(真实地址) 当描述符地址再触发一次
+       「垃圾 DMA」。历史上 fwc_dma_desc=0x400b08e0 时该地址 0xe0080b40 落在
+       4GB 之上被 QEMU 判无效，侥幸无害；本轮 .data 平移使地址变为 0x400b1930，
+       垃圾地址变成 0x30190b40，落进 32 位 PCI MMIO 窗口，QEMU 真的执行了这次
+       随机 control/length/address 的 DMA，破坏内核 → 带 ramfb 的启动全部卡死在
+       kernel_main 开头。改为只发正确的一次，不再赌「失败的会被标记 DMA error」。
+       test_framebuffer.py 的真实 screendump 判据守住这条链路。 */
     *(volatile u32 *)(FWC_DMA + 0) = bswap32_(hi);
     *(volatile u32 *)(FWC_DMA + 4) = bswap32_(lo);
-    *(volatile u32 *)(FWC_DMA + 0) = hi;
-    *(volatile u32 *)(FWC_DMA + 4) = lo;
 }
 
 static struct bootinfo ramfb_bi;
@@ -1534,7 +1540,11 @@ static void run_userprog(const char *path, const char *argline)
         eh->magic[2] != 'L' || eh->magic[3] != 'F') {
         uart_puts("不是 ELF 文件\n"); return;
     }
-    if (eh->phoff + (u64)eh->phnum * eh->phentsize > (u64)n) { uart_puts("ELF 程序头越界\n"); return; }
+    /* 第三十六轮修 H2：phoff/phnum/phentsize 全来自用户 ELF，64 位加法会回绕绕过校验。
+       改用「减法 + 除法」分步校验，并强制 phentsize ≥ 一个程序头的大小（防解析错位）。 */
+    if (eh->phentsize < (u16)sizeof(struct elf64_phdr)) { uart_puts("ELF phentsize 异常\n"); return; }
+    if (eh->phoff > (u64)n)                                { uart_puts("ELF 程序头越界\n"); return; }
+    if ((u64)eh->phnum > ((u64)n - eh->phoff) / eh->phentsize) { uart_puts("ELF 程序头越界\n"); return; }
     if (eh->entry < USER_BASE || eh->entry >= USER_END)       { uart_puts("入口不在用户区，拒跑\n"); return; }
 
     /* ⚠️ 先把整个用户区恢复 EL1 可写：上一个程序的代码段是 PROT_USEREX（EL1 只读！），
@@ -1600,17 +1610,23 @@ static void run_userprog(const char *path, const char *argline)
 static struct { int ino; int used; u32 off; u32 len; } g_fd[NFDS];
 static u8 g_fdbuf[NFDS][NFDBUF];
 
-/* 把用户态字符串拷进内核缓冲：先卡指针范围，再找 NUL，最多 max-1 字节 */
+/* 把用户态字符串拷进内核缓冲：先卡指针范围，再找 NUL，最多 max-1 字节。
+   第三十六轮修 H3：原实现只校验 uptr 起点，循环读到 uptr+i 会越过 USER_END
+   读进内核区。这里额外把读取上限钳在「起点到用户区上界」的剩余字节内。 */
 static int u_strcpy(char *dst, u64 uptr, int max)
 {
+    if (max <= 0) return -1;
     if (uptr < USER_BASE || uptr >= USER_END) return -1;
-    for (int i = 0; i < max - 1; i++) {
+    u64 room = USER_END - uptr;              /* 用户区内从起点到上界还剩多少字节 */
+    int lim = max - 1;
+    if ((u64)lim > room) lim = (int)room;
+    for (int i = 0; i < lim; i++) {
         char c = ((const char *)uptr)[i];
         dst[i] = c;
         if (!c) return i;
     }
-    dst[max - 1] = 0;
-    return max - 1;
+    dst[lim] = 0;
+    return lim;
 }
 
 static void svc_dispatch(struct regs *f)
