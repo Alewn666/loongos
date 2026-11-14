@@ -44,6 +44,17 @@ FILES = [
     ('README.md',                 '本体/README.md'),
     ('本体/iso/loongos.iso',      'iso/自研内核ISO/loongos.iso'),
     ('本体/test_minimize.py',     '本体/test_minimize.py'),
+    # 第四十二轮：桌面全面优化（脏矩形感知 + 拖动零整屏 + 裁剪栈对称）
+    ('本体/gfx.c',                '本体/gfx.c'),
+    ('本体/bss_budget.txt',       '本体/bss_budget.txt'),
+    ('本体/test_desktop_p3.py',   '本体/test_desktop_p3.py'),
+    ('本体/diag_gfxstat.py',      '本体/diag_gfxstat.py'),
+    ('本体/test_drag_render.py',  '本体/test_drag_render.py'),
+    ('本体/拖动逐帧诊断.png',      '本体/拖动逐帧诊断.png'),
+    # 第四十/四十一轮遗留未同步：W 键修复与手机触屏走查
+    ('本体/test_kbd_desktop_w.py','本体/test_kbd_desktop_w.py'),
+    ('本体/test_touch.py',        '本体/test_touch.py'),
+    ('本体/触屏走查总览.png',      '本体/触屏走查总览.png'),
 ]
 
 def md5_local(path):
@@ -81,7 +92,8 @@ def mkdir_p(sftp, remote_dir):
                 pass
 
 def main():
-    print(f'[sync] -> {USER}@{HOST}:{PORT}  BASE={BASE}')
+    # 脱敏：不把真实 主机:端口:用户 打进日志/工具快照（S1 教训）
+    print(f'[sync] -> <已配置连接:主机/端口/用户已隐藏>  BASE={BASE}')
     try:
         c = paramiko.SSHClient()
         c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
