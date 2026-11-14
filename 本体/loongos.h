@@ -139,6 +139,36 @@ extern void smp_tick_inc(void);
 extern void smp_secondary_entry(void);
 extern volatile unsigned long smp_online[4];
 extern volatile unsigned long smp_counter[4];
+
+/* 多核工作分派（阶段9 正式版：把真实工作分派到从核，而非空转计数） */
+#define SMP_JOB_CHK  1
+#define SMP_JOB_FILL 2
+struct smp_job {
+    volatile int  active;     /* 主核写 1 表示有活；从核看到才认领 */
+    volatile int  type;       /* SMP_JOB_CHK / SMP_JOB_FILL */
+    volatile const u8 *buf;
+    volatile u64  len;
+    volatile int  ncores;     /* 参与核数（含主核 CPU0） */
+    volatile u32  iters;      /* 单分区叠算遍数（放大计算量） */
+    volatile u32  part[4];    /* 各核部分结果 */
+    volatile u64  cycles[4];  /* 各核耗时（cntpct 周期） */
+    volatile int  done;       /* 完成核计数（原子递增） */
+    volatile u8   done_by[4]; /* 每核完成标志（各自写自己的字节，无跨核 RMW 竞争） */
+    volatile int  fallback;   /* 1 = 有核未唤醒，主核已补算（降级单核） */
+    volatile u64  seq;        /* 任务序号，从核凭它判断是否已经做过本轮 */
+};
+extern struct smp_job G_job;
+extern void smp_do_partition(int cpu);
+extern int  smp_job_run(int type, u32 iters, int ncores_limit);
+extern void smp_job_compute_seq(int type, u32 iters, int ncores_limit);
+extern int  smp_online_count(void);
+extern volatile unsigned long smp_jobs_done[4];
+extern volatile unsigned long smp_work_cycles[4];
+extern volatile unsigned long smp_ipi_hits[4];
+extern volatile int smp_no_conduit;
+extern u32  smp_combine(const u32 *part, int n);
+#define SMP_WORK_SZ  2048       /* 多核工作缓冲大小（与 smp.c 保持一致） */
+
 extern volatile u64 tick;                /* kernel.c 的 10Hz 全局节拍（软件，恒 10Hz） */
 
 /* ===================== 资源调配 / 时钟（R 轮） =====================

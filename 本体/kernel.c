@@ -942,6 +942,14 @@ static void gic_init(void)
         GICD_IPRIORITYR(UART0_IRQ) = 0x80;
         GICD_ISENABLER(UART0_IRQ) = (1u << (UART0_IRQ % 32));
 
+        /* ⚠️ 多核关键：把串口 SPI(33) 的路由固定到 CPU0（Aff0=0, IRM=0）。
+           否则 GICv3 1-of-N 会把串口中断分发给任一在线核；从核没接主核的
+           handle_irq 读取 FIFO 的逻辑，主核 shell 就收不到输入（whoami/ls
+           全哑）。阶段9 多核实测踩过。 */
+        { volatile u64 *irouter =
+              (volatile u64 *)(GICD_BASE + 0x6000UL + 8UL * (u64)UART0_IRQ);
+          *irouter = 0; }
+
         /* CPU 接口走系统寄存器 */
         { u64 sre = 1; __asm__ volatile("msr ICC_SRE_EL1, %0" :: "r"(sre)); }
         __asm__ volatile("isb");
@@ -952,6 +960,13 @@ static void gic_init(void)
         GICD_CTLR = 0;                               /* 先关中断分发 */
         GICD_IPRIORITYR(UART0_IRQ) = 0x80;           /* 串口中断优先级 */
         GICD_ISENABLER(UART0_IRQ) = (1u << (UART0_IRQ % 32));  /* 使能这一路 */
+
+        /* ⚠️ 多核关键：GICv2 用 ITARGETSR 把串口 SPI(33) 钉到 CPU0。
+           字节寄存器，每 INTID 一个字节，值 = 目标 CPU 位图（0x01=CPU0）。 */
+        { volatile u8 *itarget =
+              (volatile u8 *)(GICD_BASE + 0x800UL + (u64)UART0_IRQ);
+          *itarget = 0x01; }
+
         GICD_CTLR = 1;                               /* 开中断分发 */
         GICC_PMR = 0xFF;                             /* 接受所有优先级 */
         GICC_CTLR = 1;                               /* 开 CPU 接口 */
@@ -2435,21 +2450,83 @@ static void cmd_net(char *args)
 
 static void cmd_ifconfig(char *args) { (void)args; net_ifconfig_print(); }
 
-/* cpu —— 看多核状态：在线标记 + 计数增量（增量>0 说明那颗核真的在跑） */
+/* cpu —— 看多核状态：在线标记 + IPI 命中 + 完成任务数 + 上次任务耗时。
+   从核已不开周期定时器（避免空转烧核），故不再看 tick，改看这些真实指标。 */
 static void cmd_cpu(char *args)
 {
     (void)args;
-    extern volatile unsigned long smp_pcpu_tick(int cpu);
     uart_puts("本核 MPIDR.aff0="); uart_putdec((u32)smp_cpu_id());
-    uart_puts("  本核 tick="); uart_putdec((u32)smp_pcpu_tick(0)); uart_puts("\n");
-    unsigned long c0[4];
-    for (int i = 0; i < 4; i++) c0[i] = smp_pcpu_tick(i);
-    for (volatile int k = 0; k < 2000000; k++) { }      /* 粗延时，让从核把计数推上去 */
+    uart_puts("  在线核数="); uart_putdec((u32)smp_online_count());
+    uart_puts("  PSCI="); uart_puts(smp_no_conduit ? "无conduit" : "ok"); uart_puts("\n");
     for (int i = 0; i < 4; i++) {
         uart_puts("  cpu"); uart_putdec((u32)i);
         uart_puts(smp_online[i] ? "  在线  " : "  未启动");
-        uart_puts("  tick "); uart_putdec((u32)smp_pcpu_tick(i));
-        uart_puts("  (+"); uart_putdec((u32)(smp_pcpu_tick(i) - c0[i])); uart_puts(")\n");
+        uart_puts("  IPI="); uart_putdec((u32)smp_ipi_hits[i]);
+        uart_puts("  任务="); uart_putdec((u32)smp_jobs_done[i]);
+        uart_puts("  上次周期="); uart_putdec((u32)smp_work_cycles[i]); uart_puts("\n");
+    }
+}
+
+/* smpwork —— 把真实工作分派到多核，量化收益并自校结果。
+   单核模式（ncores=1）与多核模式（ncores=全部在线）各跑一遍 FNV 校验和，
+   对比耗时；两种模式按固定分区序折叠，结果必须一致（自校）。
+   刻意不写进 help 文本 / 不进行为基线命令集。 */
+static void cmd_smpwork(char *args)
+{
+    (void)args;
+    extern int  smp_job_run(int type, u32 iters, int ncores_limit);
+    extern void smp_job_compute_seq(int type, u32 iters, int ncores_limit);
+    extern u32  smp_combine(const u32 *part, int n);
+    u32 iters = 4000;                      /* 放大计算量，让加速比可测（工作远大于从核唤醒延迟） */
+
+    int online = smp_online_count();
+    uart_puts("[smpw] 在线核数="); uart_putdec((u32)online);
+    uart_puts("  工作缓冲="); uart_putdec((u32)SMP_WORK_SZ); uart_puts("B  iters=");
+    uart_putdec(iters); uart_puts("\n");
+
+    /* 单核等价参考：主核顺序算所有分区（与多核完全相同的 per-partition 算法），
+       折叠后必须与多核一致 —— 这是正确性自校，而非「整段单核全量」另一种算法。 */
+    u64 t0, t1;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t0));
+    smp_job_compute_seq(SMP_JOB_CHK, iters, online);
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t1));
+    u32 single = smp_combine((const u32 *)G_job.part, online);
+    u64 single_cyc = t1 - t0;
+    uart_puts("[smpw] 单核顺序: 结果="); uart_puthex(single);
+    uart_puts("  周期="); uart_putdec((u32)single_cyc); uart_puts("\n");
+
+    /* 多核：ncores=online，分区并行（主核算 partition 0，从核算其余） */
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t0));
+    smp_job_run(SMP_JOB_CHK, iters, online);
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t1));
+    u32 multi = smp_combine((const u32 *)G_job.part, online);
+    u64 multi_cyc = t1 - t0;
+    uart_puts("[smpw] 多核并行: 结果="); uart_puthex(multi);
+    uart_puts("  周期="); uart_putdec((u32)multi_cyc); uart_puts("\n");
+    for (int i = 0; i < online; i++) {
+        uart_puts("        cpu"); uart_putdec((u32)i);
+        uart_puts(" part="); uart_puthex(G_job.part[i]);
+        uart_puts(" 周期="); uart_putdec((u32)G_job.cycles[i]); uart_puts("\n");
+    }
+
+    /* 自校：单核顺序 == 多核折叠？ */
+    if (single == multi) {
+        uart_puts("[smpw] 自校 PASS：多核分区结果与单核顺序一致\n");
+    } else {
+        uart_puts("[smpw] 自校 FAIL：多核="); uart_puthex(multi);
+        uart_puts(" 单核="); uart_puthex(single); uart_puts("\n");
+    }
+
+    if (G_job.fallback)
+        uart_puts("[smpw] 注意：部分从核未响应 SGI，已回退由主核补算（降级为单核）\n");
+
+    if (multi_cyc > 0 && online > 1) {
+        uart_puts("[smpw] 加速比 ≈ ");
+        u32 ratio_x100 = (u32)((single_cyc * 100ull) / multi_cyc);
+        uart_putdec(ratio_x100 / 100); uart_putc('.');
+        uart_putdec(ratio_x100 % 100); uart_puts("x\n");
+    } else {
+        uart_puts("[smpw] 当前仅 1 核在线，无可并行加速（请用 -smp 2/4 启动）\n");
     }
 }
 
@@ -2650,6 +2727,7 @@ static const struct cmdent CMDS[] = {
     { "desktop", cmd_desktop }, { "mousecal", cmd_mousecal },
     { "b64out", cmd_b64out }, { "b64in", cmd_b64in },   /* 批次2：文件进出通道 */
     { "res", cmd_res },        /* R 轮资源账诊断（刻意不写进 help，保行为基线逐字一致） */
+    { "smpwork", cmd_smpwork },/* 阶段9 多核工作分派演示（刻意不写进 help / 行为基线） */
     { "poweroff", cmd_poweroff }, { "shutdown", cmd_shutdown },
     { "halt", cmd_halt },         { "reboot", cmd_reboot },
     { 0, 0 }
@@ -3436,30 +3514,17 @@ void kernel_main(unsigned long bootinfo)
     mmu_init();
     uart_puts("[mmu ] MMU 已开启：内核 text 只读、data 可写、设备 Device 映射\n");
 
-    /* 阶段9：拉起从核（只跑计数循环，不碰 fs/UART，避免竞态） */
+    /* 阶段9：拉起从核（默认启用——用户要求「把核心都用起来」）。
+       从核平时 wfi 真睡（宿主 CPU ≈0%），只在收到 SGI 时被唤醒认领工作；
+       不开周期定时器，避免空转烧核。多核下串口 SPI(33) 已在 gic_init 钉到 CPU0，
+       主核 shell 输入不受影响。 */
     { extern void smp_pcpu_setup(unsigned long); smp_pcpu_setup(0); }
     smp_set_gic_ver((int)gic_ver);
     smp_online[0] = 1;
     {
         unsigned long mask = 0;
-        /* 2026-11-07 实测结论（QEMU 8.2，TCG）：仍默认关闭从核，但原因已查清并部分修复。
-           - PSCI conduit：默认 `-machine virt` 在 EL1 且 EL3/EL2 都不可用时 smc 是
-             UNDEFINED，旧版会刷一屏异常转储；smp.c 现在先探测 ID_AA64PFR0_EL1，
-             无可用 conduit 就优雅返回 0。加 `virtualization=on` 即可拉起 cpu1 并在线。
-           - 从核向量表：原版 16 条 b 挤在前 64 字节，IRQ 槽（应在 0x280）实际落在
-             +0x14；已按 128B 槽距重排（见 smp.c）。
-           - 仍未解决：从核定时期中断进不了处理程序，wfi 计数 2.5 秒内涨 5000 万+
-             （满速空转烧核）。因此默认不启用；要实验加 -DSMP_ENABLE 且 QEMU 加
-             `virtualization=on`，仅供调试，不要当"多核可用"。 */
-#ifdef SMP_ENABLE
         extern volatile int smp_no_conduit;
         int n = smp_start(&mask);
-        if (smp_no_conduit)
-            uart_puts("[smp ] 本机无 PSCI conduit（EL1 且 EL3/EL2 不可用），跳过从核\n");
-#else
-        int n = 0;
-        (void)mask;                  /* 默认关闭，见上 */
-#endif
         uart_puts("[smp ] PSCI 拉起从核 "); uart_putdec((u32)n); uart_puts(" 个");
         if (n > 0) {
             uart_puts("（");
@@ -3472,6 +3537,8 @@ void kernel_main(unsigned long bootinfo)
             int ok = 0;
             for (int i = 1; i < 4; i++) if (mask & (1ul << i)) ok += smp_wait_online((unsigned long)i, 200000);
             uart_puts("，在线 "); uart_putdec((u32)ok); uart_puts(" 个");
+        } else if (smp_no_conduit) {
+            uart_puts("（本机无 PSCI conduit，跳过从核）");
         }
         uart_puts("\n");
     }
