@@ -46,11 +46,17 @@ void kputdec(u32 v) { char b[16]; int n = 0; if (!v) b[n++] = '0'; while (v) { b
 void tcp_rx(const u8 *ip, int iplen) { (void)ip; (void)iplen; }
 void tcp_tick(void) { }
 
-static int vn_stub_present = 1;
-int  vn_init(void) { return 0; }
-int  vn_present(void) { return vn_stub_present; }
-void vn_mac_copy(u8 out[6]) { static const u8 m[6] = { 0x42, 0x4f, 0xa5, 0xf9, 0xa6, 0x62 }; for (int i = 0; i < 6; i++) out[i] = m[i]; }
-int  vn_link(void) { return 1; }
+/* net.c 现在通过 nic_* 抽象层收发（活动网卡）。主机单测不链 nic.c，这里补齐这些符号：
+ *   nic_init_all / nic_select_default → 空桩（测试不真正扫卡）
+ *   nic_active_present → 恒 1（假装已选好活动卡）
+ *   nic_active_send    → 记录发出的帧，并触发「自动扮演服务器」回调（T8 用）
+ *   nic_active_mac     → 喂一个固定 MAC
+ *   nic_active_link / nic_active_model / nic_active_poll → 空桩 */
+int  nic_init_all(void)       { return 1; }
+void nic_select_default(void) { }
+int  nic_active_present(void) { return 1; }
+int  nic_active_link(void)    { return 1; }
+const char *nic_active_model(void) { return "virtio"; }
 
 /* 发出的帧都记下来；可挂一个「自动扮演服务器」的回调（T8 用） */
 static u8  g_tx[8][1600];
@@ -58,14 +64,15 @@ static int g_tx_len[8];
 static int g_tx_n;
 static void (*g_on_send)(const u8 *frame, int len);
 
-int vn_send(const void *frame, int len)
+int nic_active_send(const u8 *frame, int len)
 {
     if (g_tx_n < 8) { memcpy(g_tx[g_tx_n], frame, (size_t)len); g_tx_len[g_tx_n] = len; }
     g_tx_n++;
-    if (g_on_send) g_on_send((const u8 *)frame, len);
+    if (g_on_send) g_on_send(frame, len);
     return 0;
 }
-int vn_poll(int (*on_rx)(const u8 *, int)) { (void)on_rx; return 0; }
+int nic_active_poll(int (*on_rx)(const u8 *, int)) { (void)on_rx; return 0; }
+void nic_active_mac(u8 out[6]) { static const u8 m[6] = { 0x42, 0x4f, 0xa5, 0xf9, 0xa6, 0x62 }; for (int i = 0; i < 6; i++) out[i] = m[i]; }
 
 /* ---------------- 测试工具 ---------------- */
 static int fails, total;
@@ -242,7 +249,7 @@ int main(void)
 
     /* 从这里起需要「已联网」状态 */
     g_up = 1; g_ip = our_ip; g_mask = mask; g_gw = gw_ip;
-    vn_mac_copy(g_mac);
+    nic_active_mac(g_mac);
     g_arp[0].valid = 0; g_arp[1].valid = 0; g_arp[2].valid = 0; g_arp[3].valid = 0;
     g_arp[4].valid = 0; g_arp[5].valid = 0; g_arp[6].valid = 0; g_arp[7].valid = 0;
 

@@ -1,8 +1,8 @@
 # 由 build.sh 自动生成，纳入版本库作为内核空间基线
-margin_bytes=8192
-kernel_upper=0x40216000
-user_base=0x40218000
-bss_bytes=1392640
-data_bytes=31336
+margin_bytes=77824
+kernel_upper=0x4021d000
+user_base=0x40230000
+bss_bytes=1417216
+data_bytes=31544
 nvmedma_bytes=24576
 align_gap_bytes=0

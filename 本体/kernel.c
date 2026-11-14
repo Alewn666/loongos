@@ -1028,8 +1028,11 @@ static void gic_init(void)
    2026-11-11：desktop.c 新增 GUI 应用生态（App 注册表 + 11 个 App + 多窗口状态），
    .bss 又涨约 4KB，把内核上界 __nvmedma_end 顶到 0x40211000、越过旧 USER_BASE，
    构建期 BSS 预算守卫越界 FAIL → USER_BASE 再上移 0x40210000→0x40218000（留 28KB 余量）。
+   2026-11-14：阶段10 多网卡抽象层引入 48KB 共享 DMA 池（nic.c 的 g_nic_pool，仅活动网卡占用，
+   但池本身常驻 .bss），加上 G_nics[] 等状态，把内核上界顶过 0x40218000 →
+   USER_BASE 再上移 0x40218000→0x40230000（留约 40KB 余量；池 + 元数据约 49KB）。
    代码段=EL0 可执行可读（PXN，EL1 不执行用户代码）；data/栈=EL0 可读写（UXN） */
-#define USER_BASE 0x40218000UL       /* 用户区 0x40218000-0x403FFFFF，独立 L3（l3_user）。
+#define USER_BASE 0x40230000UL       /* 用户区 0x40230000-0x403FFFFF，独立 L3（l3_user）。
                                         内核 .bss 可延伸到 0x40200000 起的那几页（PROT_RAM，EL1 专用），
                                         用户区权限只从 USER_BASE 起覆盖，互不干扰。 */
 #define USER_END  0x40400000UL
@@ -2429,13 +2432,39 @@ static char *next_word(char **pp)
 
 /* net                 初始化网卡驱动（不配 IP）
    net dhcp            走 DHCP 拿 IP
-   net static <ip> [掩码] [网关]   手配 */
+   net static <ip> [掩码] [网关]   手配
+   net list            列出全部网卡（型号 / PCI / MAC / 链路 / 活动）
+   net select <序号>   切换到指定网卡为活动卡
+   net auto            重新自动选「链路 up」的卡为活动卡 */
 static void cmd_net(char *args)
 {
     char *a = args;
     char *sub = next_word(&a);
     if (!sub) { net_init_driver(); return; }
-    net_init_driver();
+    if (fs_strcmp(sub, "list") == 0) { nic_list_print(); return; }
+    if (fs_strcmp(sub, "auto") == 0) {
+        nic_select_default();
+        net_rebind_active();
+        return;
+    }
+    if (fs_strcmp(sub, "select") == 0) {
+        char *idxs = next_word(&a);
+        if (!idxs) { uart_puts("用法: net select <序号>（序号见 net list）\n"); return; }
+        int idx = 0, ok = 1;
+        for (char *p = idxs; *p; p++) {
+            if (*p < '0' || *p > '9') { ok = 0; break; }
+            idx = idx * 10 + (*p - '0');
+        }
+        if (!ok) { uart_puts("序号必须是数字（见 net list）\n"); return; }
+        if (nic_select(idx) != 0) { uart_puts("选择失败：序号无效或该卡未初始化\n"); return; }
+        net_rebind_active();
+        return;
+    }
+    /* dhcp/static/未知子命令：仅在「还没有活动网卡」时才做一次驱动初始化。
+       ⚠️ 绝不能无条件调 net_init_driver()：它内部的 nic_select_default() 会把
+       用户刚用 `net select <idx>` 选中的活动卡重置回默认卡，使切卡静默失效
+       （阶段10 验收点 4 曾因此「假通过」：DHCP/ping 其实仍跑在 0 号 virtio 上）。 */
+    if (!nic_active_present()) net_init_driver();
     if (fs_strcmp(sub, "dhcp") == 0) { net_dhcp(); return; }
     if (fs_strcmp(sub, "static") == 0) {
         char *ip  = next_word(&a);
@@ -2445,7 +2474,7 @@ static void cmd_net(char *args)
         net_static_config(ip, mks, gw);
         return;
     }
-    uart_puts("用法: net | net dhcp | net static <ip> [掩码] [网关]\n");
+    uart_puts("用法: net | net dhcp | net static <ip> [掩码] [网关] | net list | net select <序号> | net auto\n");
 }
 
 static void cmd_ifconfig(char *args) { (void)args; net_ifconfig_print(); }
@@ -3439,6 +3468,9 @@ static void cmd_help(char *a)
         "  install yes          把系统装到硬盘（会清空整块盘！需从 ISO 启动）\n"
         "  net | net dhcp       初始化网卡 / 走 DHCP 拿 IP\n"
         "  net static <ip> [掩码] [网关]   手配 IP\n"
+        "  net list             列出全部网卡（多网卡 / 多型号）\n"
+        "  net select <序号>    切换到指定网卡（序号见 net list）\n"
+        "  net auto             自动选链路 up 的卡\n"
         "  ifconfig             看网卡状态 / IP / 统计 / ARP 缓存\n"
         "  ping <ip> [1-10]     ICMP ping（带 RTT）\n"
         "  tcp get <ip> <端口>  建 TCP 连接并读最多 3 秒（80 自动发 GET）\n"
@@ -3667,6 +3699,20 @@ void kernel_main(unsigned long bootinfo)
 #endif
     /* 恢复上次保存的鼠标校准偏移（/etc/mousecal，装盘后重启仍生效） */
     mouse_cal_load();
+
+    /* 阶段10：开机自动联网（多网卡 + 多型号 + 自动选链路 up 的卡走 DHCP）。
+       在进桌面之前跑：桌面起来后 net_poll 已在桌面主循环里持续收包，DHCP 应答/ARP
+       都能被及时处理；这里先把「选卡 + 配 IP」做完，桌面一启动就是已联网状态。
+       只有链路 up 的卡才尝试 DHCP，避免无 DHCP 服务器时白等满超时。 */
+    uart_puts("[net ] 开机自动联网：扫描多网卡…\n");
+    net_init_driver();
+    nic_list_print();
+    if (nic_active_present() && nic_active_link()) {
+        uart_puts("[net ] 链路 up，走 DHCP…\n");
+        net_dhcp();
+    } else if (nic_active_present()) {
+        uart_puts("[net ] 活动网卡链路 down，未走 DHCP（net dhcp 可手动重试）\n");
+    }
 
     /* 桌面 P1/P2：开机默认直接进图形桌面。
        先把当前帧缓冲参数交给绘图层；串口 shell 仍是调试/回归通道 —— 桌面期间

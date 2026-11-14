@@ -1,22 +1,19 @@
-#include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
-/* LoongOS 阶段7 —— virtio-net 网卡驱动（modern virtio-pci，VIRTIO 1.0）
+#include "loongos.h"
+#include "nic.h"
+/* LoongOS 阶段10 —— virtio-net 网卡驱动（modern virtio-pci，VIRTIO 1.0）· 多实例版
  *
- * 与 virtio_blk.c 同一套路：modern MMIO BAR + 能力链 + VERSION_1 特征协商。
- * 差别：
- *   - 设备 ID：transitional 0x1000 / modern-only 0x1041
- *   - **两个队列**：0 = RX（设备写入）、1 = TX（设备读出）
- *   - 每个包前后带 12 字节 virtio_net 头（VERSION_1 固定 12 字节，全 0 = 不做卸载）
- *   - RX 预贴缓冲：上电就把 8 个可写缓冲挂进队列，设备来包就填一个
- *   - 全程轮询 used 环，不用中断（单核 shell 场景够用且稳）
+ * 与旧版区别：旧版是「单实例单设备」，所有静态全局只服务一张卡；
+ * 现在按 slot（= 该卡在 G_nics[] 的下标）存状态，收发环与缓冲在 activate 时
+ * 从**共享 DMA 池**分配（只有活动网卡占用），从而支持多张 virtio-net 并存，
+ * 且不把内核 BSS 顶穿。协议流程（能力链 / VERSION_1 协商 / 双队列 / RX 预贴）不变。
  *
- * ⚠️ MMIO 一律 rd8/rd16/rd32/rd64 + wr8/wr16/wr32/wr64 单次访问（同 virtio_blk.c 的教训，别用普通指针）。
+ * ⚠️ MMIO 一律 rd8/rd16/rd32/rd64 + wr* 单次访问（同 virtio_blk.c 的教训，别用普通指针）。
  */
 
 typedef unsigned long  u64;
 typedef unsigned int   u32;
 typedef unsigned short u16;
 typedef unsigned char  u8;
-
 
 /* ---------------- PCI（与 virtio_blk.c 同参） ---------------- */
 #define PCI_ECAM_BASE   0x4010000000ULL
@@ -69,6 +66,12 @@ typedef unsigned char  u8;
 struct vdesc { u64 addr; u32 len; u16 flags; u16 next; };
 struct vused_elem { u32 id; u32 len; };
 
+struct vq {
+    struct vdesc *desc;
+    struct { u16 flags, idx; u16 ring[VN_QNUM]; u16 used_event; } *avail;
+    struct { u16 flags, idx; struct vused_elem ring[VN_QNUM]; u16 avail_event; } *used;
+};
+
 /* ---------------- MMIO ---------------- */
 static inline u8 rd8(u64 a)   { u8 v;  __asm__ volatile("ldrb %w0, [%1]" : "=r"(v) : "r"(a) : "memory"); return v; }
 static inline u16 rd16(u64 a) { u16 v; __asm__ volatile("ldrh %w0, [%1]" : "=r"(v) : "r"(a) : "memory"); return v; }
@@ -80,30 +83,22 @@ static inline void wr32(u64 a, u32 v) { __asm__ volatile("str %w1, [%0]" :: "r"(
 static inline void wr64(u64 a, u64 v) { __asm__ volatile("str %1, [%0]" :: "r"(a), "r"(v) : "memory"); }
 static inline void bar(void)          { __asm__ volatile("dsb sy" ::: "memory"); }
 
-/* ---------------- 状态 ---------------- */
-static int  vn_ok;
-static u64  vn_common, vn_notify, vn_isr, vn_devcfg;
-static u32  vn_notify_mul;
-static u16  vn_qnum = VN_QNUM;
-static u16  vn_rx_notify_off, vn_tx_notify_off;
-static u8   vn_mac[6];
-static int  vn_link_up;
-static u64  vn_tx_last_used, vn_rx_seen_used;
+/* ---------------- 每实例（slot）状态 ---------------- */
+static int   vn_ok[NIC_MAX];
+static u64   vn_common[NIC_MAX], vn_notify[NIC_MAX], vn_isr[NIC_MAX], vn_devcfg[NIC_MAX];
+static u32   vn_notify_mul[NIC_MAX];
+static u16   vn_qnum[NIC_MAX];
+static u16   vn_rx_notify_off[NIC_MAX], vn_tx_notify_off[NIC_MAX];
+static u8    vn_mac[NIC_MAX][6];
+static int   vn_link_up[NIC_MAX];
+static u64   vn_tx_last_used[NIC_MAX], vn_rx_seen_used[NIC_MAX];
 
-/* 队列 0 = RX，队列 1 = TX，desc/avail/used 三块独立内存 */
-static struct vdesc vn_rx_desc[VN_QNUM] __attribute__((aligned(4096), section(".bss.align4k")));
-static struct { u16 flags, idx; u16 ring[VN_QNUM]; u16 used_event; } vn_rx_avail __attribute__((aligned(4096), section(".bss.align4k")));
-static struct { u16 flags, idx; struct vused_elem ring[VN_QNUM]; u16 avail_event; } vn_rx_used __attribute__((aligned(4096), section(".bss.align4k")));
+/* activate 时从共享池分配出来的环/缓冲（仅活动卡有效；切卡后会被覆盖，但不影响当前卡） */
+static struct vq  vn_rxq[NIC_MAX], vn_txq[NIC_MAX];
+static u8   *vn_rx_buf[NIC_MAX];         /* VN_RXBUF 个缓冲的基址（连续） */
+static u8   *vn_tx_buf[NIC_MAX];
 
-static struct vdesc vn_tx_desc[VN_QNUM] __attribute__((aligned(4096), section(".bss.align4k")));
-static struct { u16 flags, idx; u16 ring[VN_QNUM]; u16 used_event; } vn_tx_avail __attribute__((aligned(4096), section(".bss.align4k")));
-static struct { u16 flags, idx; struct vused_elem ring[VN_QNUM]; u16 avail_event; } vn_tx_used __attribute__((aligned(4096), section(".bss.align4k")));
-
-/* RX 缓冲：每块 = 12 字节头 + 帧区；TX 缓冲同布局 */
-static u8 vn_rx_buf[VN_RXBUF][VN_HDRLEN + VN_PKTMAX] __attribute__((aligned(16)));
-static u8 vn_tx_buf[VN_HDRLEN + VN_PKTMAX] __attribute__((aligned(16)));
-
-/* ---------------- PCI 小工具（同 virtio_blk.c） ---------------- */
+/* ---------------- PCI 小工具 ---------------- */
 static volatile u32 *ecam(int bus, int dev, int fn, int reg)
 {
     return (volatile u32 *)(PCI_ECAM_BASE + ((u64)bus << 20) + ((u64)dev << 15)
@@ -142,221 +137,242 @@ static u64 bar_assign(int b, int d, int f, int idx, u32 want)
     return cfg_rd(b, d, f, reg) & ~0xfu;
 }
 
-/* ---------------- 初始化 ---------------- */
-int vn_init(void)
+/* ---------------- match / attach ---------------- */
+static int vm_match(u16 vendor, u16 device, u8 base_class)
 {
-    vn_ok = 0;
-    int bus = -1, dev = -1, fn = -1;
-    for (int b = 0; b < 8 && bus < 0; b++)
-        for (int d = 0; d < 32 && bus < 0; d++)
-            for (int f = 0; f < 8; f++) {
-                u32 id = cfg_rd(b, d, f, PCI_VENDOR);
-                if ((id & 0xffff) != VIRTIO_VENDOR) continue;
-                u32 did = (id >> 16) & 0xffff;
-                if (did != VIRTIO_NET_TRANS && did != VIRTIO_NET_MODERN) continue;
-                bus = b; dev = d; fn = f;
-                break;
-            }
-    if (bus < 0) return -1;
+    (void)base_class;
+    if (vendor != VIRTIO_VENDOR) return 0;
+    if (device != VIRTIO_NET_TRANS && device != VIRTIO_NET_MODERN) return 0;
+    return 1;
+}
 
-    /* BAR 分地址（MMIO 窗口内与 blk 设备隔开：blk 用 +0x100000，net 用 +0x200000） */
+static int vm_attach(struct nic *n)
+{
+    int slot = n->slot;
+    int b = n->bus, d = n->dev, f = n->fn;
+    vn_ok[slot] = 0;
+
+    /* 分配各 BAR（MMIO 窗口内与 blk 设备隔开） */
     u64 bars[6];
     for (int i = 0; i < 6; i++) {
-        u32 sz = bar_size(bus, dev, fn, i);
+        u32 sz = bar_size(b, d, f, i);
         if (!sz) { bars[i] = 0; continue; }
-        u64 a = bar_assign(bus, dev, fn, i, PCI_MMIO_WINDOW + 0x200000u + (u32)dev * 0x10000u + (u32)i * 0x4000u);
+        u64 a = bar_assign(b, d, f, i, PCI_MMIO_WINDOW + 0x200000u + (u32)d * 0x10000u + (u32)i * 0x4000u);
         bars[i] = a;
-        if (((cfg_rd(bus, dev, fn, PCI_BAR0 + i * 4) & 0x6u) >> 1) == 2) i++;
+        if (((cfg_rd(b, d, f, PCI_BAR0 + i * 4) & 0x6u) >> 1) == 2) i++;
     }
 
-    /* 开内存空间 + 总线主控 */
-    u32 cmd = cfg_rd(bus, dev, fn, PCI_CMD);
-    cfg_wr(bus, dev, fn, PCI_CMD, cmd | PCI_CMD_MSE | PCI_CMD_BME);
+    u32 cmd = cfg_rd(b, d, f, PCI_CMD);
+    cfg_wr(b, d, f, PCI_CMD, cmd | PCI_CMD_MSE | PCI_CMD_BME);
 
     /* 能力链 */
-    u32 st = cfg_rd(bus, dev, fn, 0x04) >> 16;
-    if (!((st >> 4) & 1)) { kputs("[net ] 设备没有能力链（不支持 modern）\n"); return -2; }
-    u32 cap = cfg_rd(bus, dev, fn, PCI_CAP_PTR) & 0xff;
-    vn_common = vn_notify = vn_isr = vn_devcfg = 0;
+    u32 st = cfg_rd(b, d, f, 0x04) >> 16;
+    if (!((st >> 4) & 1)) { kputs("[net ] virtio 设备没有能力链（不支持 modern）\n"); return -2; }
+    u32 cap = cfg_rd(b, d, f, PCI_CAP_PTR) & 0xff;
+    vn_common[slot] = vn_notify[slot] = vn_isr[slot] = vn_devcfg[slot] = 0;
     for (int guard = 0; guard < 48 && cap; guard++) {
-        u32 d0 = cfg_rd(bus, dev, fn, (int)(cap & 0xfc));
+        u32 d0 = cfg_rd(b, d, f, (int)(cap & 0xfc));
         u8  id      = (u8)(d0 & 0xff);
         u32 nxt     = (d0 >> 8) & 0xff;
         u32 cfgtype = (d0 >> 24) & 0xff;
-        u32 d1 = cfg_rd(bus, dev, fn, (int)((cap + 4) & 0xfc));
+        u32 d1 = cfg_rd(b, d, f, (int)((cap + 4) & 0xfc));
         u32 baridx = d1 & 0xff;
-        u32 off = cfg_rd(bus, dev, fn, (int)((cap + 8) & 0xfc));
+        u32 off = cfg_rd(b, d, f, (int)((cap + 8) & 0xfc));
         if (id == 0x09) {
             u64 base = bars[baridx & 7];
             if (base) {
-                if (cfgtype == VIRTIO_PCI_CAP_COMMON_CFG)      vn_common = base + off;
+                if (cfgtype == VIRTIO_PCI_CAP_COMMON_CFG)      vn_common[slot] = base + off;
                 else if (cfgtype == VIRTIO_PCI_CAP_NOTIFY_CFG) {
-                    vn_notify = base + off;
-                    vn_notify_mul = cfg_rd(bus, dev, fn, (int)((cap + 16) & 0xfc));
+                    vn_notify[slot] = base + off;
+                    vn_notify_mul[slot] = cfg_rd(b, d, f, (int)((cap + 16) & 0xfc));
                 }
-                else if (cfgtype == VIRTIO_PCI_CAP_ISR_CFG)    vn_isr = base + off;
-                else if (cfgtype == VIRTIO_PCI_CAP_DEVICE_CFG) vn_devcfg = base + off;
+                else if (cfgtype == VIRTIO_PCI_CAP_ISR_CFG)    vn_isr[slot] = base + off;
+                else if (cfgtype == VIRTIO_PCI_CAP_DEVICE_CFG) vn_devcfg[slot] = base + off;
             }
         }
         cap = nxt;
     }
-    if (!vn_common || !vn_notify || !vn_devcfg) {
-        kputs("[net ] 没找到 virtio 的 common/notify/device 配置\n");
+    if (!vn_common[slot] || !vn_notify[slot] || !vn_devcfg[slot]) {
+        kputs("[net ] virtio 没找到 common/notify/device 配置\n");
         return -3;
     }
 
-    /* 复位 + 特征协商（只开 VERSION_1；不做校验和/GSO 卸载，全软件算，简单稳） */
-    wr8(vn_common + CC_DEV_STATUS, 0);
-    bar();
-    wr8(vn_common + CC_DEV_STATUS, VST_ACK);
-    wr8(vn_common + CC_DEV_STATUS, VST_ACK | VST_DRIVER);
-    wr32(vn_common + CC_DEV_FEAT_SEL, 0);
-    u32 feat_lo = rd32(vn_common + CC_DEV_FEAT);
-    wr32(vn_common + CC_DEV_FEAT_SEL, 1);
-    u32 feat_hi = rd32(vn_common + CC_DEV_FEAT);
+    /* 复位 + 特征协商（只开 VERSION_1） */
+    wr8(vn_common[slot] + CC_DEV_STATUS, 0); bar();
+    wr8(vn_common[slot] + CC_DEV_STATUS, VST_ACK);
+    wr8(vn_common[slot] + CC_DEV_STATUS, VST_ACK | VST_DRIVER);
+    wr32(vn_common[slot] + CC_DEV_FEAT_SEL, 0);
+    u32 feat_lo = rd32(vn_common[slot] + CC_DEV_FEAT);
+    wr32(vn_common[slot] + CC_DEV_FEAT_SEL, 1);
+    u32 feat_hi = rd32(vn_common[slot] + CC_DEV_FEAT);
     u64 devf = ((u64)feat_hi << 32) | feat_lo;
     u64 want = 1ull << VIRTIO_F_VERSION_1;
-    if (!(devf & want)) {
-        kputs("[net ] 设备不支持 VIRTIO 1.0  feat="); kputhex(devf); kputs("\n");
-        return -4;
-    }
-    wr32(vn_common + CC_DRV_FEAT_SEL, 0);
-    wr32(vn_common + CC_DRV_FEAT, (u32)want);
-    wr32(vn_common + CC_DRV_FEAT_SEL, 1);
-    wr32(vn_common + CC_DRV_FEAT, (u32)(want >> 32));
-    wr8(vn_common + CC_DEV_STATUS, VST_ACK | VST_DRIVER | VST_FEATURES_OK);
-    if (!(rd8(vn_common + CC_DEV_STATUS) & VST_FEATURES_OK)) {
-        kputs("[net ] 设备拒绝 FEATURES_OK\n"); return -5;
-    }
+    if (!(devf & want)) { kputs("[net ] virtio 设备不支持 VIRTIO 1.0\n"); return -4; }
+    wr32(vn_common[slot] + CC_DRV_FEAT_SEL, 0);
+    wr32(vn_common[slot] + CC_DRV_FEAT, (u32)want);
+    wr32(vn_common[slot] + CC_DRV_FEAT_SEL, 1);
+    wr32(vn_common[slot] + CC_DRV_FEAT, (u32)(want >> 32));
+    wr8(vn_common[slot] + CC_DEV_STATUS, VST_ACK | VST_DRIVER | VST_FEATURES_OK);
+    if (!(rd8(vn_common[slot] + CC_DEV_STATUS) & VST_FEATURES_OK)) { kputs("[net ] virtio 拒绝 FEATURES_OK\n"); return -5; }
 
-    /* 队列数检查 + 两个队列 */
-    wr16(vn_common + CC_QUEUE_SEL, 0);
-    u16 nq = rd16(vn_common + CC_NUM_QUEUES);
-    if (nq < 2) { kputs("[net ] 队列数不足 2\n"); return -6; }
+    wr16(vn_common[slot] + CC_QUEUE_SEL, 0);
+    u16 nq = rd16(vn_common[slot] + CC_NUM_QUEUES);
+    if (nq < 2) { kputs("[net ] virtio 队列数不足 2\n"); return -6; }
 
     for (int q = 0; q < 2; q++) {
-        wr16(vn_common + CC_QUEUE_SEL, (u16)q);
-        u16 qsz = rd16(vn_common + CC_QUEUE_SIZE);
-        if (!qsz) { kputs("[net ] 队列不可用\n"); return -7; }
+        wr16(vn_common[slot] + CC_QUEUE_SEL, (u16)q);
+        u16 qsz = rd16(vn_common[slot] + CC_QUEUE_SIZE);
+        if (!qsz) { kputs("[net ] virtio 队列不可用\n"); return -7; }
         if (qsz > VN_QNUM) qsz = VN_QNUM;
-        vn_qnum = qsz;
-        wr16(vn_common + CC_QUEUE_SIZE, qsz);
-        struct vdesc *desc = q ? vn_tx_desc : vn_rx_desc;
-        void *av = q ? (void *)&vn_tx_avail : (void *)&vn_rx_avail;
-        void *us = q ? (void *)&vn_tx_used  : (void *)&vn_rx_used;
-        for (u32 i = 0; i < sizeof(vn_rx_desc); i++) ((u8 *)desc)[i] = 0;
-        for (u32 i = 0; i < sizeof(vn_rx_avail); i++) ((u8 *)av)[i] = 0;
-        for (u32 i = 0; i < sizeof(vn_rx_used); i++) ((u8 *)us)[i] = 0;
-        wr64(vn_common + CC_QUEUE_DESC, (u64)desc);
-        wr64(vn_common + CC_QUEUE_DRIVER, (u64)av);
-        wr64(vn_common + CC_QUEUE_DEVICE, (u64)us);
-        wr16(vn_common + CC_QUEUE_ENABLE, 1);
-        u16 noff = rd16(vn_common + CC_QUEUE_NOTIFY_OFF);
-        if (q == 0) vn_rx_notify_off = noff; else vn_tx_notify_off = noff;
+        vn_qnum[slot] = qsz;
+        wr16(vn_common[slot] + CC_QUEUE_SIZE, qsz);
+        u16 noff = rd16(vn_common[slot] + CC_QUEUE_NOTIFY_OFF);
+        if (q == 0) vn_rx_notify_off[slot] = noff; else vn_tx_notify_off[slot] = noff;
+        /* 队列寄存器先清零；activate 时再用池地址填 */
+        wr64(vn_common[slot] + CC_QUEUE_DESC, 0);
+        wr64(vn_common[slot] + CC_QUEUE_DRIVER, 0);
+        wr64(vn_common[slot] + CC_QUEUE_DEVICE, 0);
     }
-
-    wr8(vn_common + CC_DEV_STATUS, VST_ACK | VST_DRIVER | VST_FEATURES_OK | VST_DRIVER_OK);
-    if (rd8(vn_common + CC_DEV_STATUS) & VST_FAILED) { kputs("[net ] 设备报 FAILED\n"); return -8; }
+    wr8(vn_common[slot] + CC_DEV_STATUS, VST_ACK | VST_DRIVER | VST_FEATURES_OK);
 
     /* MAC（device cfg 前 6 字节）+ 链路状态（偏移 6 的 u16，bit0=LINK_UP） */
-    for (int i = 0; i < 6; i++) vn_mac[i] = rd8(vn_devcfg + (u64)i);
-    u16 lstat = rd16(vn_devcfg + 6);
-    vn_link_up = (lstat & 1) ? 1 : 0;
+    for (int i = 0; i < 6; i++) vn_mac[slot][i] = rd8(vn_devcfg[slot] + (u64)i);
+    u16 lstat = rd16(vn_devcfg[slot] + 6);
+    vn_link_up[slot] = (lstat & 1) ? 1 : 0;
 
-    /* RX 预贴 8 个缓冲：desc[i] 单条可写，avail 全挂上 */
-    for (int i = 0; i < VN_RXBUF; i++) {
-        vn_rx_desc[i].addr = (u64)vn_rx_buf[i];
-        vn_rx_desc[i].len  = VN_HDRLEN + VN_PKTMAX;
-        vn_rx_desc[i].flags = VDESC_WRITE;
-        vn_rx_desc[i].next = 0;
-        vn_rx_avail.ring[i] = (u16)i;
-    }
-    vn_rx_avail.idx = VN_RXBUF;
-    bar();
-    { u64 a = vn_notify + (u64)vn_rx_notify_off * (u64)(vn_notify_mul ? vn_notify_mul : 1);
-      wr16(a, 0); bar(); }
-
-    vn_tx_last_used = 0;
-    vn_rx_seen_used = 0;
-    vn_ok = 1;
+    for (int i = 0; i < 6; i++) n->mac[i] = vn_mac[slot][i];
+    n->link = vn_link_up[slot];
+    n->model = "virtio";
+    n->type = NIC_TYPE_VIRTIO;
+    vn_ok[slot] = 1;
     return 0;
 }
 
-int vn_present(void) { return vn_ok; }
-void vn_mac_copy(u8 out[6]) { for (int i = 0; i < 6; i++) out[i] = vn_mac[i]; }
-int  vn_link(void) { return vn_link_up; }
-
-/* ---------------- 收 ---------------- */
-/* notify：按队列 notify_off 计算地址 */
-static void vn_queue_notify(int q)
+/* ---------------- activate：从共享池分配环/缓冲并使能 ---------------- */
+static int vm_activate(struct nic *n)
 {
-    u16 off = q ? vn_tx_notify_off : vn_rx_notify_off;
-    u64 a = vn_notify + (u64)off * (u64)(vn_notify_mul ? vn_notify_mul : 1);
-    wr16(a, (u16)q);
-    bar();
+    int slot = n->slot;
+    if (!vn_ok[slot]) return -1;
+
+    u32 mul = vn_notify_mul[slot] ? vn_notify_mul[slot] : 1;
+
+    /* 各队列三块结构：desc / avail / used（used 需 4KB 对齐，按 4KB 分配最稳） */
+    vn_rxq[slot].desc   = (struct vdesc *)nic_pool_alloc(sizeof(struct vdesc) * VN_QNUM, 16);
+    vn_rxq[slot].avail  = (void *)nic_pool_alloc(4096, 4096);     /* 整页，避免对齐漂移 */
+    vn_rxq[slot].used   = (void *)nic_pool_alloc(4096, 4096);
+    vn_txq[slot].desc   = (struct vdesc *)nic_pool_alloc(sizeof(struct vdesc) * VN_QNUM, 16);
+    vn_txq[slot].avail  = (void *)nic_pool_alloc(4096, 4096);
+    vn_txq[slot].used   = (void *)nic_pool_alloc(4096, 4096);
+    vn_rx_buf[slot]     = (u8 *)nic_pool_alloc((u32)(VN_RXBUF * (VN_HDRLEN + VN_PKTMAX)), 16);
+    vn_tx_buf[slot]     = (u8 *)nic_pool_alloc(VN_HDRLEN + VN_PKTMAX, 16);
+    if (!vn_rxq[slot].desc || !vn_rxq[slot].avail || !vn_rxq[slot].used ||
+        !vn_txq[slot].desc || !vn_txq[slot].avail || !vn_txq[slot].used ||
+        !vn_rx_buf[slot] || !vn_tx_buf[slot]) return -8;
+
+    for (int q = 0; q < 2; q++) {
+        struct vq *vq = q ? &vn_txq[slot] : &vn_rxq[slot];
+        wr16(vn_common[slot] + CC_QUEUE_SEL, (u16)q);
+        wr64(vn_common[slot] + CC_QUEUE_DESC, (u64)vq->desc);
+        wr64(vn_common[slot] + CC_QUEUE_DRIVER, (u64)vq->avail);
+        wr64(vn_common[slot] + CC_QUEUE_DEVICE, (u64)vq->used);
+        wr16(vn_common[slot] + CC_QUEUE_ENABLE, 1);
+    }
+
+    /* RX 预贴 8 个缓冲 */
+    for (int i = 0; i < VN_RXBUF; i++) {
+        vn_rxq[slot].desc[i].addr = (u64)(vn_rx_buf[slot] + i * (VN_HDRLEN + VN_PKTMAX));
+        vn_rxq[slot].desc[i].len  = VN_HDRLEN + VN_PKTMAX;
+        vn_rxq[slot].desc[i].flags = VDESC_WRITE;
+        vn_rxq[slot].desc[i].next = 0;
+        vn_rxq[slot].avail->ring[i] = (u16)i;
+    }
+    vn_rxq[slot].avail->idx = VN_RXBUF; bar();
+    { u64 a = vn_notify[slot] + (u64)vn_rx_notify_off[slot] * (u64)mul; wr16(a, 0); bar(); }
+
+    vn_tx_last_used[slot] = 0;
+    vn_rx_seen_used[slot] = 0;
+    wr8(vn_common[slot] + CC_DEV_STATUS, VST_ACK | VST_DRIVER | VST_FEATURES_OK | VST_DRIVER_OK);
+    if (rd8(vn_common[slot] + CC_DEV_STATUS) & VST_FAILED) { kputs("[net ] virtio 设备报 FAILED\n"); return -9; }
+    return 0;
 }
 
-/* 取出所有已到达的 RX 帧，逐个交给回调；返回处理帧数 */
-int vn_poll(int (*on_rx)(const u8 *frame, int len))
+static int vm_link(struct nic *n)
 {
-    if (!vn_ok) return 0;
-    int n = 0;
-    while (vn_rx_seen_used != vn_rx_used.idx) {
-        struct vused_elem *e = &vn_rx_used.ring[vn_rx_seen_used % vn_qnum];
-        u32 id = e->id;
-        u32 len = e->len;
+    int slot = n->slot;
+    if (!vn_ok[slot]) return 0;
+    u16 lstat = rd16(vn_devcfg[slot] + 6);
+    vn_link_up[slot] = (lstat & 1) ? 1 : 0;
+    n->link = vn_link_up[slot];
+    return vn_link_up[slot];
+}
+
+static void vm_queue_notify(int slot, int q)
+{
+    u16 off = q ? vn_tx_notify_off[slot] : vn_rx_notify_off[slot];
+    u64 a = vn_notify[slot] + (u64)off * (u64)(vn_notify_mul[slot] ? vn_notify_mul[slot] : 1);
+    wr16(a, (u16)q); bar();
+}
+
+/* ---------------- 收 ---------------- */
+static int vm_poll(struct nic *n, int (*on_rx)(const u8 *frame, int len))
+{
+    int slot = n->slot;
+    if (!vn_ok[slot]) return 0;
+    int cnt = 0;
+    while (vn_rx_seen_used[slot] != vn_rxq[slot].used->idx) {
+        struct vused_elem *e = &vn_rxq[slot].used->ring[vn_rx_seen_used[slot] % vn_qnum[slot]];
+        u32 id = e->id, len = e->len;
         if (id < VN_RXBUF && len > VN_HDRLEN) {
             int flen = (int)(len - VN_HDRLEN);
             if (flen > VN_PKTMAX) flen = VN_PKTMAX;
-            if (on_rx) on_rx(vn_rx_buf[id] + VN_HDRLEN, flen);
-            n++;
+            if (on_rx) on_rx(vn_rx_buf[slot] + id * (VN_HDRLEN + VN_PKTMAX) + VN_HDRLEN, flen);
+            cnt++;
         }
-        /* 缓冲挂回去 */
-        vn_rx_avail.ring[vn_rx_avail.idx % vn_qnum] = (u16)id;
-        vn_rx_avail.idx++;
-        vn_rx_seen_used++;
+        vn_rxq[slot].avail->ring[vn_rxq[slot].avail->idx % vn_qnum[slot]] = (u16)id;
+        vn_rxq[slot].avail->idx++;
+        vn_rx_seen_used[slot]++;
         bar();
     }
-    if (n) vn_queue_notify(0);
-    return n;
+    if (cnt) vm_queue_notify(slot, 0);
+    return cnt;
 }
 
 /* ---------------- 发 ---------------- */
-int vn_send(const void *frame, int len)
+static int vm_send(struct nic *n, const u8 *frame, int len)
 {
-    if (!vn_ok) return -1;
+    int slot = n->slot;
+    if (!vn_ok[slot]) return -1;
     if (len <= 0 || len > VN_PKTMAX) return -2;
 
-    /* 等 TX 环空出来（同步发，一次一帧；shell 场景足够） */
     for (u64 spin = 0; spin < 30000000ull; spin++) {
         bar();
-        if (vn_tx_avail.idx - vn_tx_last_used < vn_qnum) break;
+        if (vn_txq[slot].avail->idx - vn_tx_last_used[slot] < vn_qnum[slot]) break;
         if (spin == 29999999ull) return -3;
     }
-
-    for (int i = 0; i < VN_HDRLEN; i++) vn_tx_buf[i] = 0;   /* 头全 0：不做校验和/GSO 卸载 */
+    for (int i = 0; i < VN_HDRLEN; i++) vn_tx_buf[slot][i] = 0;
     const u8 *s = (const u8 *)frame;
-    for (int i = 0; i < len; i++) vn_tx_buf[VN_HDRLEN + i] = s[i];
+    for (int i = 0; i < len; i++) vn_tx_buf[slot][i + VN_HDRLEN] = s[i];
 
-    u16 slot = vn_tx_avail.idx % vn_qnum;
-    vn_tx_desc[0].addr  = (u64)vn_tx_buf;
-    vn_tx_desc[0].len   = (u32)(VN_HDRLEN + len);
-    vn_tx_desc[0].flags = 0;                 /* 设备只读 */
-    vn_tx_desc[0].next  = 0;
-    vn_tx_avail.ring[slot] = 0;
-    bar();
-    vn_tx_avail.idx++;
-    bar();
-    vn_queue_notify(1);
+    u16 slo = (u16)(vn_txq[slot].avail->idx % vn_qnum[slot]);
+    vn_txq[slot].desc[0].addr  = (u64)vn_tx_buf[slot];
+    vn_txq[slot].desc[0].len   = (u32)(VN_HDRLEN + len);
+    vn_txq[slot].desc[0].flags = 0;
+    vn_txq[slot].desc[0].next  = 0;
+    vn_txq[slot].avail->ring[slo] = 0; bar();
+    vn_txq[slot].avail->idx++; bar();
+    vm_queue_notify(slot, 1);
 
-    /* 等设备收走（used 环推进） */
     for (u64 spin = 0; spin < 60000000ull; spin++) {
         bar();
-        if (vn_tx_used.idx != vn_tx_last_used) {
-            vn_tx_last_used = vn_tx_used.idx;
-            (void)rd8(vn_isr);
+        if (vn_txq[slot].used->idx != vn_tx_last_used[slot]) {
+            vn_tx_last_used[slot] = vn_txq[slot].used->idx;
+            (void)rd8(vn_isr[slot]);
             return 0;
         }
     }
     return -4;
 }
+
+struct nic_driver drv_virtio = {
+    "virtio", vm_match, vm_attach, vm_activate, vm_link, vm_send, vm_poll,
+};

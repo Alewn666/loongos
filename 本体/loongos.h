@@ -110,6 +110,7 @@ extern int  net_static_config(const char *ip, const char *mask, const char *gw);
 extern void net_ifconfig_print(void);
 extern int  net_ping(const char *ip, int count);
 extern void net_poll(void);
+extern void net_rebind_active(void);     /* 切卡 / 初始化后刷新活动 MAC 到网络栈 */
 extern int  ip_send_tcp(u32 dst_ip, const u8 *seg, int len);
 
 extern int  tcp_connect(unsigned int ip, unsigned short port, int timeout_ms);
@@ -118,12 +119,20 @@ extern int  tcp_recv(void *buf, int max, int timeout_ms);
 extern void tcp_close(void);
 extern int  tcp_established(void);
 
-extern int  vn_init(void);
-extern int  vn_link(void);
-extern int  vn_present(void);
-extern int  vn_send(const void *frame, int len);
-extern int  vn_poll(int (*on_rx)(const u8 *frame, int len));
-extern void vn_mac_copy(u8 out[6]);
+/* ===================== 多网卡抽象层（nic.c，阶段10） =====================
+ * net.c 不再直接认领具体网卡型号，只通过下面这套「活动网卡」接口收发；
+ * 具体型号（virtio/e1000/e1000e/rtl8139）由 nic.c 的驱动注册表派发。 */
+extern int  nic_init_all(void);            /* 扫描 PCI + attach 全部网卡 */
+extern void nic_scan(void);               /* 仅枚举（由 nic_init_all 调） */
+extern void nic_select_default(void);     /* 选链路 up 的卡（否则 0 号）并 activate */
+extern int  nic_select(int idx);          /* 切到 idx 号卡并 activate */
+extern int  nic_active_present(void);     /* 是否有活动网卡 */
+extern int  nic_active_link(void);        /* 活动网卡链路状态 */
+extern void nic_active_mac(u8 out[6]);    /* 活动网卡 MAC */
+extern const char *nic_active_model(void);/* 活动网卡型号字串（"virtio"/"e1000"…） */
+extern int  nic_active_send(const u8 *frame, int len);
+extern int  nic_active_poll(int (*cb)(const u8 *, int));
+extern void nic_list_print(void);         /* net list 用的全卡清单 */
 
 /* ===================== 熵源（virtio_rng.c） ===================== */
 extern int  rng_init(void);

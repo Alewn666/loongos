@@ -14,15 +14,16 @@ cd "$(dirname "$0")"
 CROSS=aarch64-linux-gnu-
 CFLAGS="-nostdlib -ffreestanding -fno-builtin -fno-stack-protector -fno-strict-aliasing -mcpu=cortex-a57 -O2 -Wall ${EXTRA_CFLAGS:-}"
 # 用户程序：独立 ELF，链在用户区（kernel.c 的 run 校验 vaddr 必须在 [USER_BASE,USER_END)）
-# ⚠️ USER_BASE 现为 0x40218000（2026-11-11 为 desktop.c 的 GUI 应用生态 .bss 增长上移 0x40210000→0x40218000），
-#    用户程序链在 -Ttext=0x40219000（=USER_BASE+64KB）；该值必须落在 [USER_BASE,USER_END) 内，
+# ⚠️ USER_BASE 现为 0x40230000（2026-11-14 阶段10 为 48KB 共享 DMA 池上移 0x40218000→0x40230000），
+#    用户程序链在 -Ttext=0x40240000（=USER_BASE+64KB）；该值必须落在 [USER_BASE,USER_END) 内，
 #    否则 cmd_run 报「入口不在用户区」。改 USER_BASE 时记得同步这里。
-UCFLAGS="-nostdlib -ffreestanding -static -fno-stack-protector -fno-pie -O2 -Wall -Ttext=0x40219000 -Wl,--build-id=none -Wl,-z,max-page-size=0x1000"
+UCFLAGS="-nostdlib -ffreestanding -static -fno-stack-protector -fno-pie -O2 -Wall -Ttext=0x40240000 -Wl,--build-id=none -Wl,-z,max-page-size=0x1000"
 
 # ---- 内核编译单元：唯一事实来源（顺序即链接顺序，勿随意重排）----
 KERN_SRCS="boot.S kernel.c fs.c crypto.c usb_kbd.c \
            blkdev.c virtio_blk.c virtio_blk_legacy.c virtio_scsi.c virtio_net.c \
            net.c tcp.c smp.c nvme.c virtio_rng.c pci.c \
+           nic.c e1000.c rtl8139.c \
            gfx.c gfxterm.c desktop.c"
 # 由源码名派生目标文件名（.S / .c → .o）
 OBJS=""

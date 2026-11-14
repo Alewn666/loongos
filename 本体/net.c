@@ -132,7 +132,7 @@ static int eth_send2(const u8 dst[6], u16 type, const u8 *payload, int plen)
     int total = 14 + plen;
     if (total < 60) { for (int i = total; i < 60; i++) g_txframe[i] = 0; total = 60; }  /* 以太网最小帧填充 */
     st_tx++;
-    return vn_send(g_txframe, total);
+    return nic_active_send(g_txframe, total);
 }
 
 /* 发 ARP 请求：who has <ip> */
@@ -403,8 +403,22 @@ static int on_frame(const u8 *frame, int len)
 /* shell 空闲时调用：能收多少收多少 */
 void net_poll(void)
 {
-    if (vn_present()) vn_poll(on_frame);
+    if (nic_active_present()) nic_active_poll(on_frame);
     { extern void tcp_tick(void); tcp_tick(); }
+}
+
+/* 把活动网卡的 MAC/链路状态刷新到网络栈（切卡 / 初始化后调用） */
+void net_rebind_active(void)
+{
+    if (!nic_active_present()) { kputs("[net ] 没有活动网卡（未初始化或未联网）\n"); return; }
+    nic_active_mac(g_mac);
+    kputs("[net ] MAC ");
+    for (int i = 0; i < 6; i++) {
+        if (i) kputs(":");
+        char hx[3]; hx[0] = "0123456789abcdef"[g_mac[i] >> 4]; hx[1] = "0123456789abcdef"[g_mac[i] & 15]; hx[2] = 0;
+        kputs(hx);
+    }
+    kputs(nic_active_link() ? "  链路 up\n" : "  链路 down\n");
 }
 
 /* ---------------- 对外命令 ---------------- */
@@ -434,26 +448,25 @@ static int poll_until(volatile unsigned *flag, int timeout_ms)
 
 int net_init_driver(void)
 {
-    if (vn_present()) { kputs("[net ] 驱动已初始化\n"); return 0; }
-    int r = vn_init();
-    if (r != 0) {
-        kputs("[net ] virtio-net 初始化失败 r="); kputdec((u32)(-r)); kputs("\n");
-        return r;
+    int n = nic_init_all();          /* 扫描 PCI + attach 全部网卡（幂等） */
+    if (n <= 0) {
+        kputs("[net ] 没有发现任何网卡（检查 QEMU 是否 -device 网卡 / PCI 拓扑）\n");
+        return -1;
     }
-    vn_mac_copy(g_mac);
-    kputs("[net ] MAC ");
-    for (int i = 0; i < 6; i++) {
-        if (i) kputs(":");
-        char hx[3]; hx[0] = "0123456789abcdef"[g_mac[i] >> 4]; hx[1] = "0123456789abcdef"[g_mac[i] & 15]; hx[2] = 0;
-        kputs(hx);
-    }
-    kputs(vn_link() ? "  链路 ✅ up\n" : "  链路 ⚠️ down\n");
+    kputs("[net ] 发现 "); kputdec((u32)n); kputs(" 张网卡，自动选活动卡…\n");
+    nic_select_default();
+    net_rebind_active();
     return 0;
 }
 
 int net_dhcp(void)
 {
-    if (!vn_present()) { kputs("[net ] 驱动不在，先 net\n"); return -1; }
+    if (!nic_active_present()) { kputs("[net ] 没有活动网卡，先 net\n"); return -1; }
+    /* 每次都真实走一遍 DISCOVER/OFFER/REQUEST/ACK。切卡后重 DHCP 时必须先清掉
+       上一次残留的 g_offered/g_up，否则下面两个 for 的循环条件立刻为假，命令
+       会「空转」直接打印联网成功，根本没验证新活动卡的收发路径。 */
+    g_offered = 0;
+    g_up = 0;
     g_dhcp_xid = 0x4c4f0000u | (u32)(tick & 0xffff);
     kputs("[net ] DHCP: 发 DISCOVER …\n");
     for (int try = 0; try < 3 && !g_offered; try++) {
@@ -497,14 +510,14 @@ int net_static_config(const char *ip_s, const char *mask_s, const char *gw_s)
 void net_ifconfig_print(void)
 {
     char b[16];
-    if (!vn_present()) { kputs("网卡: 无（先 net 初始化驱动）\n"); return; }
-    kputs("网卡: virtio-net  MAC ");
+    if (!nic_active_present()) { kputs("网卡: 无活动网卡（先 net 初始化驱动）\n"); return; }
+    kputs("网卡: "); kputs(nic_active_model()); kputs("  MAC ");
     for (int i = 0; i < 6; i++) {
         if (i) kputs(":");
         char hx[3]; hx[0] = "0123456789abcdef"[g_mac[i] >> 4]; hx[1] = "0123456789abcdef"[g_mac[i] & 15]; hx[2] = 0;
         kputs(hx);
     }
-    kputs(vn_link() ? "  link up\n" : "  link down\n");
+    kputs(nic_active_link() ? "  link up\n" : "  link down\n");
     if (!g_up) { kputs("IP: 未配置（net 走 DHCP，或 net static <ip> <掩码> <网关>）\n"); }
     else {
         ip_fmt(g_ip, b); kputs("IP: "); kputs(b);
