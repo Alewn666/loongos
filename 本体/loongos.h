@@ -103,6 +103,19 @@ extern int  fs_mount_disk(u64 part_lba, u32 nblocks);
 extern int  fs_is_disk(void);
 extern u32  fs_blocks(void);
 
+/* ===================== 安装盘 / 多盘选择（kernel.c + blkdev.c） =====================
+ * 第四十五轮：安装盘开始菜单「安装系统」+ 可选目标硬盘。
+ * install_media_present() 依据 bootinfo 里是否有 payload.img（只有 ISO 启动
+ * 时 UEFI stub 才会填 img_size），装好的系统从硬盘启动时为 0 → 桌面不显示
+ * 安装入口、install 命令也会被 no-esp-payload 守卫挡掉。 */
+extern int  install_media_present(void);
+extern int  blk_disk_count(void);
+extern const char *blk_disk_name(int n);
+extern u64  blk_disk_capacity_bytes(int n);
+extern u64  blk_disk_capacity_sectors(int n);
+extern int  blk_select(int n);
+extern int  blk_selected(void);
+
 /* ===================== 网络（net.c / tcp.c / virtio_net.c） ===================== */
 extern int  net_init_driver(void);
 extern int  net_dhcp(void);

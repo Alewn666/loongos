@@ -125,12 +125,19 @@ struct gapp {
     void (*key)(char c, int win);
     void (*scroll)(int dy, int win);
 };
-/* App 编号（同时是 G_apps 下标） */
+/* App 编号（同时是 G_apps 下标）
+ * ⚠️ 第四十五轮 A_INSTALL 追加在末尾：不打乱既有 App 编号，避免窗口状态 /
+ *    行为基线里的窗口 z 序、任务栏顺序跟着变。 */
 enum {
     A_TERM = 0, A_INFO, A_DEMO, A_HELP,
-    A_CALC, A_MON, A_SET, A_ABOUT, A_FILES, A_EDIT, NAPP
+    A_CALC, A_MON, A_SET, A_ABOUT, A_FILES, A_EDIT,
+    A_INSTALL, NAPP
 };
 static const struct gapp *G_apps[NAPP];
+/* 安装系统 App 状态（仅安装盘可见/可用） */
+static int G_inst_disk;                 /* 当前选中的目标盘号 */
+static int G_install_armed;             /* 二次确认：第一次点只武装，第二次才真装 */
+static u64 G_arm_tick;
 static char G_launch_path[PATH_CAP]; /* open_app 前由调用方填；统一 160，杜绝与 full/tmp 错配 */
 
 /* ---- 开始菜单项（动态生成） ---- */
@@ -386,6 +393,110 @@ static int top_win_at(int x, int y)
 static void term_draw(struct gfx_rect cr, int f, int w){ (void)f;(void)w; gfxterm_draw(cr, f); }
 static void term_key(char c, int w){ (void)w; gfxterm_key(c); }
 static void term_scroll(int dy, int w){ (void)w; gfxterm_scroll(dy > 0 ? 2 : -2); }
+
+/* —— 安装系统（第四十五轮：仅安装盘可见，可选目标硬盘） ——
+ * 从 ISO 启动时 UEFI stub 会提供 payload.img（install_media_present()=1），
+ * 桌面才注册这个 App；装好的系统从硬盘启动时没有该镜像，开始菜单里
+ * 根本不出现，install 命令也会被 no-esp-payload 守卫挡掉。
+ * 交互：点磁盘行/「切换磁盘」选目标盘 → 「检查磁盘」→ 二次确认「清空并安装」
+ *       → gfxterm_exec("install <盘号> yes")，输出落在终端窗口。 */
+#define INST_ROW0 40
+#define INST_ROWH 22
+#define INST_MAXROW 4
+
+static void inst_cmd(char *out, int cap)
+{
+    int k = 0;
+    const char *p = "install ";
+    while (*p && k < cap - 1) out[k++] = *p++;
+    if (k < cap - 1) k += my_itoa(out + k, (long)G_inst_disk);
+    p = " yes";
+    while (*p && k < cap - 1) out[k++] = *p++;
+    out[k] = 0;
+}
+
+static void install_draw(struct gfx_rect cr, int f, int w)
+{
+    (void)f;(void)w;
+    gfx_clip_push(cr);
+    gfx_fill((struct gfx_rect){cr.x + 1, cr.y + 1, cr.w - 2, 2}, G_apps[A_INSTALL]->accent);
+    gfx_text(cr.x + 14, cr.y + 8,  "安装系统 · 选择目标硬盘", C_WIN_TEXT, C_TRANSP);
+    gfx_text(cr.x + 14, cr.y + 24, "会清空选中磁盘的全部数据", C_WIN_DIM, C_TRANSP);
+
+    int nd = blk_disk_count();
+    if (nd <= 0) {
+        gfx_text(cr.x + 14, cr.y + INST_ROW0 + 6, "没有可用磁盘", C_RED, C_TRANSP);
+    } else {
+        if (G_inst_disk < 0 || G_inst_disk >= nd) G_inst_disk = 0;
+        for (int i = 0; i < nd && i < INST_MAXROW; i++) {
+            int y = INST_ROW0 + i * INST_ROWH;
+            if (i == G_inst_disk)
+                gfx_fill((struct gfx_rect){cr.x + 8, cr.y + y, cr.w - 24, 20}, C_BTN_HI);
+            char line[64];
+            int m = 0;
+            line[m++] = i == G_inst_disk ? '>' : ' ';
+            line[m++] = '['; m += my_itoa(line + m, (long)i); line[m++] = ']'; line[m++] = ' ';
+            const char *nm = blk_disk_name(i);
+            if (!nm) nm = "?";
+            while (*nm && m < 44) line[m++] = *nm++;
+            line[m++] = ' ';
+            m += my_itoa(line + m, (long)(blk_disk_capacity_bytes(i) / (1024 * 1024)));
+            { const char *u = " MB"; while (*u) line[m++] = *u++; }
+            line[m] = 0;
+            gfx_text(cr.x + 14, cr.y + y + 2, line,
+                     i == G_inst_disk ? C_WHITE : C_WIN_TEXT, C_TRANSP);
+        }
+    }
+    int by = INST_ROW0 + INST_MAXROW * INST_ROWH + 14;
+    app_button(cr, 14,  by,      100, 26, "切换磁盘", C_BTN);
+    app_button(cr, 122, by,      100, 26, "检查磁盘", C_BTN);
+    app_button(cr, 14,  by + 36, 210, 30,
+               G_install_armed ? "再点一次确认清空" : "清空并安装",
+               G_install_armed ? C_RED : C_BTN);
+    gfx_text(cr.x + 14, cr.y + by + 74,
+             G_install_armed ? "10 秒内再点一次才真正安装" : "安装后关机移除光盘即可",
+             G_install_armed ? C_RED : C_WIN_DIM, C_TRANSP);
+    gfx_clip_pop();
+}
+
+static void install_press(struct gfx_rect cr, int lx, int ly, int w)
+{
+    (void)w;
+    int nd = blk_disk_count();
+    /* 1. 点磁盘行直接选中 */
+    for (int i = 0; i < nd && i < INST_MAXROW; i++) {
+        if (app_hit(lx, ly, 8, INST_ROW0 + i * INST_ROWH, cr.w - 24, 20)) {
+            G_inst_disk = i; G_install_armed = 0; gfx_damage(full_screen()); return;
+        }
+    }
+    int by = INST_ROW0 + INST_MAXROW * INST_ROWH + 14;
+    /* 2. 循环切换 */
+    if (app_hit(lx, ly, 14, by, 100, 26)) {
+        if (nd > 0) G_inst_disk = (G_inst_disk + 1) % nd;
+        G_install_armed = 0; gfx_damage(full_screen()); return;
+    }
+    /* 3. 检查磁盘：在终端里跑 disks */
+    if (app_hit(lx, ly, 122, by, 100, 26)) {
+        gfxterm_exec("disks"); focus_win(open_app(A_TERM)); return;
+    }
+    /* 4. 二次确认后真正安装 */
+    if (app_hit(lx, ly, 14, by + 36, 210, 30)) {
+        if (!G_install_armed) {
+            G_install_armed = 1; G_arm_tick = tick; gfx_damage(full_screen()); return;
+        }
+        G_install_armed = 0;
+        if (nd <= 0) {                       /* 无盘：不执行安装，给明确提示 */
+            gfxterm_exec("disks");
+            focus_win(open_app(A_TERM));
+            gfx_damage(full_screen());
+            return;
+        }
+        char cmd[40];
+        inst_cmd(cmd, sizeof cmd);
+        gfxterm_exec(cmd);
+        focus_win(open_app(A_TERM));
+    }
+}
 
 /* —— 系统信息 / 图形演示 / 操作说明（静态文本） —— */
 static void info_draw(struct gfx_rect cr, int f, int w)
@@ -804,10 +915,15 @@ static const struct gapp G_app_defs[NAPP] = {
     [A_ABOUT]   = {"关于",       C_BLUE,   1, 0, about_draw,  0, 0, 0},
     [A_FILES]   = {"文件管理器", C_ORANGE, 1, 0, fm_draw,     fm_press, 0, fm_scroll_h},
     [A_EDIT]    = {"文本编辑器", C_BLUE,   1, ed_init, ed_draw, ed_press, ed_key, ed_scroll_h},
+    [A_INSTALL] = {"安装系统",   C_ORANGE, 1, 0, install_draw, install_press, 0, 0},
 };
 static void apps_register(void)
 {
     for (int i = 0; i < NAPP; i++) G_apps[i] = &G_app_defs[i];
+    /* 第四十五轮：装好的系统（从硬盘启动、无 payload.img）不带安装程序。
+       置 NULL 后 menu_build() 会跳过它，open_app(A_INSTALL) 也会被拒绝，
+       比只隐藏菜单项更彻底。安装盘上则正常出现在「开始」菜单里。 */
+    if (!install_media_present()) G_apps[A_INSTALL] = 0;
 }
 
 /* ---- 各层绘制 ---- */
@@ -1179,6 +1295,12 @@ void desktop_run(void)
     gfx_take_screen();
     gfx_set_redraw(redraw);
     G_cal_on = 0; G_cal_done = 0;
+    /* 每次进桌面都报告一次（G_inited 可能已为 1，不能只放 apps_register）。
+       装好的系统无 payload.img → 不显示安装程序；安装盘则启用。 */
+    if (install_media_present())
+        kputs("[desktop] 安装盘：开始菜单已启用「安装系统」\n");
+    else
+        kputs("[desktop] 已装系统：开始菜单不显示安装程序\n");
 
     if (!G_inited) {
         apps_register();
@@ -1235,6 +1357,10 @@ void desktop_run(void)
             u64 sec = tick / 10;
             if (sec != G_last_sec) { G_last_sec = sec; gfx_damage(clock_rect()); input = 1; }
             if (ed_msg_t) { ed_msg_t = 0; gfx_damage(full_screen()); }
+            /* 安装二次确认 10 秒（100 tick）后自动解除，避免误装 */
+            if (G_install_armed && tick - G_arm_tick > 100) {
+                G_install_armed = 0; gfx_damage(full_screen()); input = 1;
+            }
         }
 
         u64 now = dsk_cntpct();

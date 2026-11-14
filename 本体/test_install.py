@@ -36,8 +36,12 @@ class VM:
         if not os.path.exists(VARS):
             import shutil
             shutil.copy("/usr/share/AAVMF/AAVMF_VARS.fd", VARS)
+        # 有 /dev/kvm 走真 KVM（复现飞牛虚拟机）；无 KVM 的环境（如 CI/沙箱）
+        # 自动退到 TCG + cortex-a57，否则 "-accel kvm" 会直接起不来。
+        use_kvm = KVM and os.path.exists("/dev/kvm")
         cmd = ["qemu-system-aarch64", "-machine", "virt-7.2,gic-version=3",
-               "-accel", "kvm", "-cpu", "host", "-m", "128", "-smp", "1",
+               "-accel", "kvm" if use_kvm else "tcg",
+               "-cpu", "host" if use_kvm else "cortex-a57", "-m", "128", "-smp", "1",
                "-drive", "if=pflash,format=raw,readonly=on,file=" + CODE,
                "-drive", "if=pflash,format=raw,file=" + VARS,
                "-serial", "unix:%s,server,nowait" % SER,

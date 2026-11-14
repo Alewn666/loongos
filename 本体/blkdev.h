@@ -64,6 +64,21 @@ int         blk_write(u64 lba, const void *buf, u32 nsec);
 int         blk_read_block(u64 blk_no, u64 part_lba, void *buf);
 int         blk_write_block(u64 blk_no, u64 part_lba, const void *buf);
 
+/* ---- 多盘登记 + 安装目标盘选择（第四十五轮：安装盘可选硬盘）----
+ * 背景：安装盘要能「装到指定硬盘」。既有 blk_* 门面固定转发到 blk_find()
+ *       （第一个 present 的驱动），无法选盘。这里新增：
+ *   - blk_probe_all() 探测时把「所有」init 成功的驱动登记成盘列表；
+ *   - blk_select(n) 让 blk_find() 改指向第 n 张盘，于是 vb_* 门面、
+ *     fs_format_disk()、cmd_install() 的所有读写整体落到选中盘，fs.c 零改动。
+ * 兼容性：不调用 blk_select() 时（默认 n=-1）blk_find() 行为逐字不变；
+ *         无盘时启动日志、disks 输出、行为基线均不受影响。 */
+int         blk_disk_count(void);                 /* 已登记盘数 */
+const char *blk_disk_name(int n);                /* 第 n 张盘的驱动名，越界返回 0 */
+u64         blk_disk_capacity_bytes(int n);      /* 第 n 张盘容量（字节） */
+u64         blk_disk_capacity_sectors(int n);    /* 第 n 张盘容量（扇区） */
+int         blk_select(int n);                   /* 选第 n 张盘；-1 = 恢复默认 */
+int         blk_selected(void);                  /* 当前选中盘号，-1 = 默认 */
+
 /* ---- 各驱动导出的 ops（新增驱动在这里加一行 extern + 在 blkdev.c 表加一项）---- */
 extern const struct blkdev_ops vb_ops;   /* virtio-blk（含 modern→legacy 回退） */
 extern const struct blkdev_ops vs_ops;   /* virtio-scsi */

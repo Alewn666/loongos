@@ -2260,16 +2260,36 @@ static void cmd_bench(char *args)
     uart_puts("提示: us 越小越好, MB/s 越大越好\n");
 }
 
+/* 第四十五轮：安装盘判定。只有从 ISO 启动时 UEFI stub 才会把 payload.img
+ * 读进内存并填 img_addr/img_size；从装好的硬盘启动时这两项为 0。
+ * 桌面「安装系统」入口据此只在安装盘出现，装好的系统保持不带安装程序。 */
+int install_media_present(void)
+{
+    return (g_bi && g_bi->magic == BOOTINFO_MAGIC &&
+            g_bi->img_addr && g_bi->img_size) ? 1 : 0;
+}
+
 static void cmd_disks(char *a)
 {
     (void)a;
+    /* ⚠️ 无盘这句必须逐字保持：golden_behavior.txt 行为基线按字比对。 */
     if (!vb_present()) { uart_puts("没有可用磁盘（virtio-blk / virtio-scsi / nvme 都未识别）\n"); return; }
-    const char *bk = "virtio-blk";
-    if (vs_present()) bk = "virtio-scsi";
-    if (nv_present()) bk = "nvme";
-    u64 mb = vb_capacity_bytes() / (1024 * 1024);
-    uart_puts("磁盘 0 ("); uart_puts(bk); uart_puts("): "); uart_putdec((u32)mb); uart_puts(" MB, ");
-    uart_putdec((u32)vb_capacity_bytes()); uart_puts(" 字节\n");
+
+    /* 有盘时列出全部可用盘（安装盘可据此选目标硬盘）。blk_disk_count()
+       内部会触发 blk_scan_all()，把 virtio-blk / virtio-scsi / nvme 都探一遍。 */
+    int nd = blk_disk_count();
+    for (int i = 0; i < nd; i++) {
+        const char *nm = blk_disk_name(i);
+        u64 by = blk_disk_capacity_bytes(i);
+        uart_puts("磁盘 "); uart_putdec((u32)i);
+        uart_puts(" ("); uart_puts(nm ? nm : "?"); uart_puts("): ");
+        uart_putdec((u32)(by / (1024 * 1024))); uart_puts(" MB, ");
+        uart_putdec((u32)by); uart_puts(" 字节");
+        if (i == 0) uart_puts("  [默认]");
+        uart_puts("\n");
+    }
+
+    /* 扇区0 诊断仍针对默认盘，输出格式与历史一致（行为基线友好）。 */
     u8 sec[512];
     if (vb_read(0, sec, 1) == 0) {
         uart_puts("  扇区0 前 16 字节: ");
@@ -2308,6 +2328,17 @@ static void cmd_disktest(char *a)
 /* ---- 阶段6③：把系统装到硬盘 ----
    做法：写 MBR（p1=ESP FAT / p2=LoongOS 数据区）→ 把 stub 读进内存的 esp.img 原样写进 p1
         → 在我们的分区上用本内核自己的文件系统格式化（不需要 Linux、不需要 FAT 写入代码）。 */
+/* 拆出 args 的第一个词；返回指向第二个词的指针（没有则指向空串）。 */
+static void inst_split(const char *args, char *w1, int c1, const char **rest)
+{
+    int i = 0;
+    while (*args == ' ') args++;
+    while (*args && *args != ' ' && i < c1 - 1) w1[i++] = *args++;
+    w1[i] = 0;
+    while (*args == ' ') args++;
+    *rest = args;
+}
+
 static void cmd_install(char *args)
 {
     if (!vb_present()) {
@@ -2315,15 +2346,48 @@ static void cmd_install(char *args)
         uart_puts("[install] 敲 scsi 看 PCI 设备清单；若显示旧版「扫描总线数=2」，说明在跑旧 ISO，请换最新 loongos.iso\n");
         return;
     }
-    if (!g_bi || g_bi->magic != BOOTINFO_MAGIC || !g_bi->img_addr || !g_bi->img_size) {
+    if (!install_media_present()) {
         uart_puts("[install] FAIL no-esp-payload\n");
         return;
     }
-    uart_puts("[install] START\n");
-    if (!args || fs_strcmp(args, "yes") != 0) {
-        uart_puts("⚠️ 安装会清空整块磁盘！确认请敲: install yes\n");
+
+    /* 参数：install | install yes | install <n> | install <n> yes
+       yes = 确认清空；<n> = 目标盘号（省略=0，兼容旧脚本 install yes）。 */
+    char w1[16]; const char *rest;
+    inst_split(args ? args : "", w1, sizeof w1, &rest);
+    int disk = 0, confirm = 0;
+    if (w1[0] >= '0' && w1[0] <= '9' && w1[1] == 0) {
+        disk = w1[0] - '0';
+        if (fs_strcmp(rest, "yes") == 0) confirm = 1;
+    } else if (fs_strcmp(w1, "yes") == 0) {
+        disk = 0; confirm = 1;
+    }
+
+    int nd = blk_disk_count();
+    uart_puts("[install] 可用磁盘 "); uart_putdec((u32)nd); uart_puts(" 块：\n");
+    for (int i = 0; i < nd; i++) {
+        const char *nm = blk_disk_name(i);
+        uart_puts("  ["); uart_putdec((u32)i); uart_puts("] ");
+        uart_puts(nm ? nm : "?");
+        uart_puts("  "); uart_putdec((u32)(blk_disk_capacity_bytes(i) / (1024 * 1024)));
+        uart_puts(" MB\n");
+    }
+    if (nd == 0) { uart_puts("[install] FAIL no-disk\n"); return; }
+    if (disk < 0 || disk >= nd) {
+        uart_puts("[install] FAIL bad-disk：盘号超出范围，敲 disks 看清单\n");
         return;
     }
+    if (!confirm) {
+        uart_puts("⚠️ 安装会清空目标磁盘！确认请敲: install ");
+        uart_putdec((u32)disk); uart_puts(" yes\n");
+        return;
+    }
+    if (blk_select(disk) != 0) { uart_puts("[install] FAIL select-disk\n"); return; }
+    uart_puts("[install] START 目标磁盘 "); uart_putdec((u32)disk);
+    uart_puts(" ("); uart_puts(blk_disk_name(disk)); uart_puts(")\n");
+
+    /* ⚠️ 选盘后 vb_* 门面与 fs_format_disk() 已整体指向目标盘，
+       下面所有读写（MBR/ESP/数据分区格式化）都落在选中盘，无需改 fs.c。 */
     u64 total = vb_capacity_sectors();
     u64 img_sec = (g_bi->img_size + 511) / 512;
     u64 esp_lba = 2048;

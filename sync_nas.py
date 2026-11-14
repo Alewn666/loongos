@@ -65,6 +65,13 @@ FILES = [
     ('本体/virtio_net.c',         '本体/virtio_net.c'),
     ('本体/test_net_host.c',      '本体/test_net_host.c'),
     ('本体/test_nic.py',          '本体/test_nic.py'),
+    # 第四十五轮：安装盘「安装系统」+ 可选目标硬盘
+    ('本体/blkdev.c',             '本体/blkdev.c'),
+    ('本体/blkdev.h',             '本体/blkdev.h'),
+    ('本体/loongos.h',            '本体/loongos.h'),
+    ('本体/golden_behavior.txt',  '本体/golden_behavior.txt'),
+    ('本体/test_install_disk.py', '本体/test_install_disk.py'),
+    ('本体/test_install.py',      '本体/test_install.py'),
 ]
 
 def md5_local(path):

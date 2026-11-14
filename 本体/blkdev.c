@@ -32,9 +32,22 @@ const struct blkdev_ops *const blk_drivers[] = {
 int blk_active = -1;                                  /* -1 = 无盘 */
 int blk_init_rc[BLK_MAX_DRIVERS] = { -1, -1, -1, -1, -1, -1, -1, -1 };
 
-/* 选中「第一个 present 的驱动」——严格复现历史 vb_* 的运行时优先级 */
+/* ---- 第四十五轮：安装盘「可选目标硬盘」-------------------------------
+ * ⚠️ 与 blk_active 同样的理由，这两个必须显式非零初值放 .data，不能落 .bss：
+ *    见上方注释（.bss 里 4KB 对齐队列会挤占布局，推高 .nvmedma / 压缩
+ *    USER_BASE 余量）。初值 -1 = 尚未扫描 / 未显式选盘。 */
+int blk_scan_count = -1;                              /* blk_scan_all() 结果 */
+int blk_sel_idx    = -1;                              /* 选中的驱动下标，-1=默认 */
+/* 紧凑盘号 -> blk_drivers[] 下标；用非零哨兵初始化以留在 .data */
+static int blk_map[BLK_MAX_DRIVERS] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+
+/* 选中驱动：若安装时显式选了盘，优先它；否则严格复现历史「第一个 present」。
+ * 不调用 blk_select() 时行为与改动前逐字一致，启动日志/行为基线不受影响。 */
 static const struct blkdev_ops *blk_find(void)
 {
+    if (blk_sel_idx >= 0 && blk_sel_idx < BLK_MAX_DRIVERS &&
+        blk_drivers[blk_sel_idx] && blk_drivers[blk_sel_idx]->present())
+        return blk_drivers[blk_sel_idx];
     for (int i = 0; blk_drivers[i]; i++)
         if (blk_drivers[i]->present())
             return blk_drivers[i];
@@ -53,6 +66,47 @@ int blk_probe_all(void)
         }
     }
     return -1;
+}
+
+/* 安装场景专用：把「所有」驱动都尝试 init 一遍并登记成盘列表。
+ * 与 blk_probe_all() 分开，是为了让正常启动路径一个字节都不变。
+ * 已 present 的驱动不重复 init（init 非幂等，会重置队列/重新协商）。 */
+static void blk_scan_all(void)
+{
+    blk_scan_count = 0;
+    for (int i = 0; i < BLK_MAX_DRIVERS && blk_drivers[i]; i++) {
+        if (!blk_drivers[i]->present())
+            blk_drivers[i]->init();
+        if (blk_drivers[i]->present())
+            blk_map[blk_scan_count++] = i;
+    }
+}
+static const struct blkdev_ops *blk_by_disk(int n)
+{
+    if (blk_scan_count < 0) blk_scan_all();
+    if (n < 0 || n >= blk_scan_count) return 0;
+    return blk_drivers[blk_map[n]];
+}
+
+int         blk_disk_count(void)           { if (blk_scan_count < 0) blk_scan_all(); return blk_scan_count; }
+const char *blk_disk_name(int n)           { const struct blkdev_ops *d = blk_by_disk(n); return d ? d->name : 0; }
+u64         blk_disk_capacity_bytes(int n) { const struct blkdev_ops *d = blk_by_disk(n); return d ? d->capacity_bytes()   : 0; }
+u64         blk_disk_capacity_sectors(int n){ const struct blkdev_ops *d = blk_by_disk(n); return d ? d->capacity_sectors() : 0; }
+int         blk_selected(void)
+{
+    if (blk_sel_idx < 0) return -1;
+    if (blk_scan_count < 0) blk_scan_all();
+    for (int i = 0; i < blk_scan_count; i++)
+        if (blk_map[i] == blk_sel_idx) return i;      /* 返回紧凑盘号 */
+    return -1;
+}
+int         blk_select(int n)
+{
+    if (n < 0) { blk_sel_idx = -1; return 0; }        /* 恢复默认 */
+    if (blk_scan_count < 0) blk_scan_all();
+    if (n >= blk_scan_count) return -1;
+    blk_sel_idx = blk_map[n];
+    return 0;
 }
 
 int blk_present(void)         { return blk_find() != 0; }
