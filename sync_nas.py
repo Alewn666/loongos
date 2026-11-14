@@ -55,6 +55,16 @@ FILES = [
     ('本体/test_kbd_desktop_w.py','本体/test_kbd_desktop_w.py'),
     ('本体/test_touch.py',        '本体/test_touch.py'),
     ('本体/触屏走查总览.png',      '本体/触屏走查总览.png'),
+    # 第四十四轮：多网卡 + 多型号 + 开机自动联网（8 张混杂网卡 / 4 型号）
+    ('本体/nic.c',                '本体/nic.c'),
+    ('本体/nic.h',                '本体/nic.h'),
+    ('本体/e1000.c',              '本体/e1000.c'),
+    ('本体/rtl8139.c',            '本体/rtl8139.c'),
+    ('本体/net.c',                '本体/net.c'),
+    ('本体/loongos.h',            '本体/loongos.h'),
+    ('本体/virtio_net.c',         '本体/virtio_net.c'),
+    ('本体/test_net_host.c',      '本体/test_net_host.c'),
+    ('本体/test_nic.py',          '本体/test_nic.py'),
 ]
 
 def md5_local(path):
