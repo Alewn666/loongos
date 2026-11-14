@@ -79,6 +79,17 @@ FILES = [
     ('本体/run_regression_r.sh',  '本体/run_regression_r.sh'),
     ('本体/test_mousecal.py',     '本体/test_mousecal.py'),
     ('本体/iso/loongos.iso.md5',  'iso/自研内核ISO/loongos.iso.md5'),
+    # 第四十七轮：渲染 / 内存 / 文件系统 / ARM SHA-256 提速
+    # 注：kernel.c / kernel.elf / gfx.c / build.sh / boot.S / bss_budget.txt /
+    #     golden_behavior.txt / docs 已在上面登记，此处只补历史漏登的编译单元。
+    ('本体/crypto.c',             '本体/crypto.c'),
+    ('本体/crypto.h',             '本体/crypto.h'),
+    ('本体/fs.c',                 '本体/fs.c'),
+    ('本体/fs.h',                 '本体/fs.h'),
+    ('本体/gfx.h',                '本体/gfx.h'),
+    # 第四十七轮收尾：ESP 写抖动的「同请求重踢 + 三次重试」修复
+    # （.o 为构建中间产物，沿用清单惯例不登记，只同步源码与 kernel.elf / ISO / md5）
+    ('本体/virtio_blk.c',         '本体/virtio_blk.c'),
 ]
 
 def md5_local(path):

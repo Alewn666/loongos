@@ -73,7 +73,13 @@ ${CROSS}objdump -h build/hello.elf | head -8
 rm -f $OBJS kernel.elf
 for s in $KERN_SRCS; do
     echo "   cc $s"
-    ${CROSS}gcc $CFLAGS -c "$s" -o "${s%.*}.o"
+    # 第四十七轮：crypto.c 单独开 ARMv8 Crypto Extensions（SHA256H/SHA256H2）。
+    # 只影响这一个编译单元；是否真的执行密码指令由 ID_AA64ISAR0_EL1.SHA2
+    # 运行时判定 + 自检把关，不支持的老核仍走纯 C。
+    case "$s" in
+        crypto.c) ${CROSS}gcc $CFLAGS -mcpu=cortex-a57+crypto -c "$s" -o "${s%.*}.o" ;;
+        *)        ${CROSS}gcc $CFLAGS -c "$s" -o "${s%.*}.o" ;;
+    esac
 done
 ${CROSS}ld -T linker.ld -o kernel.elf $OBJS \
     build/hello_blob.o build/bad_blob.o build/hang_blob.o build/cat_blob.o build/args_blob.o

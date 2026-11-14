@@ -96,15 +96,33 @@ static inline void px(int x, int y, u32 c)
     G_fb[(uint32_t)y * (uint32_t)G_stride + (uint32_t)x] = c;
 }
 
-/* ---- 图元 ---- */
+/* 第四十七轮：批量填充走非 volatile 视图 + 64 位成对写。
+ * 原实现逐像素写 volatile u32，每次都是一条独立 store，且编译器不能合并；
+ * 800x600 全屏要 48 万次 4 字节写（实测 1072us/屏，比 fb_clear_all 慢 4.8 倍）。
+ * 帧缓冲在 MMU 里是 Normal-WB（见 kernel.c PROT_FB_BLK），CPU 视角就是普通内存，
+ * 用 u64 写不会丢像素；桌面 present 由 gfx_present 统一提交，这里只需编译器屏障
+ * 防止把填充挪到后面的绘制之后（单核顺序足够，无 DMA 读帧缓冲）。 */
 void gfx_fill(struct gfx_rect r, u32 rgb)
 {
     if (!G_fb) return;
     r = drawable(r);
     if (!gfx_rect_valid(r)) return;
-    for (int y = r.y; y < r.y + r.h; y++)
-        for (int x = r.x; x < r.x + r.w; x++)
-            px(x, y, rgb);
+    uint32_t *base = (uint32_t *)(uintptr_t)G_fb;
+    u64 pat = ((u64)rgb << 32) | (u64)rgb;
+    for (int y = r.y; y < r.y + r.h; y++) {
+        uint32_t *p = base + (u64)(u32)y * (u32)G_stride + (u32)r.x;
+        int n = r.w;
+        if ((uintptr_t)p & 4) { *p++ = rgb; n--; }      /* 头部 4B 对齐 */
+        u64 *q = (u64 *)p;
+        while (n >= 16) {                               /* 主体：128B/轮，成对 16B 写 */
+            q[0] = pat; q[1] = pat; q[2] = pat; q[3] = pat;
+            q[4] = pat; q[5] = pat; q[6] = pat; q[7] = pat;
+            q += 8; n -= 16;
+        }
+        while (n >= 2) { *q++ = pat; n -= 2; }
+        if (n) *(uint32_t *)q = rgb;                    /* 尾巴 1 像素 */
+    }
+    __asm__ volatile("" ::: "memory");
 }
 
 void gfx_rect_draw(struct gfx_rect r, u32 rgb, int thickness)
@@ -120,16 +138,16 @@ void gfx_rect_draw(struct gfx_rect r, u32 rgb, int thickness)
 void gfx_line(int x0, int y0, int x1, int y1, u32 rgb)
 {
     if (!G_fb) return;
-    /* Bresenham；每个点都过 drawable 裁剪，避免逐点判断屏幕边界的重复代码 */
+    /* Bresenham；裁剪矩形只算一次，逐点用 gfx_hit 判定。
+       原实现每个点都构造矩形再走 gfx_clip，壁纸 7 条斜线要算上千次裁剪。 */
+    struct gfx_rect c = gfx_clip(G_clip[G_clip_n - 1], G_w, G_h);
     int dx = x1 - x0, dy = y1 - y0;
     int sx = dx >= 0 ? 1 : -1, sy = dy >= 0 ? 1 : -1;
     if (dx < 0) dx = -dx;
     if (dy < 0) dy = -dy;
     int err = dx - dy;
     for (;;) {
-        struct gfx_rect one = gfx_clip((struct gfx_rect){x0, y0, 1, 1}, G_w, G_h);
-        if (gfx_rect_valid(one) && gfx_hit(G_clip[G_clip_n - 1], x0, y0))
-            px(x0, y0, rgb);
+        if (gfx_hit(c, x0, y0)) px(x0, y0, rgb);
         if (x0 == x1 && y0 == y1) break;
         int e2 = 2 * err;
         if (e2 > -dy) { err -= dy; x0 += sx; }
@@ -175,26 +193,49 @@ static int glyph(int x, int y, u32 cp, u32 fg, u32 bg)
 {
     const u8 *bmp; int w = 0, h = 0, rb = 0;
     if (fb_query_glyph(cp, &bmp, &w, &h, &rb) != 0) { w = 8; h = 16; bmp = 0; }
+    /* 第四十七轮：整个字形只算一次可视范围，不再逐像素 gfx_clip。
+       原实现每个亮点都要构造 1x1 矩形 → gfx_clip → gfx_hit，一个 8x16 字形
+       最多 128 次裁剪；桌面满屏文字实测 9.5us/字，是渲染最大头。 */
+    struct gfx_rect vis = gfx_clip(G_clip[G_clip_n - 1], G_w, G_h);
+    struct gfx_rect gr = {x, y, w, h};
+    if (!gfx_overlap(vis, gr)) return x + w;      /* 整字在裁剪区外：零像素开销 */
     if (bg != 0xFFFFFFFFu)
-        gfx_fill((struct gfx_rect){x, y, w, h}, bg);
+        gfx_fill(gr, bg);
     if (bmp && G_fb) {
-        for (int r = 0; r < h; r++)
-            for (int c = 0; c < w; c++) {
-                u8 bits = bmp[r * rb + c / 8];
-                if (!((bits >> (7 - (c & 7))) & 1)) continue;
-                /* 逐点裁剪：文字可能被窗口边框裁掉半个字符 */
-                if (!gfx_rect_valid(gfx_clip((struct gfx_rect){x + c, y + r, 1, 1}, G_w, G_h))) continue;
-                if (!gfx_hit(G_clip[G_clip_n - 1], x + c, y + r)) continue;
-                px(x + c, y + r, fg);
+        int cx0 = x > vis.x ? x : vis.x;
+        int cy0 = y > vis.y ? y : vis.y;
+        int cx1 = (x + w) < (vis.x + vis.w) ? (x + w) : (vis.x + vis.w);
+        int cy1 = (y + h) < (vis.y + vis.h) ? (y + h) : (vis.y + vis.h);
+        uint32_t *base = (uint32_t *)(uintptr_t)G_fb;
+        for (int yy = cy0; yy < cy1; yy++) {
+            const u8 *rowb = bmp + (yy - y) * rb;
+            uint32_t *dst = base + (u64)(u32)yy * (u32)G_stride;
+            for (int xx = cx0; xx < cx1; xx++) {
+                int c = xx - x;
+                if ((rowb[c >> 3] >> (7 - (c & 7))) & 1) dst[xx] = fg;
             }
+        }
+        __asm__ volatile("" ::: "memory");
     }
     return x + w;
 }
 
 int gfx_text(int x, int y, const char *s, u32 fg, u32 bg)
 {
+    /* 第四十七轮：先按字符宽度做一次矩形相交，完全在裁剪区外的 ASCII 直接跳过。
+       桌面输入行刷新时脏区只有 22px 高，终端却会把 64 行历史都走一遍；
+       原实现每个字符都要 fb_query_glyph（CJK 是 885 字形二分）再算裁剪，
+       一屏文字白算上千次。ASCII 宽度固定 8，可以安全跳过而不影响排版。 */
+    struct gfx_rect vis = gfx_clip(G_clip[G_clip_n - 1], G_w, G_h);
     while (*s) {
         u32 cp = u8_next(&s);
+        if (cp < 128) {
+            if (x + 8 <= vis.x || x >= vis.x + vis.w ||
+                y + 16 <= vis.y || y >= vis.y + vis.h) {
+                x += 8;
+                continue;
+            }
+        }
         x = glyph(x, y, cp, fg, bg);
     }
     return x;

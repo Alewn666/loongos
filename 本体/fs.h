@@ -64,6 +64,7 @@ int  fs_mount_disk(u64 part_lba, u32 nblocks);       /* 挂载磁盘上已有 FS
 int  fs_is_disk(void);                               /* 当前是否跑在磁盘上 */
 u32  fs_blocks(void);                                /* 当前块数 */
 int  fs_last_io_err(void);                           /* 最近一次块 I/O 是否出错 */
+void fs_cache_stats(u32 *hits, u32 *misses);         /* 第四十七轮：磁盘块读缓存命中统计 */
 int  fs_lookup(const char *path);                   /* 绝对路径 → inode 号；找不到 -1 */
 int  fs_isdir(int ino);
 void fs_list(int ino, void (*cb)(const struct dirent *, int ino, void *), void *arg);

@@ -19,4 +19,7 @@ void sha256_iter(const u8 *salt, u32 saltlen, const char *pw, u32 iter, u8 out[3
 /* hex 工具：out 必须有 2*n+1 空间（结尾 NUL） */
 void to_hex(const u8 *in, u32 n, char *out);
 
+/* 第四十七轮：1 = 正在使用 ARMv8 密码扩展，0 = 纯 C 回退（诊断/基准用） */
+int  sha256_hw_enabled(void);
+
 #endif

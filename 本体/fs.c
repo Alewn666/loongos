@@ -27,10 +27,44 @@ static u32  fs_nblocks = FS_BLOCKS;/* 运行期块数（内存盘 256 = 1MB；�
                                       因为位图只有一块 4KB = 32768 bit） */
 static int  fs_io_err = 0;         /* 最近一次块 I/O 是否出错（诊断用） */
 
+/* ---- 第四十七轮：磁盘块读缓存（只对磁盘模式生效，写穿透）----
+ * 装好的系统上，`ls`/`stat`/`write` 的元数据访问高度集中：一次 ialloc 要把
+ * inode 表 4 个块反复读几十遍，每次都是一次完整 virtio/NVMe 往返。
+ * 4 块（16KB）正好覆盖 inode 表全表；写操作只更新已在缓存里的块（不写分配），
+ * 因此格式化/大文件写入不会被额外的整块拷贝拖慢。
+ * 内存盘模式（fs_on_disk=0）一个字节都不走这里，行为与旧版完全一致。 */
+#define FS_BCACHE 4
+struct fs_bcache { u32 blk; u8 valid; u8 pad[3]; u8 data[FS_BLOCK]; };
+static struct fs_bcache fs_bc[FS_BCACHE] __attribute__((aligned(64)));
+static u32 fs_bc_clock, fs_bc_hits, fs_bc_misses;
+
+static void fs_cache_reset(void)
+{
+    for (int i = 0; i < FS_BCACHE; i++) fs_bc[i].valid = 0;
+    fs_bc_clock = 0;
+}
+void fs_cache_stats(u32 *hits, u32 *misses)
+{
+    if (hits) *hits = fs_bc_hits;
+    if (misses) *misses = fs_bc_misses;
+}
+
 static void bread(u32 b, void *buf)
 {
     if (fs_on_disk) {
-        if (vb_read_block(b, fs_part_lba, buf) != 0) { fs_io_err = 1; fs_memset(buf, 0, FS_BLOCK); }
+        for (int i = 0; i < FS_BCACHE; i++) {
+            if (fs_bc[i].valid && fs_bc[i].blk == b) {
+                fs_memcpy(buf, fs_bc[i].data, FS_BLOCK);
+                fs_bc_hits++;
+                return;
+            }
+        }
+        fs_bc_misses++;
+        if (vb_read_block(b, fs_part_lba, buf) != 0) { fs_io_err = 1; fs_memset(buf, 0, FS_BLOCK); return; }
+        u32 slot = fs_bc_clock++ % FS_BCACHE;
+        fs_bc[slot].blk = b;
+        fs_bc[slot].valid = 1;
+        fs_memcpy(fs_bc[slot].data, buf, FS_BLOCK);
         return;
     }
     fs_memcpy(buf, fs_disk + (u32)b * FS_BLOCK, FS_BLOCK);
@@ -39,6 +73,12 @@ static void bwrite(u32 b, const void *buf)
 {
     if (fs_on_disk) {
         if (vb_write_block(b, fs_part_lba, buf) != 0) fs_io_err = 1;
+        /* 写穿透：只有已经在缓存里的块才同步更新，避免写分配把格式化拖慢 */
+        for (int i = 0; i < FS_BCACHE; i++)
+            if (fs_bc[i].valid && fs_bc[i].blk == b) {
+                fs_memcpy(fs_bc[i].data, buf, FS_BLOCK);
+                break;
+            }
         return;
     }
     fs_memcpy(fs_disk + (u32)b * FS_BLOCK, buf, FS_BLOCK);
@@ -60,21 +100,52 @@ int fs_strcmp(const char *a, const char *b)
 }
 void fs_memcpy(void *d, const void *s, u32 n)
 {
-    u64 *xd = d; const u64 *xs = s;
-    while (n >= 8) { *xd++ = *xs++; n -= 8; }
-    u8 *pd = (u8 *)xd; const u8 *ps = (const u8 *)xs;
+    u8 *pd = (u8 *)d; const u8 *ps = (const u8 *)s;
+    /* 第四十七轮：源/目标同 8 字节对齐时走 64B/轮的 ldp+stp 快路。
+       原实现每 8 字节一次「索引寻址 + 加一 + 比较」，1MB 要 13 万次循环；
+       这里一轮搬 64B，循环开销摊薄到 1/8，且 ldp/stp 是 ARM64 最划算的成对访问。 */
+    if ((((u64)pd ^ (u64)ps) & 7) == 0) {
+        while (n && ((u64)pd & 7)) { *pd++ = *ps++; n--; }
+        u64 *xd = (u64 *)pd; const u64 *xs = (const u64 *)ps;
+        while (n >= 64) {
+            u64 a, b;
+            __asm__ volatile(
+                "ldp %0, %1, [%2]\n\t"
+                "stp %0, %1, [%3]\n\t"
+                "ldp %0, %1, [%2, #16]\n\t"
+                "stp %0, %1, [%3, #16]\n\t"
+                "ldp %0, %1, [%2, #32]\n\t"
+                "stp %0, %1, [%3, #32]\n\t"
+                "ldp %0, %1, [%2, #48]\n\t"
+                "stp %0, %1, [%3, #48]"
+                : "=&r"(a), "=&r"(b) : "r"(xs), "r"(xd) : "memory");
+            xs += 8; xd += 8; n -= 64;
+        }
+        while (n >= 8) { *xd++ = *xs++; n -= 8; }
+        pd = (u8 *)xd; ps = (const u8 *)xs;
+    }
     while (n--) *pd++ = *ps++;
 }
 /* 零/填充：8 字节一次写（原来逐字节，1MB 格式化时要跑 100 万次）
-   ⚠️ 指针可能不是 8 字节对齐（目录项名之类），所以先对齐再走快路 */
+   ⚠️ 指针可能不是 8 字节对齐（目录项名之类），所以先对齐再走快路。
+   第四十七轮再把主体从 8B 提升到 64B/轮（4 条 stp，无循环体开销）。 */
 void fs_memset(void *d, int v, u32 n)
 {
-    u8 *p = d;
+    u8 *p = (u8 *)d;
     u8 b = (u8)v;
     u64 pat = 0x0101010101010101ULL * (u64)b;
     while (n && ((u64)p & 7)) { *p++ = b; n--; }     /* 头部对齐 */
     u64 *q = (u64 *)p;
-    while (n >= 8) { *q++ = pat; n -= 8; }           /* 主体：8 字节 */
+    while (n >= 64) {                                /* 主体：64B/轮 */
+        __asm__ volatile(
+            "stp %0, %0, [%1]\n\t"
+            "stp %0, %0, [%1, #16]\n\t"
+            "stp %0, %0, [%1, #32]\n\t"
+            "stp %0, %0, [%1, #48]"
+            :: "r"(pat), "r"(q) : "memory");
+        q += 8; n -= 64;
+    }
+    while (n >= 8) { *q++ = pat; n -= 8; }           /* 剩余整字 */
     p = (u8 *)q;
     while (n--) *p++ = b;                            /* 尾巴 */
 }
@@ -93,19 +164,24 @@ static int  bmp_get(u32 b)  { return (bitmap[b / 8] >> (b % 8)) & 1; }
 static void bmp_set(u32 b)  { bitmap[b / 8] |= (u8)(1u << (b % 8)); }
 static void bmp_clr(u32 b)  { bitmap[b / 8] &= (u8)~(1u << (b % 8)); }
 
-static int balloc(void)
+static int balloc_common(int need_zero)
 {
     bmp_load();
     for (u32 b = FS_B_DATA; b < fs_nblocks; b++) {
         if (!bmp_get(b)) {
             bmp_set(b);
             bmp_save();
-            bwrite(b, fs_zero);               /* 新块先清零（目录/间接块都靠它） */
+            /* 第四十七轮：文件数据块由调用方整块覆写（fs_setfile/dir_add 都先
+               memset 满 4KB 再 bwrite），这里再写一遍零块纯属多一次 4KB 设备写。
+               间接块必须清零（后续按 u32 表项逐项填），保留零块路径。 */
+            if (need_zero) bwrite(b, fs_zero);
             return (int)b;
         }
     }
     return -1;                                /* 盘满 */
 }
+static int balloc(void)      { return balloc_common(1); }   /* 目录/间接块：清零 */
+static int balloc_data(void) { return balloc_common(0); }   /* 文件数据块：调用方覆写 */
 static void bfree(u32 b)
 {
     if (b < FS_B_DATA || b >= fs_nblocks) return;
@@ -157,7 +233,7 @@ static u32 bmap(struct inode *in, u32 fblk, int alloc)   /* 文件逻辑块号 �
 {
     if (fblk < 10) {
         if (in->direct[fblk] == 0 && alloc) {
-            int b = balloc();
+            int b = balloc_data();            /* 数据块：调用方整块覆写，免零块写 */
             if (b < 0) return 0;
             in->direct[fblk] = (u32)b;
         }
@@ -176,7 +252,7 @@ static u32 bmap(struct inode *in, u32 fblk, int alloc)   /* 文件逻辑块号 �
     u32 *iblk = (u32 *)fs_scratch;
     u32 ent = iblk[fblk];
     if (ent == 0 && alloc) {
-        int b = balloc();                     /* balloc 不碰 scratch（用 fs_zero），安全 */
+        int b = balloc_data();                /* 数据块：调用方整块覆写 */
         if (b < 0) return 0;
         iblk[fblk] = (u32)b;
         bwrite(in->indirect, fs_scratch);
@@ -327,6 +403,7 @@ void fs_init(void)
     fs_on_disk = 0;
     fs_part_lba = 0;
     fs_nblocks = FS_BLOCKS;
+    fs_cache_reset();
     fs_memset(fs_disk, 0, sizeof(fs_disk));
     fs_format_now();
 }
@@ -340,6 +417,7 @@ int fs_format_disk(u64 part_lba, u32 nblocks)
     fs_part_lba = part_lba;
     fs_nblocks = nblocks;
     fs_io_err = 0;
+    fs_cache_reset();                            /* 换盘/重格：旧块号缓存必须作废 */
     fs_format_now();
     return fs_io_err ? -2 : 0;
 }
@@ -350,6 +428,7 @@ int fs_mount_disk(u64 part_lba, u32 nblocks)
     if (nblocks < FS_B_DATA + 4) return -1;
     if (nblocks > 32768u) nblocks = 32768u;
     u8 *blk = fs_scratch;
+    fs_cache_reset();
     if (vb_read_block(FS_B_SUPER, part_lba, blk) != 0) return -1;
     struct super sb;
     fs_memcpy(&sb, blk, sizeof(sb));
@@ -573,7 +652,7 @@ int fs_setfile(int ino, const u8 *buf, u32 len)
         u8 *blk = fs_scratch;               /* bmap 用完 scratch 之后才填充内容 */
         u32 chunk = len - off;
         if (chunk > FS_BLOCK) chunk = FS_BLOCK;
-        fs_memset(blk, 0, FS_BLOCK);
+        if (chunk < FS_BLOCK) fs_memset(blk, 0, FS_BLOCK);  /* 整块覆写时免清零 */
         fs_memcpy(blk, buf + off, chunk);
         bwrite(b, blk);
         off += chunk;

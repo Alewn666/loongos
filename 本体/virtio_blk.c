@@ -375,11 +375,19 @@ static int vb_request(u32 type, u64 lba, void *buf, u32 nsec, int dev_writes)
     vb_notify_queue0();
 
     u16 before = vb_used.idx;
-    for (u64 spin = 0; spin < 60000000ull; spin++) {
-        bar();
-        if (vb_used.idx != before) {              /* 设备把 used.idx 推上来 = 完成 */
-            (void)rd8(vb_isr);                /* 清中断状态 */
-            return (vb_st_buf[0] == 0) ? 0 : -3;
+    /* 第四十七轮：宿主 IO 抖动时，单次自旋可能等不到 used.idx。
+       超时后**不新增 avail 项**地重新 notify（同一链头），virtio 规范允许
+       重复 kick：设备已取走描述符时是 no-op，没取走时正好把它踢醒。
+       最多 3 轮，仍不完成才报 -4。这样不会产生重复完成，也不会把一次
+       偶发写延迟放大成安装失败。 */
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt) vb_notify_queue0();
+        for (u64 spin = 0; spin < 60000000ull; spin++) {
+            bar();
+            if (vb_used.idx != before) {              /* 设备把 used.idx 推上来 = 完成 */
+                (void)rd8(vb_isr);                /* 清中断状态 */
+                return (vb_st_buf[0] == 0) ? 0 : -3;
+            }
         }
     }
     return -4;

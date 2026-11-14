@@ -1,6 +1,8 @@
 #include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
 #include "arm_io.h"    /* 第四十六轮：ARM64 弱内存序统一屏障层（sys_dsb/mmio_wmb/…） */
 #include "blkdev.h"    /* 块设备统一抽象层：blk_probe_all / 驱动表 */
+#include "gfx.h"       /* 第四十七轮：渲染基准要用 gfx_rect / gfx_fill / gfx_text */
+#include "gfx_draw.h"
 /* LoongOS 阶段5④ - 重定向（cmd > 输出到文件、write < 输入喂文件）
  * 阶段5① 起能力全保留：1MB 内存盘 fs（Unix 单根 /）、行输入 shell、root/demo + 口令 + DAC。
  * 本阶段新增：
@@ -103,10 +105,19 @@ static u32 gic_ver = 2;      /* 2 或 3，gic_init 里探测 */
 static inline u64 icc_iar1_read(void)  { u64 v; __asm__ volatile("mrs %0, ICC_IAR1_EL1" : "=r"(v)); return v; }
 static inline void icc_eoir1_write(u64 v) { __asm__ volatile("msr ICC_EOIR1_EL1, %0" :: "r"(v)); }
 
-/* ---------------- 异常帧（与 boot.S 的 SAVE_CTX 布局一致） ---------------- */
+/* ---------------- 异常帧（与 boot.S 的 SAVE_CTX 布局一致） ----------------
+ * 第四十七轮：异常帧从 288B 扩到 800B，末尾保存 q0..q31。
+ * ARM64 只有 v8..v15 的低 64 位是 callee-saved，其余 SIMD 寄存器都是
+ * caller-saved（v8..v15 高半也不保证），异常处理/任务切换另一侧可以合法
+ * 改写。全存 q0..q31 才能保证被中断的 NEON/SHA256H 计算（例如口令 KDF）
+ * 不被中断路径破坏。偏移 0..279 与旧布局完全一致，handle_* 对
+ * elr/spsr/esr/far 的访问不变。 */
+#define EXC_FRAME_SIZE 800
 struct regs {
     u64 x[31];      /* x0..x30 */
     u64 elr, spsr, esr, far;
+    u64 _frame_pad; /* 280..287：保持 q 从 288 开始，与 SAVE_CTX 偏移一致 */
+    u64 q[64];      /* q0..q31（288..799） */
 };
 
 /* ---------------- 阶段5④：重定向状态（uart_putc 是唯一总闸，shell 命令的打印都从这过） ---------------- */
@@ -1364,10 +1375,10 @@ __attribute__((aligned(16))) static u8 t1_stack[8192];
 /* 造一个"初始异常帧"，RESTORE_CTX 一恢复就等于从异常返回进 fn */
 static void task_create(int i, void (*fn)(void), const char *name)
 {
-    u64 fp = tasks[i].stack_top - 288;            /* 288=帧大小（SAVE_CTX 口径） */
+    u64 fp = tasks[i].stack_top - EXC_FRAME_SIZE;  /* 帧大小与 SAVE_CTX 口径一致 */
     u64 *p = (u64 *)fp;
-    for (int k = 0; k < 35; k++)
-        p[k] = 0;                                 /* x0..x30 + elr/spsr/esr/far 清零 */
+    for (int k = 0; k < EXC_FRAME_SIZE / 8; k++)
+        p[k] = 0;                                 /* 整帧清零（含 q0..q7 占位） */
     p[31] = (u64)fn;                              /* ELR @248 → 一恢复就跳进 fn */
     p[32] = 0x345;                                /* SPSR @256 → EL1h、D/A/F 屏蔽、IRQ 开 */
     tasks[i].frame = fp;
@@ -2322,7 +2333,20 @@ static void cmd_bench(char *args)
     uart_puts(" w="); uart_putdec(fb_w); uart_puts(" h="); uart_putdec(fb_h);
     uart_puts(" stride="); uart_putdec(fb_stride);
     uart_puts(" u64ok="); uart_putdec((u32)fb_u64_ok); uart_puts("\n");
+    {
+        u64 isar = 0;
+        __asm__ volatile("mrs %0, id_aa64isar0_el1" : "=r"(isar));
+        uart_puts("  SHA2 扩展="); uart_putdec((u32)((isar >> 4) & 0xF));
+        uart_puts("  硬件哈希="); uart_putdec((u32)sha256_hw_enabled());
+        uart_puts(" (1=硬件 0=纯C)\n");
+    }
     u64 t0, t1;
+
+    /* 0) fs_memset 1MB（格式化/清零路径） */
+    t0 = bench_cnt();
+    for (int i = 0; i < 2048; i++) fs_memset(bench_a, 0xA5, sizeof bench_a);
+    t1 = bench_cnt();
+    bench_line("memset 1MB", 1024 * 1024, t1 - t0, hz);
 
     /* 1) fs_memcpy 1MB（64KB × 16） */
     t0 = bench_cnt();
@@ -2350,6 +2374,50 @@ static void cmd_bench(char *args)
         t1 = bench_cnt();
         fb_x = sx; fb_y = sy;
         bench_line("fb 画 1000 字符", 1000ull * FONT_W * FONT_H * 4, t1 - t0, hz);
+    }
+    /* 5) gfx 全屏填充 ×10（桌面壁纸/窗口底色走的同一条路） */
+    if (fb_mem) {
+        u64 bytes = (u64)fb_w * fb_h * 4 * 10;
+        gfx_init((void *)(u64)fb_mem, (int)fb_w, (int)fb_h, (int)fb_stride);
+        t0 = bench_cnt();
+        for (int i = 0; i < 10; i++)
+            gfx_fill((struct gfx_rect){0, 0, (int)fb_w, (int)fb_h},
+                     (u32)(0x00102030u + (u32)i));
+        t1 = bench_cnt();
+        bench_line("gfx 全屏填充 x10", bytes, t1 - t0, hz);
+
+        /* 6) gfx 画 ~1000 个 ASCII 字形（含裁剪与底色） */
+        const char *sample = "LoongOS ARM render bench 0123456789 abcdefghijklmnopqrstuvwxyz";
+        int slen = (int)fs_strlen(sample);
+        int rows = (1000 / (slen > 0 ? slen : 1)) + 1;   /* 17 行 × 60 字 ≈ 1020 */
+        u64 gbytes = (u64)rows * (u64)slen * FONT_W * FONT_H * 4;
+        t0 = bench_cnt();
+        for (int row = 0; row < rows; row++)
+            gfx_text(0, row * FONT_H, sample, 0x00FFFFFFu, 0x00000000u);
+        t1 = bench_cnt();
+        bench_line("gfx 画 ~1000 字符", gbytes, t1 - t0, hz);
+
+        /* 6b) 局部重绘：同样 17 行文字，但裁剪区只有 300x40（模拟终端输入行刷新） */
+        t0 = bench_cnt();
+        gfx_clip_push((struct gfx_rect){0, 0, 300, 40});
+        for (int row = 0; row < rows; row++)
+            gfx_text(0, row * FONT_H, sample, 0x00FFFFFFu, 0x00000000u);
+        gfx_clip_pop();
+        t1 = bench_cnt();
+        bench_line("gfx 局部重绘 ~1000 字符", gbytes, t1 - t0, hz);
+    }
+    /* 7) 口令哈希：一次 5 万轮迭代（等价一次 su 登录的 KDF 成本）
+       先空跑一次预热（TCG 首次执行要翻译代码，直接计时会把 JIT 成本算进去）。 */
+    {
+        static const u8 salt[8] = { 'L','o','o','n','g','S','l','t' };
+        u8 hh[32];
+        sha256_iter(salt, 8, "loong2026", AUTH_ITER, hh);
+        t0 = bench_cnt();
+        sha256_iter(salt, 8, "loong2026", AUTH_ITER, hh);
+        t1 = bench_cnt();
+        u64 us = (t1 - t0) / (hz / 1000000);
+        uart_puts("  KDF 5万轮: "); uart_putdec((u32)us); uart_puts(" us (");
+        uart_putdec((u32)((50000ull * 1000ull) / (us ? us : 1))); uart_puts(" 轮/ms)\n");
     }
     uart_puts("提示: us 越小越好, MB/s 越大越好\n");
 }
@@ -2751,6 +2819,14 @@ static void cmd_res(char *args)
     uart_puts("  熔断="); uart_putdec(g_exc_trip); uart_puts("\n");
     uart_puts("[res ] 时钟跳变截断="); uart_putdec(g_tick_jumps);
     uart_puts("  UART FIFO 收满="); uart_putdec(g_irq_uart_ovf); uart_puts("\n");
+    /* 第四十七轮：块读缓存与口令哈希路径（性能回归时一眼看出口径） */
+    u32 ch = 0, cm = 0;
+    fs_cache_stats(&ch, &cm);
+    uart_puts("[res ] 磁盘块缓存: 命中="); uart_putdec(ch);
+    uart_puts(" 未命中="); uart_putdec(cm);
+    uart_puts("  模式="); uart_puts(fs_is_disk() ? "磁盘" : "内存盘");
+    uart_puts("  SHA256="); uart_puts(sha256_hw_enabled() ? "硬件" : "纯C");
+    uart_puts("\n");
 }
 
 /* tcp get <ip> <端口> —— 连上去读最多 3 秒（80 端口自动发一个 GET，其余当纯读，比如 22 端口读 SSH 横幅） */
@@ -3857,7 +3933,7 @@ void kernel_main(unsigned long bootinfo)
     /* 任务表：task0=本内核（shell 所在，帧在第一次抢占时自然生成）；task1=造帧进入 worker */
     tasks[0].stack_top = (u64)_stack_top;
     tasks[0].name = "kernel/shell";
-    tasks[1].stack_top = (u64)&t1_stack[sizeof(t1_stack)];   /* ⚠️ 不赋值 task_create 会拿 0-288 当帧地址 */
+    tasks[1].stack_top = (u64)&t1_stack[sizeof(t1_stack)];   /* ⚠️ 不赋值 task_create 会拿 0-800 当帧地址 */
     task_create(1, task1_main, "worker");
 
     u64 freq;
