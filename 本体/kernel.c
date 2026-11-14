@@ -1,4 +1,5 @@
 #include "loongos.h"   /* 统一内核接口：跨模块声明的唯一事实来源 */
+#include "arm_io.h"    /* 第四十六轮：ARM64 弱内存序统一屏障层（sys_dsb/mmio_wmb/…） */
 #include "blkdev.h"    /* 块设备统一抽象层：blk_probe_all / 驱动表 */
 /* LoongOS 阶段5④ - 重定向（cmd > 输出到文件、write < 输入喂文件）
  * 阶段5① 起能力全保留：1MB 内存盘 fs（Unix 单根 /）、行输入 shell、root/demo + 口令 + DAC。
@@ -974,6 +975,7 @@ static void gic_init(void)
 
     io_wr32(UART0_BASE + 0x38, IMSC_RXIM);          /* 只开 RX 掩码（赋值，勿 |=） */
     __asm__ volatile("msr daifclr, #2");             /* 开 CPU 中断（IRQ） */
+    arm_isb();                                       /* DAIF 变更需上下文同步 */
 }
 
 /* ================= 阶段2：MMU ================= */
@@ -1275,6 +1277,17 @@ volatile u32 g_desktop_active = 0;  /* 桌面态：抑制抢占轮转，GUI 独�
 volatile u64 g_timer_irqs = 0;      /* 诊断：TIMER IRQ 累计（硬件唤醒次数） */
 volatile u64 g_wfi_hits = 0;        /* 诊断：桌面 wfi 命中次数 */
 
+/* 第四十六轮：异常 / 中断健康计数（显式初值 → 落 .data，不挤 .bss 的 4KB 对齐链）。
+   res 命令可见；长稳验收据此判断「有没有悄悄停机 / 有没有时钟跳变被截断」。
+   ⚠️ 这些是诊断量，绝不能参与任何控制流决策。 */
+volatile u32 g_exc_sync = 0;        /* 同步异常累计 */
+volatile u32 g_exc_recovered = 0;   /* 自愈 / 回 shell 累计 */
+volatile u32 g_exc_nisv = 0;        /* NISV 数据中止（真机 ARM 高发） */
+volatile u32 g_exc_fatal = 0;       /* FIQ / SError */
+volatile u32 g_exc_trip = 0;        /* 熔断 / 嵌套异常 */
+volatile u32 g_tick_jumps = 0;      /* cntpct 回退 / 长暂停补拍截断次数 */
+volatile u32 g_irq_uart_ovf = 0;    /* 一次 UART IRQ 收满上限（FIFO 异常迹象） */
+
 /* ⚠️ tick 由【硬件计数器真实经过的 cycle】驱动，不数 IRQ 个数。
  * 原因：QEMU TCG 下 cntp_tval_el0 按 freq/hz 设定后，实际 IRQ 触发率并不精确等于
  *   hz（实测设 1000Hz 只触发 ~558Hz），且 cntpct_el0 虚拟时间也不等于墙钟。
@@ -1298,6 +1311,7 @@ void timer_set_wake_hz(u32 hz)
     timer_interval = timer_freq / hz;
     if (!timer_interval) timer_interval = 1;
     __asm__ volatile("msr cntp_tval_el0, %0" :: "r"(timer_interval));
+    arm_isb();              /* 改定时器周期后上下文同步 */
 }
 void res_wfi_inc(void) { g_wfi_hits++; }   /* 桌面每次 wfi 前调，供 res 统计 */
 
@@ -1325,6 +1339,7 @@ static void timer_init(u32 hz)
     }
     __asm__ volatile("msr cntp_tval_el0, %0" :: "r"(timer_interval));
     __asm__ volatile("msr cntp_ctl_el0, %0"  :: "r"(1UL));  /* enable + 不屏蔽 */
+    arm_isb();              /* 定时器使能后需上下文同步，保证 IRQ 能被正确投递 */
 }
 
 static void timer_rearm(void)
@@ -1383,8 +1398,16 @@ struct regs *handle_irq(struct regs *f)
     if (id == 1023)                    /* 伪中断 */
         return f;
     if (id == UART0_IRQ) {
-        while (!(io_rd32(UART0_BASE + 0x18) & FR_RXFE))   /* 把串口 FIFO 里积压的全收走 */
+        /* ⚠️ 第四十六轮稳定性修复：原来是 while(!(FR & RXFE)) 无界循环。
+           中断上下文里 IRQ 已被硬件屏蔽，一旦 PL011 状态寄存器异常（真机 UART /
+           GIC 路由抖动 / RXFE 迟迟不置位）就永远出不来 → 整机硬挂死，且没有任何
+           转储。改为有界：PL011 FIFO 硬件深度 16 字节，一次 IRQ 最多收 64 字节，
+           剩下的留给下次 IRQ（10Hz 定时器也会把它唤醒）。 */
+        for (u32 n = 0; n < 64; n++) {
+            if (io_rd32(UART0_BASE + 0x18) & FR_RXFE) break;
             ring_push((char)(io_rd32(UART0_BASE + 0x00) & 0xFF), 0);  /* 0 = 串口控制台 */
+            if (n == 63) g_irq_uart_ovf++;
+        }
     } else if (id == TIMER_IRQ) {
         timer_rearm();                 /* 重装计数 = 清挂起 */
         g_timer_irqs++;                /* 诊断：硬件唤醒 IRQ 累计 */
@@ -1395,10 +1418,32 @@ struct regs *handle_irq(struct regs *f)
            与原版「每次 IRQ tick++」逐字节等价。 */
         u64 cyc;
         __asm__ volatile("mrs %0, cntpct_el0" : "=r"(cyc));
-        g_tick_cyc_acc += cyc - g_tick_last_cyc;
+        /* ⚠️ 第四十六轮稳定性修复（ARM / VM 长稳核心）：
+           ① cntpct_el0 回退（VM 迁移、快照恢复、计数器复位）会让 `cyc - last`
+              在 u64 下溢成 ~1.8e19，下面的 while 要跑 3e12 次 —— 在 IRQ 上下文
+              里等价于永久死机；
+           ② VM 长时间 stop 后 cont，一次 IRQ 按真实 cycle 补齐几万个 tick 同样
+              会把中断卡住。两者都必须截断。 */
+        u64 delta;
+        if (cyc >= g_tick_last_cyc) {
+            delta = cyc - g_tick_last_cyc;
+        } else {
+            delta = 0;
+            g_tick_cyc_acc = 0;        /* 计数器回退：基准重来，绝不带着余数下溢 */
+            g_tick_jumps++;
+        }
         g_tick_last_cyc = cyc;
+        /* 一次 IRQ 最多补 100 个 tick（≈10 秒的暂停），超出的物理时间直接丢弃。
+           tick 只服务于 fs mtime / EL0 看门狗 / 心跳，补太多既无意义又会卡死中断。 */
+        const u64 TICK_CATCHUP_MAX = 100;
+        if (delta > g_tick_period * TICK_CATCHUP_MAX) {
+            delta = g_tick_period * TICK_CATCHUP_MAX;
+            g_tick_cyc_acc = 0;
+            g_tick_jumps++;
+        }
+        g_tick_cyc_acc += delta;
         int advanced = 0;
-        while (g_tick_cyc_acc >= g_tick_period) {
+        while (g_tick_cyc_acc >= g_tick_period && advanced < (int)TICK_CATCHUP_MAX) {
             g_tick_cyc_acc -= g_tick_period;
             tick++;
             advanced++;
@@ -1424,6 +1469,10 @@ struct regs *handle_irq(struct regs *f)
         }
     }
     if (id >= 16) {                    /* PPI(30) 和 SPI(33) 都要 EOI；SGI 0~15 我们不用 */
+        /* ⚠️ ARM 弱内存序：写 EOI 前必须保证本 IRQ 里对设备寄存器的写已真正到达
+           设备，否则中断可能在设备状态尚未更新时立刻重入 / 形成 IRQ 风暴。
+           x86 强序不需要这一步，真机 ARM 上缺了偶发「越用越卡直到假死」。 */
+        sys_dsb();
         if (gic_ver == 3) icc_eoir1_write(iar);
         else              GICC_EOIR = iar;
     }
@@ -1790,7 +1839,34 @@ static void enter_el0(void)
     enter_el0_at((u64)el0_demo, (u64)&el0_stack[4096]);   /* 栈顶 = 专用栈页顶（2026-10-28 起与数据页分离） */
 }
 
-/* ---------------- 同步异常处理：转储现场，可恢复的就 ELR+=4 继续跑 ---------------- */
+/* ---------------- 同步异常处理：转储现场，能自愈就自愈，绝不整机停机 ----------------
+ * 第四十六轮稳定性根治（ARM 主用）：
+ *   旧实现里 NISV/stage-2 数据中止、熔断、嵌套异常、以及 FIQ/SError 全部走
+ *   `for(;;) wfe` 永久停机。真机 ARM 上 NISV 数据中止（MMIO 异常、stage-2 fault、
+ *   总线/外设错误）远比 QEMU TCG 频繁 —— 一次就整机死，串口只留一行「停机」，
+ *   正是「系统用着用着就死机」的确定性根因（本轮已用 crash abort 稳定复现：
+ *   ESR=0x96000010 EC=0x25 ISV=0 FAR=0xdead0000 → 永久 wfe）。
+ *   现在统一改为：转储现场 + 计数 + 长跳回 el1_landing 重新接管 shell。
+ *   刻意 **不** 对内核态 NISV 做 ELR+4 盲跳（解不出肇事指令，盲跳可能踩得更深），
+ *   放弃当前调用栈是更安全的选择：命令丢了可以重敲，系统活着才有意义。 */
+static void exc_recover_to_shell(struct regs *f, const char *why)
+{
+    g_exc_recovered++;
+    /* 异常若发生在桌面主循环里，desktop_run() 末尾的正常清理
+       （timer_set_wake_hz(10) / g_desktop_active=0）会被整段跳过 →
+       硬件唤醒频率残留 1000Hz、抢占被永久抑制（task1 心跳停）。这里统一复位。 */
+    timer_set_wake_hz(10);
+    g_desktop_active = 0;
+    exc_depth = 0;              /* 允许后续异常正常转储 */
+    user_running = 0;           /* 异常发生在 EL0 用户程序里时一并放弃 */
+    exc_uart_only = 1;          /* 恢复提示只走串口，避免图形输出路径嵌套异常 */
+    uart_puts("[自愈] "); uart_puts(why);
+    uart_puts("：放弃当前栈，回 shell 继续运行\n> ");
+    exc_uart_only = 0;
+    f->spsr = 0x345;            /* EL1h、D/A/F 屏蔽、IRQ 开（与既有 SVC/EL0 返回一致） */
+    f->elr  = (u64)el1_landing;
+}
+
 void handle_sync(struct regs *f)
 {
     u64 ec = (f->esr >> 26) & 0x3F;
@@ -1818,6 +1894,8 @@ void handle_sync(struct regs *f)
         return;
     }
 
+    g_exc_sync++;               /* 真正的异常（SVC 是正常系统调用，不计入） */
+
     /* 阶段5②：用户程序跑飞（读内核/写非法地址/取指炸）→ 杀掉回 shell。
        不学 ELR+4 纵容它——那是给内核自愈演示用的，用户代码必须隔离处置 */
     if ((f->spsr & 0xF) == 0 && user_running) {
@@ -1835,18 +1913,22 @@ void handle_sync(struct regs *f)
     if (f->far == last_far && f->elr == last_elr) repeat++;
     else { last_far = f->far; last_elr = f->elr; repeat = 0; }
     if (repeat >= 6) {
-        uart_puts("\n[熔断] 同一地址连续 6 次异常，停止自愈以免刷屏\n");
-        for (;;) __asm__ volatile("wfe");
+        g_exc_trip++;
+        exc_recover_to_shell(f, "同一地址连续 6 次异常（熔断）");
+        repeat = 0;            /* 回 shell 后重新计数，避免下一次异常立刻又被熔断 */
+        return;
     }
 
     /* 防重入：异常处理期间再次异常（例如转储本身踩到坏地址）时，
        用最小输出层打印现场并停机，杜绝「自愈→再踩→再打印」无限刷屏。 */
     if (exc_depth) {
-        raw_str("\n[嵌套异常] 异常处理器重入，停机保留现场\n  ESR=");
+        raw_str("\n[嵌套异常] 异常处理器重入，放弃当前栈回 shell\n  ESR=");
         raw_hex(f->esr); raw_str(" FAR="); raw_hex(f->far);
         raw_str(" ELR="); raw_hex(f->elr);
         raw_str(" EC=");  raw_hex(ec); raw_str("\n");
-        for (;;) __asm__ volatile("wfe");
+        g_exc_trip++;
+        exc_recover_to_shell(f, "异常处理器重入（嵌套异常）");
+        return;
     }
     exc_depth = 1;
 
@@ -1883,39 +1965,51 @@ void handle_sync(struct regs *f)
     }
     uart_puts("  x30="); uart_puthex(f->x[30]); uart_puts("\n");
 
-    exc_uart_only = 0;   /* 转储结束，恢复图形输出（停机分支不返回） */
+    exc_uart_only = 0;   /* 转储结束，恢复图形输出 */
     exc_depth = 0;       /* 允许下一次异常正常转储 */
 
-    /* ISV=0 的 NISV 中止：ESR 解不出肇事指令，ELR+4 是盲跳，
-       正是 KVM 上「打印→自愈→再踩」刷屏的根源 → 停机保留现场。
-       ⚠️ 例外（2026-11-08）：.el0text 里的 EL0 演示有一条**故意**的
+    /* ISV=0 的 NISV 中止：ESR 解不出肇事指令，ELR+4 是盲跳。
+       第四十六轮起 **不再停机**，改为转储后回 shell（见 exc_recover_to_shell）：
+       真机 ARM 上 NISV(MMIO / stage-2 / 总线错误) 远比 TCG 频繁，旧版一次就整机死。
+       ⚠️ 保留 2026-11-08 的窄豁免：.el0text 里的 EL0 演示有一条**故意**的
        `ldr x2, [x2]`（读 0x40080000 内核 text）用来演示「异常→自愈→继续」。
        在 TCG 下它同样报 ISV=0 / EC=0x24，但肇事指令是段内固定的 4 字节指令，
-       ELR+4 是精确跳过、不是盲跳，应当允许自愈；否则一敲 `el0` 整个内核就停机。
-       判据取得极窄：**只有 ELR 落在 .el0text 段内才豁免**。
-         - KVM 真正的 NISV(MMIO 后索引) 来自 EL1 内核 .text → 仍停机；
-         - 用户程序跑飞在更前面的 user_running 分支已被「杀掉回 shell」，走不到这；
-         - 其余 ISV=0 中止行为完全不变。 */
+       ELR+4 是精确跳过、不是盲跳，必须允许自愈；否则一敲 `el0` 就回 shell、
+       演示效果丢失。判据仍极窄：**只有 ELR 落在 .el0text 段内才豁免**。
+         - 真机 ARM 的 NISV 来自 EL1 内核 .text → 回 shell，系统继续活着；
+         - 用户程序跑飞在更前面的 user_running 分支已被「杀掉回 shell」，走不到这。 */
     int in_el0_text = (f->elr >= (u64)__el0text_start && f->elr < (u64)__el0text_end);
     if (!in_el0_text && ((f->esr >> 24) & 1) == 0 && (ec == 0x24 || ec == 0x25)) {
-        uart_puts("[停机] NISV/stage-2 数据中止：不能 ELR+4 盲跳，停机保留现场\n");
-        for (;;) __asm__ volatile("wfe");
+        g_exc_nisv++;
+        exc_recover_to_shell(f, "NISV/stage-2 数据中止（不盲跳 ELR+4）");
     } else if (ec == 0x00 || ec == 0x24 || ec == 0x25 || ec == 0x3C) {
         f->elr += 4;                      /* 肇事指令都是 4 字节，跳过它 */
+        g_exc_recovered++;
         uart_puts("[自愈] ELR+4 跳过肇事指令，继续活着\n> ");
     } else {
-        uart_puts("[停机] 无法恢复，CPU 进入 wfe 睡眠\n");
-        for (;;)
-            __asm__ volatile("wfe");
+        exc_recover_to_shell(f, "未知异常类型（不盲跳）");
     }
 }
 
-/* FIQ/SError：不该发生，报死后停机 */
+/* FIQ / SError：第四十六轮起不再「报死后停机」。
+   boot.S 的 fiq_entry/err_entry 已改为 RESTORE_CTX + eret，这里把异常帧重定向到
+   el1_landing 重新接管 shell —— 真机 ARM 上一次 SError（总线/外设错误）不再让整机
+   永久睡死。前 3 次给完整现场，之后静默但仍恢复，避免持续性 SError 刷屏。 */
 void handle_fatal(struct regs *f)
 {
-    uart_puts("\n*** FATAL: FIQ/SError，无法处理，停机 ***\n");
-    uart_puts("ESR="); uart_puthex(f->esr);
-    uart_puts(" ELR="); uart_puthex(f->elr); uart_puts("\n");
+    g_exc_fatal++;
+    if (g_exc_fatal <= 3) {
+        exc_uart_only = 1;              /* 只走串口，避开图形输出路径的嵌套中止 */
+        uart_puts("\n*** FATAL: FIQ/SError，已转储并回 shell ***\n");
+        uart_puts("ESR="); uart_puthex(f->esr);
+        uart_puts(" FAR="); uart_puthex(f->far);
+        uart_puts(" ELR="); uart_puthex(f->elr); uart_puts("\n");
+        exc_uart_only = 0;
+    }
+    exc_depth = 0;
+    user_running = 0;
+    f->spsr = 0x345;
+    f->elr  = (u64)el1_landing;
 }
 
 /* ---------------- 演示命令 ---------------- */
@@ -2647,6 +2741,16 @@ static void cmd_res(char *args)
         uart_puts(smp_online[i] ? "=Y" : "=N");
     }
     uart_puts("  本核 tick="); uart_putdec((u32)smp_pcpu_tick(0)); uart_puts("\n");
+    /* 第四十六轮健康账：异常不再停机，全部落到「回 shell」并在这里可见。
+       长稳验收脚本据此区分「系统一直在跑」与「悄悄死过又自愈」。res 刻意不在
+       行为基线命令集里，新增输出不影响 golden_behavior.txt 的逐字比对。 */
+    uart_puts("[res ] 健康: 同步异常="); uart_putdec(g_exc_sync);
+    uart_puts("  自愈/回shell="); uart_putdec(g_exc_recovered);
+    uart_puts("  NISV="); uart_putdec(g_exc_nisv);
+    uart_puts("  FIQ/SErr="); uart_putdec(g_exc_fatal);
+    uart_puts("  熔断="); uart_putdec(g_exc_trip); uart_puts("\n");
+    uart_puts("[res ] 时钟跳变截断="); uart_putdec(g_tick_jumps);
+    uart_puts("  UART FIFO 收满="); uart_putdec(g_irq_uart_ovf); uart_puts("\n");
 }
 
 /* tcp get <ip> <端口> —— 连上去读最多 3 秒（80 端口自动发一个 GET，其余当纯读，比如 22 端口读 SSH 横幅） */
@@ -3551,7 +3655,15 @@ static void shell_loop(void)
         { extern void smp_tick_inc(void); smp_tick_inc(); }   /* 阶段9：CPU0 自己的 per-CPU tick */
         usb_kbd_poll();              /* 阶段6②：先收 USB 键盘事件，再睡 */
         net_poll();                  /* 阶段7：顺手收网络包（ping 应答/DHCP 都在这处理） */
-        __asm__ volatile("wfi");     /* 睡到下一个中断来 */
+        /* 第四十六轮 ARM 加固：wfi 之前三件事
+           ① sys_dsb() —— 弱内存序下保证本轮对设备/DMA 的 store 全部落地再睡；
+           ② daifclr #2 —— 兜底确保 IRQ 未被屏蔽：任何异常恢复路径若留下 I=1，
+              wfi 可能永远不醒（整机假死）。这是「用着用着死机」的最后一道防线；
+           ③ isb —— 上下文同步，确保后续指令在新的 DAIF 状态下执行。 */
+        sys_dsb();
+        __asm__ volatile("msr daifclr, #2" ::: "memory");
+        arm_isb();
+        arm_wfi();                   /* 睡到下一个中断来 */
         char c;
         while (ring_pop(&c))
             on_char(c);

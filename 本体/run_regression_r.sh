@@ -11,7 +11,7 @@ run(){
   if [ $rc -eq 0 ]; then echo "[$i] PASS  $name"; pass=$((pass+1));
   else echo "[$i] FAIL($rc)  $name  -> $LOG"; fail=$((fail+1)); fi
 }
-echo "########## R 轮资源调配优化 全套回归（12 项，含真实画面护栏）##########"
+echo "########## 全套回归（15 项：资源调配 + ARM 长稳 + 网络 + 安装）##########"
 run "真实画面判据(800x600非黑屏)"   python3 test_framebuffer.py
 run "行为黄金基线"                 python3 test_behavior.py --compare golden_behavior.txt
 run "NVMe 装盘+持久化"             python3 test_nvme_install.py
@@ -24,5 +24,8 @@ run "直启驱动识别"                 sh test_drivers.sh
 run "scsi 装盘"                    python3 test_scsi_install.py
 run "P3 手感(交付版)"              python3 test_desktop_p3.py
 run "资源在线验证(画面+wfi/tick/调频)" python3 test_resource_live.py
+run "ARM 内核长稳压力(异常/时钟/洪水)" python3 test_stress_arm.py
+run "8 网卡多型号逐卡验收"            python3 test_nic.py
+run "多盘安装+选盘+已装系统菜单"      python3 test_install_disk.py
 echo "########## 汇总: PASS=$pass FAIL=$fail ##########"
 [ "$fail" -eq 0 ]

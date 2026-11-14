@@ -44,9 +44,12 @@ _start:
     str xzr, [x0], #8
     b 2b
 3:
-    /* 装载异常向量表（16 槽 × 128 字节） */
+    /* 装载异常向量表（16 槽 × 128 字节）
+       ⚠️ ARM 架构要求：写 VBAR_EL1 后必须有 context synchronization event（ISB），
+       否则不保证紧随其后的指令所产生的异常使用新向量表。第四十六轮补上。 */
     ldr x0, =vectors
     msr VBAR_EL1, x0
+    isb
 
     mov x0, x19
     bl kernel_main
@@ -127,14 +130,16 @@ irq_entry:
     RESTORE_CTX
     eret
 
-/* FIQ / SError：我们不用，直接报死后停机 */
+/* FIQ / SError：第四十六轮起「转储后回 shell」，不再永久停机。
+   handle_fatal 会把帧里的 ELR/SPSR 改成 el1_landing / EL1h(IRQ 开)，
+   这里照常恢复上下文并 eret —— 真机 ARM 上偶发一次 SError 不该让整机睡死。 */
 fiq_entry:
 err_entry:
     SAVE_CTX
     mov x0, sp
     bl handle_fatal
-1:  wfe
-    b 1b
+    RESTORE_CTX
+    eret
 
 /* ------------------------------------------------------------------ */
 /* 向量表：16 槽（4 组 × 4 类），每槽必须从 0x80 对齐地址开始！          */

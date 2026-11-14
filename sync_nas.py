@@ -72,6 +72,13 @@ FILES = [
     ('本体/golden_behavior.txt',  '本体/golden_behavior.txt'),
     ('本体/test_install_disk.py', '本体/test_install_disk.py'),
     ('本体/test_install.py',      '本体/test_install.py'),
+    # 第四十六轮：ARM 内核稳定性根治 + 全面优化
+    ('本体/arm_io.h',             '本体/arm_io.h'),
+    ('本体/boot.S',               '本体/boot.S'),
+    ('本体/test_stress_arm.py',   '本体/test_stress_arm.py'),
+    ('本体/run_regression_r.sh',  '本体/run_regression_r.sh'),
+    ('本体/test_mousecal.py',     '本体/test_mousecal.py'),
+    ('本体/iso/loongos.iso.md5',  'iso/自研内核ISO/loongos.iso.md5'),
 ]
 
 def md5_local(path):
