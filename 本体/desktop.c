@@ -13,7 +13,7 @@
  *   - 多窗口：打开/聚焦/关闭、标题栏拖动、关闭按钮、z 序、脏矩形重绘全部复用既有机制。
  *
  * 应用清单（共 NAPP 个，开始菜单全列）：
- *   终端 / 安装系统 / 系统信息 / 图形演示 / 操作说明（原硬编码窗口迁移）
+ *   终端 / 系统信息 / 图形演示 / 操作说明（原硬编码窗口迁移）
  *   计算器 / 系统监视器 / 设置 / 关于（新增轻量 App）
  *   文件管理器 / 文本编辑器（新增，直接吃 fs.h 的读写 API）
  *
@@ -104,8 +104,6 @@ static int G_mx, G_my, G_mprev;
 static int G_drag = -1;                 /* 正在拖动的窗口索引 */
 static int G_drag_dx, G_drag_dy;
 static int G_menu_on;
-static int G_install_armed;
-static u64 G_arm_tick;
 static int G_cal_on;                    /* 鼠标校准覆盖层是否显示 */
 static int G_cal_done;                  /* 已算出偏移，等待用户点一下返回 */
 static char G_cal_msg[64];              /* 校准结果（ASCII，字库必定有） */
@@ -123,7 +121,7 @@ struct gapp {
 };
 /* App 编号（同时是 G_apps 下标） */
 enum {
-    A_TERM = 0, A_INSTALL, A_INFO, A_DEMO, A_HELP,
+    A_TERM = 0, A_INFO, A_DEMO, A_HELP,
     A_CALC, A_MON, A_SET, A_ABOUT, A_FILES, A_EDIT, NAPP
 };
 static const struct gapp *G_apps[NAPP];
@@ -368,40 +366,6 @@ static void term_draw(struct gfx_rect cr, int f, int w){ (void)f;(void)w; gfxter
 static void term_key(char c, int w){ (void)w; gfxterm_key(c); }
 static void term_scroll(int dy, int w){ (void)w; gfxterm_scroll(dy > 0 ? 2 : -2); }
 
-/* —— 安装系统 —— */
-static void install_draw(struct gfx_rect cr, int f, int w)
-{
-    (void)f;(void)w;
-    gfx_clip_push(cr);
-    gfx_fill((struct gfx_rect){cr.x + 1, cr.y + 1, cr.w - 2, 2}, G_apps[A_INSTALL]->accent);
-    gfx_text(cr.x + 14, cr.y + 12, "把系统装到本机硬盘", C_WIN_TEXT, C_TRANSP);
-    gfx_text(cr.x + 14, cr.y + 34, "会清空目标磁盘", C_WIN_DIM, C_TRANSP);
-    if (G_install_armed)
-        gfx_text(cr.x + 14, cr.y + 58, "再点一次确认安装", C_RED, C_TRANSP);
-    else
-        gfx_text(cr.x + 14, cr.y + 58, "先点检查磁盘", C_WIN_DIM, C_TRANSP);
-    app_button(cr, 14, 88, 162, 26, "检查磁盘", C_BTN);
-    app_button(cr, 14, 122, 162, 26,
-               G_install_armed ? "确认清空并安装" : "一键安装",
-               G_install_armed ? C_RED : C_BTN);
-    gfx_clip_pop();
-}
-static void install_press(struct gfx_rect cr, int lx, int ly, int w)
-{
-    (void)w;
-    if (app_hit(lx, ly, 14, 88, 162, 26)) {
-        gfxterm_exec("disks"); focus_win(open_app(A_TERM));
-    } else if (app_hit(lx, ly, 14, 122, 162, 26)) {
-        if (!G_install_armed) {
-            G_install_armed = 1; G_arm_tick = tick;
-            gfxterm_exec("disks"); gfx_damage(full_screen());
-        } else {
-            G_install_armed = 0;
-            gfxterm_exec("install yes"); focus_win(open_app(A_TERM));
-        }
-    }
-}
-
 /* —— 系统信息 / 图形演示 / 操作说明（静态文本） —— */
 static void info_draw(struct gfx_rect cr, int f, int w)
 {
@@ -424,8 +388,8 @@ static void demo_draw(struct gfx_rect cr, int f, int w)
         "图形栈特性演示：",
         "裁剪 / 命中 / z 序",
         "脏矩形局部重绘",
-        "按 W A S D 移动窗口",
-        "按 1..9 聚焦窗口",
+        "本窗口按 W A S D 移动",
+        "本窗口按 1..9 聚焦",
         "Ctrl+Shift+F1 返回终端",
     };
     for (int i = 0; i < 6; i++)
@@ -438,8 +402,8 @@ static void help_draw(struct gfx_rect cr, int f, int w)
         "鼠标左键  点击 / 拖动窗口",
         "开始菜单  全部功能入口",
         "终端窗口  直接敲命令",
-        "Tab / 1..9 切换窗口",
-        "W A S D 移动聚焦窗口",
+        "终端里 W/A/S/D/数字 正常打字",
+        "信息类窗口 WASD 移动 / Tab 切换",
         "Ctrl+Shift+F1 返回终端",
     };
     for (int i = 0; i < 6; i++)
@@ -810,7 +774,6 @@ static void ed_init(int w){ (void)w; ed_load(); }
 /* =================== App 注册表 =================== */
 static const struct gapp G_app_defs[NAPP] = {
     [A_TERM]    = {"终端",       C_BLUE,   1, 0, term_draw,   0,          term_key, term_scroll},
-    [A_INSTALL] = {"安装系统",   C_ORANGE, 1, 0, install_draw,install_press,0,0},
     [A_INFO]    = {"系统信息",   C_TEAL,   1, 0, info_draw,   0, 0, 0},
     [A_DEMO]    = {"图形演示",   C_VIOLET, 1, 0, demo_draw,   0, 0, 0},
     [A_HELP]    = {"操作说明",   C_TEAL,   1, 0, help_draw,   0, 0, 0},
@@ -1144,15 +1107,20 @@ static void focus_nth_visible(int nth)
 }
 static void handle_key(char c)
 {
+    /* 聚焦"有键盘输入"的 App（终端 / 编辑器 / 计算器，注册了 key 回调）时，
+       所有按键（含 W A S D、数字、Tab）一律原样交给它，绝不被桌面热键抢走。
+       否则像终端里敲 whoami、ls /dev/sda1、Tab 补全 这类输入会被桌面吞掉。 */
+    if (G_focus >= 0 && G_apps[G_win[G_focus].app_id]->key) {
+        G_apps[G_win[G_focus].app_id]->key(c, G_focus);
+        return;
+    }
+    /* 以下桌面级热键只在聚焦"无键盘输入"的窗口（信息/演示/说明/监视器等）时生效 */
     if (c == '\t') { cycle_focus(); return; }
     if (c >= '1' && c <= '9') { focus_nth_visible(c - '0'); return; }
     if (c == 'w' || c == 'W') { move_focus(0, -STEP); return; }
     if (c == 's' || c == 'S') { move_focus(0,  STEP); return; }
     if (c == 'a' || c == 'A') { move_focus(-STEP, 0); return; }
     if (c == 'd' || c == 'D') { move_focus( STEP, 0); return; }
-    /* 否则交给聚焦 App 的键盘处理（终端输入 / 计算器按键 / 编辑器打字） */
-    if (G_focus >= 0 && G_apps[G_win[G_focus].app_id]->key)
-        G_apps[G_win[G_focus].app_id]->key(c, G_focus);
 }
 
 /* ---- 桌面主循环 ---- */
@@ -1177,7 +1145,6 @@ void desktop_run(void)
         open_app(A_INFO);
         open_app(A_DEMO);
         open_app(A_HELP);
-        open_app(A_INSTALL);
         G_inited = 1;
     }
     gfxterm_init();
@@ -1219,9 +1186,6 @@ void desktop_run(void)
             last_tick = tick;
             smp_tick_inc();
             net_poll();
-            if (G_install_armed && tick - G_arm_tick > 100) {
-                G_install_armed = 0; gfx_damage(full_screen()); input = 1;
-            }
             u64 sec = tick / 10;
             if (sec != G_last_sec) { G_last_sec = sec; gfx_damage(clock_rect()); input = 1; }
             if (ed_msg_t) { ed_msg_t = 0; gfx_damage(full_screen()); }

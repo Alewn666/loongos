@@ -100,7 +100,7 @@ void gfxterm_init(void)
     G_blink_on = 1; G_key_kick = 1; G_inrect_valid = 0;
     gt_mark_all();
     gt_puts("LoongOS 图形终端  |  输入 help 看命令清单\n");
-    gt_puts("提示：开始菜单可安装系统；install yes 也可直接装盘\n");
+    gt_puts("提示：开始菜单列出全部 App；Ctrl + Shift + F1 退出桌面\n");
     gt_puts("退出桌面：Ctrl + Shift + F1\n\n");
 }
 void gfxterm_stop(void) { G_on = 0; }
