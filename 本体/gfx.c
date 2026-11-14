@@ -69,7 +69,12 @@ void gfx_release_screen(void)
 /* ---- 裁剪栈 ---- */
 void gfx_clip_push(struct gfx_rect r)
 {
-    if (G_clip_n >= GFX_CLIP_DEPTH) return;   /* 栈满：忽略新层（保守，不会画到界外） */
+    if (G_clip_n >= GFX_CLIP_DEPTH) {
+        /* 栈满：不再加新层，改为把新裁剪与栈顶取交 —— 保持「裁剪单调收紧」，
+         * 且 push/pop 始终一一对应（消除旧实现「满栈 push 不计数却仍 pop」的不对称）。 */
+        G_clip[G_clip_n - 1] = gfx_intersect(G_clip[G_clip_n - 1], r);
+        return;
+    }
     struct gfx_rect cur = G_clip[G_clip_n - 1];
     G_clip[G_clip_n++] = gfx_intersect(cur, r);
 }

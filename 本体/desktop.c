@@ -108,6 +108,12 @@ static int G_cal_on;                    /* 鼠标校准覆盖层是否显示 */
 static int G_cal_done;                  /* 已算出偏移，等待用户点一下返回 */
 static char G_cal_msg[64];              /* 校准结果（ASCII，字库必定有） */
 
+/* ---- 重绘性能统计（gfxstat）：桌面退出时串口打印，供真机自查与优化对比 ----
+ * 只统计「真正发生重绘」的帧；redraws_per_present 反映一帧被拆成几次全量重绘。 */
+static volatile u64 G_present_cyc;      /* gfx_present() 实际重绘累计 CPU 周期 */
+static volatile u32 G_present_calls;    /* 真正发生重绘的帧数 */
+static volatile u32 G_redraw_calls;     /* redraw() 累计执行次数 */
+
 /* ---- App 框架 ---- */
 struct gapp {
     const char *name;          /* 开始菜单 / 任务栏显示名 */
@@ -235,6 +241,19 @@ static struct gfx_rect min_rect(struct gfx_rect r)
     return (struct gfx_rect){r.x + r.w - 48, r.y + 4, 20, 22};
 }
 
+/* 一条线的包围盒（用于脏矩形相交快速拒绝，避免无谓的 Bresenham 全长度遍历） */
+static struct gfx_rect line_bbox(int x0, int y0, int x1, int y1)
+{
+    int lx = x0 < x1 ? x0 : x1, ty = y0 < y1 ? y0 : y1;
+    return (struct gfx_rect){lx, ty, (x0 > x1 ? x0 : x1) - lx, (y0 > y1 ? y0 : y1) - ty};
+}
+/* 窗口绘制范围（含向右下偏移 4px 的阴影），用于「只重绘与脏区相交的窗口」 */
+static struct gfx_rect win_extent(int k)
+{
+    struct gfx_rect r = G_win[k].r;
+    return (struct gfx_rect){r.x, r.y, r.w + 4, r.h + 4};
+}
+
 /* ---- 开始菜单：动态列出全部 App + 关机/重启 ---- */
 static void menu_build(void)
 {
@@ -343,10 +362,12 @@ static void focus_win(int i)
 static void move_focus(int dx, int dy)
 {
     if (G_focus < 0) return;
+    struct gfx_rect old = win_extent(G_focus);
     G_win[G_focus].r.x += dx;
     G_win[G_focus].r.y += dy;
     clamp_win(&G_win[G_focus].r);
-    gfx_damage(full_screen());      /* 整屏重画，杜绝移动残影 */
+    /* 只重画旧∪新窗口包围盒（含阴影），杜绝残影且不再整屏重绘 */
+    gfx_damage(gfx_union(old, win_extent(G_focus)));
 }
 static int top_win_at(int x, int y)
 {
@@ -790,17 +811,27 @@ static void apps_register(void)
 }
 
 /* ---- 各层绘制 ---- */
-static void draw_wallpaper(void)
+/* 脏矩形感知：只在脏区 r 的行范围内画渐变；斜线先与 r 做包围盒相交，不相交整条跳过 */
+static void draw_wallpaper(struct gfx_rect r)
 {
     int w = gfx_width(), h = gfx_height();
-    for (int y = 0; y < h; y++)
+    int y0 = r.y > 0 ? r.y : 0;
+    int y1 = r.y + r.h; if (y1 > h) y1 = h;
+    for (int y = y0; y < y1; y++)
         gfx_fill((struct gfx_rect){0, y, w, 1},
                  mix(C_WALL_A, C_WALL_B, h > 1 ? (y * 255) / (h - 1) : 0));
-    for (int i = 0; i < 7; i++)
-        gfx_line(w - 260 + i * 22, h - TASKBAR_H, w - 90 + i * 22, TOPBAR_H + 56, C_DECO);
+    for (int i = 0; i < 7; i++) {
+        int xa = w - 260 + i * 22, ya = h - TASKBAR_H;
+        int xb = w - 90  + i * 22, yb = TOPBAR_H + 56;
+        if (!gfx_overlap(r, line_bbox(xa, ya, xb, yb))) continue;  /* 不相交：跳过整条线 */
+        gfx_line(xa, ya, xb, yb, C_DECO);
+    }
 }
-static void draw_topbar(void)
+/* 脏矩形感知：脏区与顶栏不相交则整层跳过 */
+static void draw_topbar(struct gfx_rect r)
 {
+    struct gfx_rect bar = {0, 0, gfx_width(), TOPBAR_H + 2};
+    if (!gfx_overlap(r, bar)) return;
     int w = gfx_width();
     gfx_fill((struct gfx_rect){0, 0, w, TOPBAR_H}, C_TOPBAR);
     gfx_fill((struct gfx_rect){0, TOPBAR_H - 2, w, 2}, C_BLUE);
@@ -843,7 +874,8 @@ static void draw_one_win(int k, int focused)
     gfx_clip_pop();
 }
 
-static void draw_windows(void)
+/* 脏矩形感知：只绘制与脏区 r 相交（含阴影）的窗口，按 z 序保证遮挡正确 */
+static void draw_windows(struct gfx_rect r)
 {
     int order[NWIN];
     for (int i = 0; i < NWIN; i++) order[i] = i;
@@ -854,7 +886,8 @@ static void draw_windows(void)
             }
     for (int i = 0; i < NWIN; i++) {
         int k = order[i];
-        if (G_win[k].visible) draw_one_win(k, k == G_focus);
+        if (G_win[k].visible && !G_win[k].minimized && gfx_overlap(r, win_extent(k)))
+            draw_one_win(k, k == G_focus);
     }
 }
 
@@ -873,10 +906,13 @@ static struct gfx_rect taskbtn_rect_dyn(int vis_idx)
     if (bw < 56) bw = 56;
     return (struct gfx_rect){96 + vis_idx * bw, gfx_height() - TASKBAR_H + 8, bw - 6, 26};
 }
-static void draw_taskbar(void)
+/* 脏矩形感知：脏区与任务栏不相交则整层跳过 */
+static void draw_taskbar(struct gfx_rect r)
 {
     int w = gfx_width(), h = gfx_height();
     int ty = h - TASKBAR_H;
+    struct gfx_rect bar = {0, ty, w, TASKBAR_H};
+    if (!gfx_overlap(r, bar)) return;
     gfx_fill((struct gfx_rect){0, ty, w, TASKBAR_H}, C_TASKBAR);
     gfx_fill((struct gfx_rect){0, ty, w, 1}, C_TB_LINE);
     struct gfx_rect sr = start_rect();
@@ -894,11 +930,13 @@ static void draw_taskbar(void)
     gfx_text(w - gfx_text_w(tb) - 16, ty + 13, tb, C_ACCENT, C_TRANSP);
 }
 
-static void draw_menu(void)
+/* 脏矩形感知：菜单未开或脏区与菜单不相交则跳过 */
+static void draw_menu(struct gfx_rect r)
 {
     if (!G_menu_on) return;
     menu_build();
     struct gfx_rect m = menu_rect();
+    if (!gfx_overlap(r, m)) return;
     gfx_fill((struct gfx_rect){m.x + 3, m.y + 3, m.w, m.h}, C_SHADOW);
     gfx_fill(m, C_MENU_BG);
     gfx_rect_draw(m, C_TB_LINE, 1);
@@ -912,8 +950,11 @@ static void draw_menu(void)
     }
 }
 
-static void draw_cursor(void)
+/* 脏矩形感知：脏区与光标包围盒不相交则跳过（光标只在自己那一小块里画） */
+static void draw_cursor(struct gfx_rect r)
 {
+    struct gfx_rect cr = cursor_rect(G_mx, G_my);
+    if (!gfx_overlap(r, cr)) return;
     for (int i = 0; i < CURSOR_H; i++) {
         int half = i / 2;
         gfx_fill((struct gfx_rect){G_mx, G_my + i, half + 2, 1}, GFX_RGB(8, 12, 20));
@@ -947,19 +988,21 @@ static void draw_calibrate(void)
     gfx_fill((struct gfx_rect){cx - 4,  cy - 4,  8,  8},  C_RED);
     if (G_cal_msg[0])
         gfx_text((w - gfx_text_w(G_cal_msg)) / 2, h - 90, G_cal_msg, C_ACCENT, C_TRANSP);
-    draw_cursor();
+    draw_cursor(full_screen());
 }
 
+/* 全面优化：redraw 现在把脏矩形 r 透传给每一层，各层只在 r 内工作，
+ * 不再对 600 行壁纸 / 全部窗口 / 顶栏任务栏做无谓遍历 —— 见 draw_* 的脏区感知。 */
 static void redraw(struct gfx_rect r)
 {
-    (void)r;
+    G_redraw_calls++;
     if (G_cal_on) { draw_calibrate(); return; }
-    draw_wallpaper();
-    draw_topbar();
-    draw_windows();
-    draw_taskbar();
-    draw_menu();
-    draw_cursor();
+    draw_wallpaper(r);
+    draw_topbar(r);
+    draw_windows(r);
+    draw_taskbar(r);
+    draw_menu(r);
+    draw_cursor(r);
 }
 
 /* ---- 鼠标事件 ---- */
@@ -1072,8 +1115,11 @@ static int poll_mouse(void)
         }
         if (G_drag >= 0 && moved) {
             struct gfx_rect *r = &G_win[G_drag].r;
+            struct gfx_rect old = win_extent(G_drag);
             r->x = G_mx - G_drag_dx; r->y = G_my - G_drag_dy;
-            clamp_win(r); gfx_damage(full_screen());
+            clamp_win(r);
+            /* 只重画窗口旧∪新包围盒（含阴影），不再整屏 —— 彻底消除拖动卡顿 */
+            gfx_damage(gfx_union(old, win_extent(G_drag)));
         }
     }
     int st;
@@ -1203,7 +1249,16 @@ void desktop_run(void)
             else gfx_damage(G_win[G_focus >= 0 ? G_focus : 0].r);
             input = 1;
         }
-        if (input || frame_due) gfx_present();
+        if (input || frame_due) {
+            u32 rc0 = G_redraw_calls;
+            u64 pc0 = dsk_cntpct();
+            gfx_present();
+            u64 dcy = dsk_cntpct() - pc0;
+            if (G_redraw_calls != rc0) {      /* 只统计真正重绘的帧 */
+                G_present_cyc += dcy;
+                G_present_calls++;
+            }
+        }
 
         if (real_input) last_input_tick = tick;
         u64 idle_ticks = tick - last_input_tick;
@@ -1223,4 +1278,18 @@ void desktop_run(void)
     gfx_release_screen();
     fb_console_reset();
     kputs("[desktop] 已返回串口终端（Ctrl+Shift+F1 可再按一次）\n");
+    if (G_present_calls) {
+        char st[160]; int n = 0;
+        const char *p = "[gfxstat] present=";
+        while (*p) st[n++] = *p++;
+        n += my_itoa(st + n, (long)G_present_calls);
+        p = " redraw="; while (*p) st[n++] = *p++;
+        n += my_itoa(st + n, (long)G_redraw_calls);
+        p = " avg_cycles_per_present="; while (*p) st[n++] = *p++;
+        n += my_itoa(st + n, (long)(G_present_cyc / G_present_calls));
+        p = " redraws_per_present_x100="; while (*p) st[n++] = *p++;
+        n += my_itoa(st + n, (long)((G_redraw_calls * 100ULL) / G_present_calls));
+        st[n++] = '\n'; st[n] = 0;
+        kputs(st);
+    }
 }

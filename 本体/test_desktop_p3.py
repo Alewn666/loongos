@@ -221,6 +221,12 @@ def t_key_latency(q):
     快照会吞掉同拍内的按下+松开，新版边沿队列逐事件分派，差异确定且稳定。
     """
     s0 = q.shot("t3_base")
+    # 先点一下终端标题栏聚焦终端（桌面初始化后焦点在最后一个窗口「操作说明」，
+    # 它无键盘回调，字母会被桌面热键吞掉、不回显 —— 故 T3 必须先聚焦终端再测回显）
+    q.abs_move(200, 55)
+    time.sleep(0.15)
+    q.btn(True); q.btn(False)
+    time.sleep(0.3)
     for ch in "abcde":
         q.sendkey(ch)
     time.sleep(0.5)                         # 覆盖 sendkey 注入抖动(实测可达数百 ms)，等画面稳定
