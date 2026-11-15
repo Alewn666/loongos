@@ -60,6 +60,7 @@ import json
 import shutil
 import subprocess
 import time
+import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.environ.get('DUAL_PATH', HERE)
@@ -107,20 +108,42 @@ class Session:
                                      stderr=subprocess.STDOUT, bufsize=0)
         self.buf = bytearray()
         self.log_path = f'/tmp/loong_kvm_dual_{mode}.log'
+        # 第五十一轮 IO 重构：QEMU 串口 stdout.read(1) 是阻塞的，命令输出吐完后
+        # 要等后台 [task1] 每 10 秒心跳才有新字节，会把固定窗口/send/wait 全部
+        # 卡到 ~10s 一轮（两路累计 >9 分钟被 kill）。改为后台 daemon 线程持续
+        # 抽干 stdout 到 buf，主线程只用「轮询缓冲 + 5ms sleep」等待，彻底解阻塞。
+        self._lock = threading.Lock()
+        self._reader = threading.Thread(target=self._pump, daemon=True)
+        self._reader.start()
 
-    def _read_some(self, seconds):
-        end = time.time() + seconds
-        while time.time() < end:
+    def _pump(self):
+        """后台：把 QEMU 串口输出持续读进 buf（唯一接触 read 的地方）。"""
+        fd = self.proc.stdout
+        while True:
             try:
-                b = self.proc.stdout.read(1)
+                chunk = fd.read(4096)
             except Exception:
                 break
-            if not b:
+            if not chunk:
                 break
-            self.buf.extend(b)
+            with self._lock:
+                self.buf.extend(chunk)
+
+    def _snapshot(self, mark=0):
+        with self._lock:
+            raw = bytes(self.buf[mark:])
+        return raw
 
     def text(self):
-        return ANSI.sub(b'', bytes(self.buf)).decode('utf-8', 'replace')
+        return ANSI.sub(b'', self._snapshot()).decode('utf-8', 'replace')
+
+    def seg(self, mark):
+        """从字节下标 mark 起的增量文本（ANSI 清理后）。"""
+        return ANSI.sub(b'', self._snapshot(mark)).decode('utf-8', 'replace')
+
+    def _read_some(self, seconds):
+        """兼容旧调用：后台线程已在抽数据，这里只让出时间片。"""
+        time.sleep(seconds)
 
     def wait(self, pattern, timeout=30):
         rx = re.compile(pattern)
@@ -128,28 +151,54 @@ class Session:
         while time.time() < end:
             if rx.search(self.text()):
                 return True
-            try:
-                b = self.proc.stdout.read(1)
-            except Exception:
-                break
-            if not b:
-                break
-            self.buf.extend(b)
+            time.sleep(0.005)
         return False
 
     def send(self, line, settle=1.2, wait_prompt=True):
-        mark = len(self.buf)
+        with self._lock:
+            mark = len(self.buf)
         self.proc.stdin.write((line + '\r').encode())
         self.proc.stdin.flush()
         if wait_prompt:
             end = time.time() + settle
             while time.time() < end:
-                self._read_some(0.15)
-                if PROMPT.search(self.text()[len(ANSI.sub(b'', bytes(self.buf[:mark])).decode('utf-8','replace')):]):
+                if PROMPT.search(self.seg(mark)):
                     break
+                time.sleep(0.005)
         else:
-            self._read_some(settle)
-        return ANSI.sub(b'', bytes(self.buf[mark:])).decode('utf-8', 'replace')
+            time.sleep(settle)
+        return self.seg(mark)
+
+    def collect(self, line, end_rx, timeout=25):
+        """发一条命令，等到『该命令输出的结束标记』出现在增量文本里，返回增量。
+
+        第五十一轮：res/bench 输出长且真机有 [net]/[task1] 异步心跳，用固定
+        settle 秒数截断会读到半截（第一次真机 3 项误报）。改为按命令特有的
+        结束行驱动：res 等 SHA256=，bench 等『提示: us』；检测 buf[mark:] 增量
+        而非全量 text，避免第二次 res 被第一次的『SHA256=硬件』提前命中。
+        等待靠后台读线程 + 5ms 轮询，不阻塞、不依赖心跳节奏。
+        """
+        with self._lock:
+            mark = len(self.buf)
+        self.proc.stdin.write((line + '\r').encode())
+        self.proc.stdin.flush()
+        rx = re.compile(end_rx)
+        end = time.time() + timeout
+        while time.time() < end:
+            if rx.search(self.seg(mark)):
+                break
+            time.sleep(0.005)
+        return self.seg(mark)
+
+    def wait_seg(self, mark, pattern, timeout):
+        """轮询『从 mark 起的增量文本』直到出现 pattern，返回是否命中。"""
+        rx = re.compile(pattern)
+        end = time.time() + timeout
+        while time.time() < end:
+            if rx.search(self.seg(mark)):
+                return True
+            time.sleep(0.005)
+        return False
 
     def close(self):
         try:
@@ -214,8 +263,8 @@ def run_mode(mode):
             return res, checks
 
         # 1) res：健康计数（KVM 挂的最直接信号）+ SHA256 模式 + 缓存
-        s.wait(r'\n> |\r\n> ', timeout=6)
-        out = s.send('res', 1.8)
+        #    结束标记 = 最后一行 SHA256=硬件/纯C；不依赖固定时长，真机异步输出也能等全
+        out = s.collect('res', r'SHA256=(?:硬件|纯C)')
         r = parse_res(out)
         res['res'] = r
         ck('res 输出可解析', bool(r), f"SHA256={r.get('sha256_mode')} NISV={r.get('nisv')}")
@@ -225,8 +274,9 @@ def run_mode(mode):
         res['sha256_mode'] = r.get('sha256_mode')
 
         # 2) bench：SHA2 字段 / 硬件哈希 / KDF 与各子项耗时
-        s.wait(r'\n> |\r\n> ', timeout=6)
-        out = s.send('bench', 4.0)
+        #    结束标记 = 末行「提示: us…」；KDF 5 万轮在真机要跑百毫秒级，
+        #    固定 4s 窗口曾导致只解析到 memset/memcpy 而漏掉 KDF
+        out = s.collect('bench', r'提示:\s*us', timeout=30)
         b = parse_bench(out)
         res['bench'] = b
         ck('bench 跑完（SHA256H 未触发未定义异常）', 'KDF 5万轮' in out,
@@ -240,21 +290,20 @@ def run_mode(mode):
         s.wait(r'\n> |\r\n> ', timeout=6)
         out = s.send('su demo', 1.2)
         ck('su demo（root→demo 免口令）', '现在是 demo' in out)
-        # 口令提示不走 shell 提示符，单独处理：发 "su root"，等「口令:」，再喂口令
-        mark = len(s.buf)
+        # 口令提示不走 shell 提示符：发 "su root"，轮询等「口令:」，再喂口令。
+        # 第五十一轮：改用 wait_seg（后台读线程 + 轮询），不再用阻塞 _read_some
+        # 与 ANSI-clean 全量切片（后者在 UEFI 启动日志上会错位）。
+        s.wait(r'\n> |\r\n> ', timeout=6)
+        with s._lock: mark = len(s.buf)
         s.proc.stdin.write(b'su root\r'); s.proc.stdin.flush()
-        got_pw_prompt = False
-        end = time.time() + 6
-        while time.time() < end:
-            s._read_some(0.2)
-            if '口令:' in s.text()[len(ANSI.sub(b'', bytes(s.buf[:mark])).decode('utf-8','replace')):]:
-                got_pw_prompt = True; break
+        got_pw_prompt = s.wait_seg(mark, r'口令:', timeout=10)
         ck('su root 出现口令提示', got_pw_prompt)
         if got_pw_prompt:
-            mark2 = len(s.buf)
+            with s._lock: mark2 = len(s.buf)
             s.proc.stdin.write((PW_ROOT + '\r').encode()); s.proc.stdin.flush()
-            s._read_some(3.0)
-            tail = ANSI.sub(b'', bytes(s.buf[mark2:])).decode('utf-8','replace')
+            # 5 万轮 KDF 真机百毫秒级，轮询等结果串，不靠固定 3 秒
+            s.wait_seg(mark2, r'现在是 root|口令不对', timeout=20)
+            tail = s.seg(mark2)
             ok = '现在是 root' in tail
             ck('硬件 SHA + 800B 异常帧：5万轮 KDF 口令验证通过', ok,
                '成功=三项同时成立（SHA256H 算对 / IRQ 打断时 q0..q31 存对 / 无 data abort）'
@@ -263,10 +312,12 @@ def run_mode(mode):
             # 错误口令拒绝（确认不是「放行了任意口令」的假通过）
             s.wait(r'\n> |\r\n> ', timeout=5)
             s.send('su demo', 1.0)
-            mark3 = len(s.buf)
-            s.proc.stdin.write(b'su root\r'); s.proc.stdin.flush(); s._read_some(1.5)
-            s.proc.stdin.write(b'wrongpw\r'); s.proc.stdin.flush(); s._read_some(2.0)
-            tail3 = ANSI.sub(b'', bytes(s.buf[mark3:])).decode('utf-8','replace')
+            with s._lock: mark3 = len(s.buf)
+            s.proc.stdin.write(b'su root\r'); s.proc.stdin.flush()
+            s.wait_seg(mark3, r'口令:', timeout=10)
+            s.proc.stdin.write(b'wrongpw\r'); s.proc.stdin.flush()
+            s.wait_seg(mark3, r'口令不对|现在是 root', timeout=20)
+            tail3 = s.seg(mark3)
             ck('错误口令被拒（非假通过）', '口令不对' in tail3 and '现在是 root' not in tail3)
             s.send('whoami', 1.0)   # 复位到可继续状态（此时仍是 demo）
 
@@ -282,8 +333,7 @@ def run_mode(mode):
         ck('help 命令清单完整', 'b64out' in out and 'install' in out)
 
         # 收尾再看一次健康（KDF/MMU 之后有没有累积异常）
-        s.wait(r'\n> |\r\n> ', timeout=5)
-        out = s.send('res', 1.8)
+        out = s.collect('res', r'SHA256=(?:硬件|纯C)')
         r2 = parse_res(out)
         res['res_after'] = r2
         ck('全程结束健康计数仍全 0',
