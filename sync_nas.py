@@ -99,6 +99,8 @@ FILES = [
     #     已在上面登记，此处只补本轮新增与修改的文件。
     ('本体/test_desktop_apps.py', '本体/test_desktop_apps.py'),
     ('本体/LOONGOS_DESKTOP_TODO.md', '本体/LOONGOS_DESKTOP_TODO.md'),
+    # 第五十轮：真机/KVM 双路复验准备（供 NAS 侧路线 A 直接取用；零内核源码改动）
+    ('本体/test_kvm_dual.py',     '本体/test_kvm_dual.py'),
 ]
 
 def md5_local(path):
