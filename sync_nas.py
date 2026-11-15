@@ -94,6 +94,11 @@ FILES = [
     # 注：kernel.c / kernel.elf / fs.c / fs.h / bss_budget.txt / golden_behavior.txt /
     #     test_b64_io.py / docs / README.md / ISO / md5 已在上面登记，此处只补漏登项。
     ('手机版/说明.md',            '手机版/说明.md'),
+    # 第四十九轮：桌面首批应用可用性 + 大文件只读保护 + 窗口缩放
+    # 注：desktop.c / kernel.elf / bss_budget.txt / docs / README.md / ISO / md5
+    #     已在上面登记，此处只补本轮新增与修改的文件。
+    ('本体/test_desktop_apps.py', '本体/test_desktop_apps.py'),
+    ('本体/LOONGOS_DESKTOP_TODO.md', '本体/LOONGOS_DESKTOP_TODO.md'),
 ]
 
 def md5_local(path):

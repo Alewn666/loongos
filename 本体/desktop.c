@@ -103,6 +103,10 @@ static int G_open_seq;
 static int G_mx, G_my, G_mprev;
 static int G_drag = -1;                 /* 正在拖动的窗口索引 */
 static int G_drag_dx, G_drag_dy;
+/* P4 窗口缩放：拖右下角手柄改宽高，与标题栏拖动互斥 */
+static int G_resize = -1;               /* 正在缩放的窗口索引 */
+static int G_rz_w0, G_rz_h0;            /* 按下时的窗口宽高 */
+static int G_rz_mx0, G_rz_my0;          /* 按下时的鼠标坐标 */
 static int G_menu_on;
 static int G_cal_on;                    /* 鼠标校准覆盖层是否显示 */
 static int G_cal_done;                  /* 已算出偏移，等待用户点一下返回 */
@@ -246,6 +250,11 @@ static struct gfx_rect close_rect(struct gfx_rect r)
 static struct gfx_rect min_rect(struct gfx_rect r)
 {
     return (struct gfx_rect){r.x + r.w - 48, r.y + 4, 20, 22};
+}
+/* P4 缩放手柄：右下角 14x14，画在内容之上但要避开窗口边框线 */
+static struct gfx_rect resize_rect(struct gfx_rect r)
+{
+    return (struct gfx_rect){r.x + r.w - 14, r.y + r.h - 14, 14, 14};
 }
 
 /* 一条线的包围盒（用于脏矩形相交快速拒绝，避免无谓的 Bresenham 全长度遍历） */
@@ -715,10 +724,28 @@ static void about_draw(struct gfx_rect cr, int f, int w)
                  i==0 ? lines[0] : lines[i], i==0 ? C_BLUE : C_WIN_TEXT, C_TRANSP);
 }
 
-/* —— 文件管理器 —— */
+/* —— 文件管理器 ——
+ * 第四十九轮：补 P3「图形化 ls/cd/cat/write」缺的另一半 —— 新建 / 删除、
+ * 每行大小与选中态。所有按钮都在窗口内容区，绝不往开始菜单加项：
+ * test_launcher.py / test_touch.py 硬编码了菜单项 y 坐标，加项会连锁破坏。 */
 static char fm_path[PATH_CAP] = "/";
 static int  fm_scroll;
 static int  fm_overlong;   /* 上一次进目录因路径过长被拒 → 绘制时给用户可见提示 */
+static int  fm_sel = -1;        /* 当前选中行（含 has_up 偏移），-1 无 */
+static char fm_sel_name[64];    /* 选中项名字（删除用） */
+static int  fm_sel_isdir;
+static int  fm_del_armed;       /* 删除二次确认，10 秒内再点一次才真删 */
+static u64  fm_arm_tick;
+static int  fm_newseq;          /* 自动命名序号 */
+static char fm_notice[96];      /* 操作结果，约 2 秒后消失 */
+static int  fm_notice_ttl;
+static void fm_say(const char *s)
+{
+    int i = 0;
+    while (s[i] && i < (int)sizeof(fm_notice) - 1) { fm_notice[i] = s[i]; i++; }
+    fm_notice[i] = 0;
+    fm_notice_ttl = 20;
+}
 static int my_strcmp(const char *a, const char *b){ while(*a&&*a==*b){a++;b++;} return (int)(unsigned char)*a-(int)(unsigned char)*b; }
 static int my_strcmp_eq(const char *a, const char *b){ return my_strcmp(a,b)==0; }
 /* 第三十六轮修 H1：统一走 path.h 的带 cap 拼接，返回 -1 表示会越界（拒绝，不写） */
@@ -751,13 +778,30 @@ static void fm_draw_cb(const struct dirent *d, int ino, void *arg)
     int yy = c->y0 + (ri - c->scroll) * c->rowh;
     if (yy > c->cr.y + c->cr.h - 16) return;
     int isdir = fs_isdir(ino);
+    if (ri == fm_sel)       /* 选中底色先画，文字再叠上去 */
+        gfx_fill((struct gfx_rect){c->cr.x + 10, yy - 2, c->cr.w - 20, 18},
+                 GFX_RGB(214, 228, 246));
     char nm[72]; int n=0; nm[n++]=' ';
     if (isdir) nm[n++]='[';
     int i=0; while (d->name[i] && n<69) nm[n++]=d->name[i++];  /* 留 2 字节给 ']' 和 NUL */
     if (isdir && n < 71) nm[n++]=']';
     nm[n]=0;
     gfx_text(c->cr.x + 16, yy, nm, isdir ? C_BLUE : C_WIN_TEXT, C_TRANSP);
+    if (!isdir) {           /* 右侧显示大小，便于判断是否适合在编辑器里编辑 */
+        char sz[24];
+        int m = my_itoa(sz, (long)fs_filesize(ino));
+        sz[m++] = 'B'; sz[m] = 0;
+        int tw = gfx_text_w(sz);
+        gfx_text(c->cr.x + c->cr.w - 16 - tw, yy, sz, C_WIN_DIM, C_TRANSP);
+    }
 }
+
+/* 工具栏按钮（内容区局部坐标，三个并排） */
+#define FM_BTN_Y   26
+#define FM_BTN_H   22
+#define FM_BTN_W   72
+static int fm_btn_x(int i){ return 8 + i * (FM_BTN_W + 6); }
+
 static void fm_draw(struct gfx_rect cr, int f, int w)
 {
     (void)f;(void)w;
@@ -766,8 +810,18 @@ static void fm_draw(struct gfx_rect cr, int f, int w)
         gfx_text(cr.x + 10, cr.y + 6, "路径过长，已拒绝进入（上限 160 字节）", C_RED, C_TRANSP);
     else
         gfx_text(cr.x + 10, cr.y + 6, fm_path, C_WIN_TEXT, C_TRANSP);
-    gfx_rect_draw((struct gfx_rect){cr.x+8, cr.y+24, cr.w-16, cr.h-32}, GFX_RGB(200,210,224),1);
-    int y0 = cr.y + 30, rowh = 20;
+    if (fm_notice[0])
+        gfx_text(cr.x + cr.w - 16 - gfx_text_w(fm_notice), cr.y + 6,
+                 fm_notice, fm_del_armed ? C_RED : C_TEAL, C_TRANSP);
+
+    app_button(cr, fm_btn_x(0), FM_BTN_Y, FM_BTN_W, FM_BTN_H, "新建文件", C_BTN);
+    app_button(cr, fm_btn_x(1), FM_BTN_Y, FM_BTN_W, FM_BTN_H, "新建目录", C_BTN);
+    app_button(cr, fm_btn_x(2), FM_BTN_Y, FM_BTN_W, FM_BTN_H,
+               fm_del_armed ? "确认删除" : "删除", fm_del_armed ? C_RED : C_BTN);
+
+    int y0 = cr.y + 54, rowh = 20;
+    gfx_rect_draw((struct gfx_rect){cr.x+8, cr.y+48, cr.w-16, cr.h-56},
+                  GFX_RGB(200,210,224),1);
     int ino = fs_lookup(fm_path);
     int has_up = my_strcmp_eq(fm_path, "/") ? 0 : 1;
     if (has_up)
@@ -780,17 +834,68 @@ static void fm_draw(struct gfx_rect cr, int f, int w)
     }
     gfx_clip_pop();
 }
+
+/* 自动命名：新建文件N.txt / 新建目录N；重名就递增序号重试，不引入文本输入框 */
+static int fm_new(const char *prefix, const char *suffix, int dir)
+{
+    for (int k = 0; k < 32; k++) {
+        char nm[48]; int n = 0;
+        const char *p = prefix; while (*p) nm[n++] = *p++;
+        n += my_itoa(nm + n, (long)(++fm_newseq));
+        p = suffix; while (*p) nm[n++] = *p++;
+        nm[n] = 0;
+        char full[PATH_CAP];
+        if (fm_full(full, sizeof full, nm) < 0) { fm_say("路径过长"); return -1; }
+        int rc = dir ? fs_mkdir(full) : fs_createfile(full);
+        if (rc > 0) { fm_say(dir ? "已建目录" : "已建文件"); fm_del_armed = 0; return 0; }
+        if (rc == FS_DENIED) { fm_say("权限不够"); return -1; }
+    }
+    fm_say("建不了（重名？）");
+    return -1;
+}
+
+static void fm_del(void)
+{
+    if (fm_sel < 0 || fm_sel_name[0] == 0) { fm_say("先点选一项"); fm_del_armed = 0; return; }
+    if (!fm_del_armed || tick - fm_arm_tick > 100) {
+        fm_del_armed = 1; fm_arm_tick = tick; fm_say("再点一次确认删除");
+        gfx_damage(full_screen());
+        return;
+    }
+    fm_del_armed = 0;
+    char full[PATH_CAP];
+    if (fm_full(full, sizeof full, fm_sel_name) < 0) { fm_say("路径过长"); return; }
+    if (fs_unlink(full) == 0) {
+        fm_say(fm_sel_isdir ? "已删目录" : "已删文件");
+        fm_sel = -1; fm_sel_name[0] = 0;
+    } else {
+        fm_say("删不了（非空或权限）");
+    }
+    gfx_damage(full_screen());
+}
+
 static void fm_press(struct gfx_rect cr, int lx, int ly, int w)
 {
     (void)w;
-    if (lx < 8 || lx > cr.w - 8 || ly < 30) return;
-    int row = fm_scroll + (ly - 30) / 20;
+    /* 工具栏优先命中 */
+    if (app_hit(lx, ly, fm_btn_x(0), FM_BTN_Y, FM_BTN_W, FM_BTN_H)) {
+        fm_new("新建文件", ".txt", 0); gfx_damage(full_screen()); return;
+    }
+    if (app_hit(lx, ly, fm_btn_x(1), FM_BTN_Y, FM_BTN_W, FM_BTN_H)) {
+        fm_new("新建目录", "", 1); gfx_damage(full_screen()); return;
+    }
+    if (app_hit(lx, ly, fm_btn_x(2), FM_BTN_Y, FM_BTN_W, FM_BTN_H)) {
+        fm_del(); gfx_damage(full_screen()); return;
+    }
+    if (lx < 8 || lx > cr.w - 8 || ly < 54) return;
+    int row = fm_scroll + (ly - 54) / 20;
     int ino = fs_lookup(fm_path);
     int has_up = my_strcmp_eq(fm_path, "/") ? 0 : 1;
     if (has_up && row == 0) {                 /* 上级目录 */
         char tmp[PATH_CAP];
         if (path_parent(tmp, sizeof tmp, fm_path) > 0) {
             my_strcpy(fm_path, tmp); fm_scroll = 0; fm_overlong = 0;
+            fm_sel = -1; fm_sel_name[0] = 0; fm_del_armed = 0;
         }
         gfx_damage(full_screen());
         return;
@@ -805,8 +910,17 @@ static void fm_press(struct gfx_rect cr, int lx, int ly, int w)
         fm_overlong = 1; gfx_damage(full_screen()); return;
     }
     fm_overlong = 0;
+    /* 选中态：删除按钮作用于最后一次点选的项；不改变原有单击行为 */
+    fm_sel = row;
+    {
+        int i = 0; while (f.name[i] && i < 63) { fm_sel_name[i] = f.name[i]; i++; }
+        fm_sel_name[i] = 0;
+    }
+    fm_sel_isdir = f.isdir;
+    fm_del_armed = 0;
     if (f.isdir) {
         my_strcpy(fm_path, full); fm_scroll = 0;   /* full 与 fm_path 同为 PATH_CAP */
+        fm_sel = -1; fm_sel_name[0] = 0;          /* 进目录后清空选中 */
     } else {
         my_strcpy(G_launch_path, full);            /* 两者同为 PATH_CAP */
         open_app(A_EDIT);
@@ -815,60 +929,158 @@ static void fm_press(struct gfx_rect cr, int lx, int ly, int w)
 }
 static void fm_scroll_h(int dy, int w){ (void)w; fm_scroll += (dy>0?-3:3); if(fm_scroll<0) fm_scroll=0; gfx_damage(full_screen()); }
 
-/* —— 文本编辑器 / 查看器 —— */
+/* —— 文本编辑器 / 查看器 ——
+ * 第四十九轮：修两个真实缺陷（承接第四十八轮「b64 通道可传 2MB 中文文件」）
+ *  ① 原 ed_buf[1500] 只读文件前 1499B 却不提示，点「保存」会 fs_setfile 把
+ *     大文件截断重写 —— 传进来的大文件一打开再保存就被静默毁掉。现在按
+ *     fs_filesize 判真实大小，超限进入只读模式，绝不写回。
+ *  ② 原 ed_draw 逐字节把 &ed_buf[start+k] 当 ASCII 画，UTF-8 中文必然乱码；
+ *     gfx_text 本身早已支持 UTF-8 / CJK 双宽，改为按码点绘制。
+ *  中文输入仍不支持（USB HID 键盘只产 ASCII、无输入法），故含非 ASCII 的文件
+ *  一律只读查看：能正确显示，但不允许 ASCII 编辑插坏多字节序列。 */
+#define ED_CAP 4096
 static char ed_path[PATH_CAP] = "/未命名.txt";  /* 与 G_launch_path 同为 PATH_CAP，ed_load 拷贝安全 */
-static char ed_buf[1500];
+static char ed_buf[ED_CAP];
 static int  ed_len;
 static int  ed_cur;
 static int  ed_scroll;
 static int  ed_dirty;
-static int  ed_msg_t;     /* >0 时显示「已保存」 */
+static int  ed_msg;        /* 0 无 / 1 已保存 / 2 只读未保存 / 3 保存失败 */
+static int  ed_msg_ttl;    /* 提示剩余 tick 数（10Hz），约 2 秒后自动消失 */
+static int  ed_readonly;   /* 1 = 只读，禁止编辑与保存 */
+static int  ed_ro_size;    /* 只读原因 ① 的真实字节数 */
+static int  ed_ro_reason;  /* 1 文件超过 ED_CAP / 2 含非 ASCII */
+
+/* 统一设置提示并显示约 2 秒。原实现每个 tick（100ms）就清掉「已保存」，
+   用户点完按钮根本看不见反馈；这里给一个稳定的可见窗口。 */
+static void ed_set_msg(int m)
+{
+    ed_msg = m;
+    ed_msg_ttl = m ? 20 : 0;
+}
+
+/* 返回 s 处一个 UTF-8 码点占几字节；非法序列 / 嵌入 NUL 一律按 1 字节处理，
+   保证绘制循环永不越界、永不死循环。gfx_text 内部另有独立的 u8_next 解码。 */
+static int ed_u8_len(const unsigned char *s, int left)
+{
+    unsigned char b = s[0];
+    if (b < 0x80) return 1;
+    int need;
+    if      ((b & 0xE0) == 0xC0) need = 1;
+    else if ((b & 0xF0) == 0xE0) need = 2;
+    else if ((b & 0xF8) == 0xF0) need = 3;
+    else return 1;
+    if (need + 1 > left) return 1;
+    for (int i = 1; i <= need; i++)
+        if ((s[i] & 0xC0) != 0x80) return 1;
+    return need + 1;
+}
+
 static void ed_load(void)
 {
-    ed_len = 0; ed_buf[0] = 0; ed_cur = 0; ed_dirty = 0; ed_msg_t = 0;
+    ed_len = 0; ed_buf[0] = 0; ed_cur = 0; ed_dirty = 0; ed_set_msg(0);
+    ed_scroll = 0; ed_readonly = 0; ed_ro_reason = 0; ed_ro_size = 0;
     if (G_launch_path[0]) my_strcpy(ed_path, G_launch_path);
     else my_strcpy(ed_path, "/未命名.txt");
     G_launch_path[0] = 0;
+
     int ino = fs_lookup(ed_path);
-    if (ino > 0 && fs_filetype(ino) == FS_T_FILE) {
-        int n = fs_readfile(ino, (u8*)ed_buf, sizeof(ed_buf) - 1);
-        if (n > 0) { ed_len = n; ed_buf[n] = 0; ed_cur = n; }
+    if (ino <= 0 || fs_filetype(ino) != FS_T_FILE) return;   /* 新文件：可编辑 */
+
+    int sz = fs_filesize(ino);
+    if (sz < 0) sz = 0;
+    if (sz > (int)sizeof(ed_buf) - 1) {
+        /* 超限：只读显示前缀，绝不 fs_setfile 截断原文件 */
+        ed_readonly = 1; ed_ro_reason = 1; ed_ro_size = sz;
+        int n = fs_readat(ino, 0, (u8 *)ed_buf, sizeof(ed_buf) - 1);
+        if (n > 0) { ed_len = n; ed_buf[n] = 0; }
+        ed_cur = 0;
+        return;
+    }
+    int n = fs_readfile(ino, (u8 *)ed_buf, sizeof(ed_buf) - 1);
+    if (n > 0) { ed_len = n; ed_buf[n] = 0; ed_cur = n; }
+    /* 含非 ASCII 或嵌入 NUL：只读查看，避免 ASCII 编辑插坏 UTF-8 多字节序列 */
+    for (int i = 0; i < ed_len; i++) {
+        if ((unsigned char)ed_buf[i] >= 0x80 || ed_buf[i] == 0) {
+            ed_readonly = 1; ed_ro_reason = 2; ed_cur = 0;
+            break;
+        }
     }
 }
+
 static void ed_save(void)
 {
+    if (ed_readonly) { ed_set_msg(2); return; }   /* 绝不写回，保住原文件 */
     int ino = fs_lookup(ed_path);
     if (ino <= 0) fs_createfile(ed_path);
     ino = fs_lookup(ed_path);
-    if (ino > 0) { fs_setfile(ino, (u8*)ed_buf, (u32)ed_len); ed_dirty = 0; ed_msg_t = 1; }
+    if (ino <= 0) { ed_set_msg(3); return; }
+    if (fs_setfile(ino, (u8 *)ed_buf, (u32)ed_len) == 0) {
+        ed_dirty = 0; ed_set_msg(1);
+    } else {
+        ed_set_msg(3);   /* 权限不足 / 盘满：不再谎报「已保存」 */
+    }
 }
 static void ed_draw(struct gfx_rect cr, int f, int w)
 {
     (void)f;(void)w;
     gfx_clip_push(cr);
     gfx_text(cr.x + 8, cr.y + 6, ed_path, C_WIN_TEXT, C_TRANSP);
-    if (ed_dirty) gfx_text(cr.x + cr.w - 20, cr.y + 6, "*", C_RED, C_TRANSP);
-    if (ed_msg_t) gfx_text(cr.x + cr.w - 70, cr.y + 6, "已保存", C_TEAL, C_TRANSP);
-    app_button(cr, cr.w - 78, 2, 70, 22, "保存", C_BTN);
-    int x0 = cr.x + 8, y0 = cr.y + 32, maxw = cr.w - 16;
-    int cpl = maxw / 8;
+    if (!ed_readonly && ed_dirty)
+        gfx_text(cr.x + cr.w - 20, cr.y + 6, "*", C_RED, C_TRANSP);
+    app_button(cr, cr.w - 78, 2, 70, 22, ed_readonly ? "只读" : "保存",
+               ed_readonly ? C_TITLE_DIM : C_BTN);
+
+    /* 第二行：左侧只读原因，右侧瞬时状态；两者分区，不盖住正文 */
+    int y0 = cr.y + 32;
+    if (ed_readonly) {
+        char hint[96]; int n = 0;
+        const char *p = "只读·"; while (*p) hint[n++] = *p++;
+        if (ed_ro_reason == 1) {
+            p = "文件太大 "; while (*p) hint[n++] = *p++;
+            n += my_itoa(hint + n, (long)ed_ro_size);
+            hint[n++] = 'B'; hint[n++] = '>';
+            n += my_itoa(hint + n, (long)sizeof(ed_buf) - 1);
+            hint[n++] = 'B';
+        } else {
+            p = "含中文，仅查看"; while (*p) hint[n++] = *p++;
+        }
+        hint[n] = 0;
+        gfx_text(cr.x + 8, cr.y + 24, hint, C_ORANGE, C_TRANSP);
+        y0 = cr.y + 46;                 /* 提示占一行，正文整体下移 */
+    }
+    if      (ed_msg == 1) gfx_text(cr.x + cr.w - 96,  cr.y + 24, "已保存",     C_TEAL, C_TRANSP);
+    else if (ed_msg == 2) gfx_text(cr.x + cr.w - 120, cr.y + 24, "只读，未保存", C_RED,  C_TRANSP);
+    else if (ed_msg == 3) gfx_text(cr.x + cr.w - 96,  cr.y + 24, "保存失败",   C_RED,  C_TRANSP);
+
+    int x0 = cr.x + 8, maxw = cr.w - 16;
     int row = 0, start = 0, curx = -1, cury = -1;
     for (int i = 0; i <= ed_len; i++) {
-        if (i == ed_len || ed_buf[i] == '\n') {
-            if (row >= ed_scroll) {
-                int yy = y0 + (row - ed_scroll) * 18;
-                if (yy > cr.y + cr.h - 18) break;
-                int n = i - start; if (n > cpl) n = cpl;
-                /* 计算光标位置（若在本行） */
-                if (ed_cur >= start && ed_cur <= i) {
-                    curx = x0 + (ed_cur - start) * 8;
-                    cury = yy;
+        if (i != ed_len && ed_buf[i] != '\n') continue;
+        if (row >= ed_scroll) {
+            int yy = y0 + (row - ed_scroll) * 18;
+            if (yy > cr.y + cr.h - 18) break;
+            int px = x0, k = start, line_curx = -1;
+            int cur_in_line = (ed_cur >= start && ed_cur <= i);
+            while (k < i) {
+                int bl = ed_u8_len((const unsigned char *)ed_buf + k, i - k);
+                char one[5];
+                int cw;
+                if (ed_buf[k] == 0) { one[0] = '?'; one[1] = 0; cw = 8; }
+                else {
+                    for (int t = 0; t < bl; t++) one[t] = ed_buf[k + t];
+                    one[bl] = 0;
+                    cw = (bl == 1) ? 8 : 16;    /* ASCII 8px，其余 16px 双宽 */
                 }
-                for (int k = 0; k < n; k++)
-                    gfx_text(x0 + k*8, yy, &ed_buf[start + k], C_WIN_TEXT, C_TRANSP);
+                if (px + cw > x0 + maxw) break; /* 行尾按像素截断，不再按字节数 */
+                if (cur_in_line && ed_cur >= k && ed_cur < k + bl) line_curx = px;
+                px = gfx_text(px, yy, one, C_WIN_TEXT, C_TRANSP);
+                k += bl;
             }
-            start = i + 1; row++;
+            if (cur_in_line && line_curx < 0) line_curx = px;   /* 行尾光标 */
+            if (line_curx >= 0) { curx = line_curx; cury = yy; }
         }
+        start = i + 1; row++;
     }
     if (curx >= 0 && cury >= 0)
         gfx_fill((struct gfx_rect){curx, cury, 8, 16}, C_BLUE);
@@ -882,20 +1094,21 @@ static void ed_press(struct gfx_rect cr, int lx, int ly, int w)
 static void ed_key(char c, int w)
 {
     (void)w;
+    if (ed_readonly) return;   /* 只读：任何键都不碰缓冲，绝不插坏 UTF-8 序列 */
     if (c == '\b' || c == 0x7f) {                 /* 退格 */
         if (ed_cur > 0) {
             for (int i = ed_cur; i < ed_len; i++) ed_buf[i-1] = ed_buf[i];
-            ed_len--; ed_cur--; ed_dirty = 1; ed_msg_t = 0;
+            ed_len--; ed_cur--; ed_dirty = 1; ed_set_msg(0);
         }
     } else if (c == '\n' || c == '\r') {
         if (ed_len < (int)sizeof(ed_buf) - 1) {
             for (int i = ed_len; i > ed_cur; i--) ed_buf[i] = ed_buf[i-1];
-            ed_buf[ed_cur++] = '\n'; ed_len++; ed_dirty = 1; ed_msg_t = 0;
+            ed_buf[ed_cur++] = '\n'; ed_len++; ed_dirty = 1; ed_set_msg(0);
         }
     } else if (c >= 0x20 && c < 0x7f) {          /* 可打印 ASCII */
         if (ed_len < (int)sizeof(ed_buf) - 1) {
             for (int i = ed_len; i > ed_cur; i--) ed_buf[i] = ed_buf[i-1];
-            ed_buf[ed_cur++] = c; ed_len++; ed_dirty = 1; ed_msg_t = 0;
+            ed_buf[ed_cur++] = c; ed_len++; ed_dirty = 1; ed_set_msg(0);
         }
     }
     gfx_damage(full_screen());
@@ -988,6 +1201,11 @@ static void draw_one_win(int k, int focused)
     gfx_fill((struct gfx_rect){r.x + 1, r.y + TITLE_H, r.w - 2, 2}, G_apps[w->app_id]->accent);
     if (G_apps[w->app_id]->draw) G_apps[w->app_id]->draw(content, focused, k);
     gfx_clip_pop();
+    /* P4：右下角缩放手柄（内容之上），三个沿对角线的白点提示可拖 */
+    struct gfx_rect hz = resize_rect(r);
+    gfx_fill(hz, focused ? G_apps[w->app_id]->accent : C_TITLE_DIM);
+    for (int i = 0; i < 3; i++)
+        gfx_fill((struct gfx_rect){hz.x + 3 + i * 3, hz.y + 10 - i * 3, 2, 2}, C_WHITE);
 }
 
 /* 脏矩形感知：只绘制与脏区 r 相交（含阴影）的窗口，按 z 序保证遮挡正确 */
@@ -1201,6 +1419,13 @@ static void handle_press(void)
         return;
     }
     focus_win(wi);
+    /* P4：缩放手柄优先于内容区，避免被 App 的 press 当成普通点击吃掉 */
+    if (gfx_hit(resize_rect(r), x, y)) {
+        G_resize = wi;
+        G_rz_w0 = r.w; G_rz_h0 = r.h;
+        G_rz_mx0 = x; G_rz_my0 = y;
+        return;
+    }
     if (y < r.y + TITLE_H) {
         G_drag = wi; G_drag_dx = x - r.x; G_drag_dy = y - r.y;
         return;
@@ -1237,13 +1462,21 @@ static int poll_mouse(void)
             /* 只重画窗口旧∪新包围盒（含阴影），不再整屏 —— 彻底消除拖动卡顿 */
             gfx_damage(gfx_union(old, win_extent(G_drag)));
         }
+        if (G_resize >= 0 && moved) {
+            struct gfx_rect *r = &G_win[G_resize].r;
+            struct gfx_rect old = win_extent(G_resize);
+            r->w = G_rz_w0 + (G_mx - G_rz_mx0);
+            r->h = G_rz_h0 + (G_my - G_rz_my0);
+            clamp_win(r);          /* 最小 120x96、不越出屏幕，与开窗约束一致 */
+            gfx_damage(gfx_union(old, win_extent(G_resize)));
+        }
     }
     int st;
     while (mouse_pop_btn(&st)) {
         int pressed  = (st & 1) && !(G_mprev & 1);
         int released = !(st & 1) && (G_mprev & 1);
         if (pressed)  handle_press();
-        if (released) G_drag = -1;
+        if (released) { G_drag = -1; G_resize = -1; }
         G_mprev = st;
         changed = 1;
     }
@@ -1356,7 +1589,16 @@ void desktop_run(void)
             net_poll();
             u64 sec = tick / 10;
             if (sec != G_last_sec) { G_last_sec = sec; gfx_damage(clock_rect()); input = 1; }
-            if (ed_msg_t) { ed_msg_t = 0; gfx_damage(full_screen()); }
+            if (ed_msg_ttl > 0 && --ed_msg_ttl == 0) {
+                ed_msg = 0; gfx_damage(full_screen());
+            }
+            /* 文件管理器提示 2 秒后消失；删除二次确认 10 秒后自动解除，避免误删 */
+            if (fm_notice_ttl > 0 && --fm_notice_ttl == 0) {
+                fm_notice[0] = 0; gfx_damage(full_screen());
+            }
+            if (fm_del_armed && tick - fm_arm_tick > 100) {
+                fm_del_armed = 0; gfx_damage(full_screen());
+            }
             /* 安装二次确认 10 秒（100 tick）后自动解除，避免误装 */
             if (G_install_armed && tick - G_arm_tick > 100) {
                 G_install_armed = 0; gfx_damage(full_screen()); input = 1;
