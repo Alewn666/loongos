@@ -90,6 +90,10 @@ FILES = [
     # 第四十七轮收尾：ESP 写抖动的「同请求重踢 + 三次重试」修复
     # （.o 为构建中间产物，沿用清单惯例不登记，只同步源码与 kernel.elf / ISO / md5）
     ('本体/virtio_blk.c',         '本体/virtio_blk.c'),
+    # 第四十八轮：b64 通道去掉 4KB 上限（流式写盘 + 临时文件原子替换）
+    # 注：kernel.c / kernel.elf / fs.c / fs.h / bss_budget.txt / golden_behavior.txt /
+    #     test_b64_io.py / docs / README.md / ISO / md5 已在上面登记，此处只补漏登项。
+    ('手机版/说明.md',            '手机版/说明.md'),
 ]
 
 def md5_local(path):

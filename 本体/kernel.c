@@ -869,7 +869,12 @@ static void hb_puthex(u64 v)
    终端一次性粘贴时 ring_push 会「满则丢弃」，把行中间的字符甚至行结束符 '\r'
    一起丢掉 —— 表现为多行被拼成一行、内容静默损坏。256 可容 3 行折行 + 余量。
    仍有溢出可能，故配套 ring_dropped：b64in 检测到丢字符就拒绝写文件。 */
-#define RING_SZ 1024
+/* 第四十八轮：1KB → 8KB。b64in 改成流式写盘后，每攒满 4KB 会做一次块写
+   （磁盘模式下是 virtio 往返），这段时间不取环；1KB 环在一次性粘贴大 base64
+   时几乎必然被 ISR 灌满并丢字符，触发「明确放弃」。8KB 给写盘留出足够窗口，
+   ring_dropped 这道安全网仍然保留（真溢出依旧拒绝写半截文件）。
+   代价：ring + ring_src 两个数组共 +14KB BSS，余量 44KB → 30KB，仍充裕。 */
+#define RING_SZ 8192
 static volatile u32  ring_dropped;      /* 输入溢出丢弃累计（b64in 每次进入清零） */
 static volatile char ring[RING_SZ];
 /* 来源标记（桌面 P1）：0 = UART 串口控制台，1 = USB 键盘。
@@ -3594,9 +3599,64 @@ static void cmd_head(char *a)
    b64out：把文件编成 76 字符折行的纯文本，串口/图形终端复制即可带出系统。
    b64in ：粘贴同样的文本还原成文件。
    没有 U 盘驱动（USB 只做 HID）、没有应用层传输协议，这是最通用的通道。
-   BSS 预算：只加 4KB 静态解码缓冲；b64out 走流式分块，不再申请 5.5KB 编码缓冲。 */
+
+   第四十八轮：去掉 4KB 上限。b64in 不再把整个文件攒进静态缓冲，而是逐行解码、
+   攒满 FS_BLOCK 就 fs_append 落一次盘；先写同目录 .b64tmp 临时文件，全部成功
+   （含帧头/帧尾的总字节数校验）后才 unlink 目标 + rename 替换，因此粘贴失败时
+   目标文件原封不动，也不会留下半截文件。b64out 同步去掉截断并加帧标记。
+   BSS 预算：复用原来的 4KB b64_scratch 作块缓冲，fs 侧不新增缓冲；
+   只把输入 ring 从 1KB 提到 8KB（见 RING_SZ）。 */
 #define B64_LIMIT 4096
 static unsigned char b64_scratch[B64_LIMIT];
+
+/* 同目录临时文件：/a/b/file → /a/b/.b64tmp。刻意放同目录，避免依赖 /tmp
+   是否存在，也让「建文件要看父目录权限」与原实现完全一致。 */
+static int b64_tmp_path(const char *rp, char *out, int cap)
+{
+    int last = -1;
+    for (int i = 0; rp[i]; i++) if (rp[i] == '/') last = i;
+    static const char suf[] = ".b64tmp";
+    int dlen = last + 1;                       /* 目录部分长度，含末尾 '/' */
+    if (dlen + (int)sizeof(suf) > cap) return -1;
+    for (int i = 0; i < dlen; i++) out[i] = rp[i];
+    for (int i = 0; i < (int)sizeof(suf); i++) out[dlen + i] = suf[i];
+    return 0;
+}
+
+/* 识别 "-- LOONGOS-B64 BEGIN <n> --" / "-- LOONGOS-B64 END <n> --"。
+   is_end: 0=BEGIN 1=END；size 回填声明的字节数；返回 0 表示不是帧行。
+   这两行含空格与连字符，不满足 b64_lines() 的纯 base64 正则，天然被旧脚本过滤；
+   不带帧的手工粘贴 / 老脚本仍完全兼容（那时不做总数校验）。 */
+static int b64_frame(const char *ln, int *is_end, u32 *size)
+{
+    static const char pre[] = "-- LOONGOS-B64 ";
+    int i = 0;
+    while (pre[i]) { if (ln[i] != pre[i]) return 0; i++; }
+    if (ln[i] == 'B' && ln[i+1] == 'E' && ln[i+2] == 'G' && ln[i+3] == 'I' && ln[i+4] == 'N') {
+        *is_end = 0; i += 5;
+    } else if (ln[i] == 'E' && ln[i+1] == 'N' && ln[i+2] == 'D') {
+        *is_end = 1; i += 3;
+    } else return 0;
+    if (ln[i] != ' ') return 0;
+    i++;
+    u32 v = 0; int any = 0;
+    while (ln[i] >= '0' && ln[i] <= '9') {
+        v = v * 10 + (u32)(ln[i] - '0'); any = 1; i++;
+    }
+    if (!any) return 0;
+    *size = v;
+    return 1;
+}
+
+/* 攒满一块就落盘；错误文案集中在这里，避免主循环里重复 */
+static int b64_flush(int ino, const u8 *buf, u32 n)
+{
+    if (!n) return 0;
+    int r = fs_append(ino, buf, n);
+    if (r == FS_DENIED) { uart_puts("权限不够：临时文件不是你的\n"); return -1; }
+    if (r < 0) { uart_puts("写失败（盘满？）\n"); return -1; }
+    return 0;
+}
 
 static void cmd_b64out(char *a)
 {
@@ -3606,16 +3666,17 @@ static void cmd_b64out(char *a)
     int ino = fs_lookup(rp);
     if (ino < 0) { uart_puts("没有这个文件: "); uart_puts(rp); uart_puts("\n"); return; }
     if (fs_isdir(ino)) { uart_puts(a); uart_puts(" 是目录\n"); return; }
+    int fsz = fs_filesize(ino);
+    if (fsz < 0) { uart_puts("读失败\n"); return; }
+    uart_puts("-- LOONGOS-B64 BEGIN "); uart_putdec((u32)fsz); uart_puts(" --\n");
     /* 流式：每 57 字节(=3*19) 编成 76 字符一行，只有末块带 '=' 填充。
-       输出走 uart_putc 唯一总闸，因此也支持 `b64out x > out.txt`（受 2KB 重定向缓冲限制）。 */
+       输出走 uart_putc 唯一总闸，因此也支持 `b64out x > out.txt`（受 2KB 重定向缓冲限制）。
+       第四十八轮去掉 off >= B64_LIMIT 的截断，一直读到文件末尾。 */
     u8 raw[57];
     char enc[80];
     u32 off = 0, total = 0;
     for (;;) {
-        if (off >= B64_LIMIT) { uart_puts("(已达 4KB 上限，其余未导出)\n"); break; }
-        u32 want = B64_LIMIT - off;
-        if (want > sizeof raw) want = (u32)sizeof raw;
-        int n = fs_readat(ino, off, raw, want);
+        int n = fs_readat(ino, off, raw, (u32)sizeof raw);
         if (n == FS_DENIED) { uart_puts("权限不够：私密文件，只有属主和 root 能看\n"); return; }
         if (n < 0)  { uart_puts("读失败\n"); return; }
         if (n == 0) break;
@@ -3624,6 +3685,7 @@ static void cmd_b64out(char *a)
         uart_puts("\n");
         off += (u32)n; total += (u32)n;
     }
+    uart_puts("-- LOONGOS-B64 END "); uart_putdec(total); uart_puts(" --\n");
     uart_puts("-- "); uart_putdec(total);
     uart_puts(" 字节文件的 base64；复制后 b64in 还原 --\n");
 }
@@ -3631,20 +3693,40 @@ static void cmd_b64out(char *a)
 static void cmd_b64in(char *a)
 {
     if (!a || !*a) { uart_puts("用法: b64in <路径>  （随后逐行粘贴 base64，空行或 . 结束）\n"); return; }
-    char rp[128];
+    char rp[128], tp[128];
     if (path_resolve(a, rp, sizeof rp) < 0) { uart_puts("路径太长\n"); return; }
+    if (b64_tmp_path(rp, tp, sizeof tp) < 0) { uart_puts("路径太长\n"); return; }
+
+    /* 先清掉上次失败可能残留的临时文件，再建干净空文件。之所以不能像旧版那样
+       「输入全部合法之后才动文件系统」，是因为现在要边收边写盘；作为补偿，
+       所有失败路径都 unlink 掉临时文件，真正的目标文件自始至终没被碰过。 */
+    if (fs_lookup(tp) >= 0) fs_unlink(tp);
+    int tino = fs_createfile(tp);
+    if (tino == FS_DENIED) { uart_puts("权限不够：父目录不是你的\n"); return; }
+    if (tino < 0) { uart_puts("建不了临时文件（父目录缺 / 目录满？）\n"); return; }
+
     uart_puts("粘贴 base64（每行字符数为 4 的倍数；单独一行 . 或空行结束）：\n");
     ring_dropped = 0;                /* 只统计本次粘贴，开机以来的旧溢出不算 */
     unsigned char *dec = b64_scratch;
-    int got = 0, bad = 0;
+    unsigned char line_dec[160];     /* 一行最多 158 字符 → 最多 118 字节，够 */
+    int got = 0, bad = 0;            /* got = 当前 4KB 块内已攒字节 */
+    u32 total = 0, want = 0, end_size = 0;
+    int saw_begin = 0, saw_end = 0;
     char ln[160];
     for (;;) {
         /* hidden=1：粘贴期间**不回显**。回显要占用串口 TX，而 TX 是轮询等待
            FR_TXFF 的——一旦 pty 输出缓冲被回显灌满，uart_putc 会自旋等 TX，
-           卡住 blocking_getline 取环，输入环被 ISR 持续灌入而溢出丢字符（表现为
-           长 base64 折行传到一半静默损坏）。不回显后取环极快，正常/快速粘贴都不丢。 */
+           卡住 blocking_getline 取环，输入环被 ISR 持续灌入而溢出丢字符。 */
         blocking_getline(ln, sizeof ln, 1);
         if (ln[0] == 0 || (ln[0] == '.' && ln[1] == 0)) break;
+
+        /* 帧头/帧尾不参与解码，也不做 4 倍数校验 */
+        int is_end = 0; u32 fsz = 0;
+        if (b64_frame(ln, &is_end, &fsz)) {
+            if (is_end) { saw_end = 1; end_size = fsz; }
+            else        { saw_begin = 1; want = fsz; }
+            continue;
+        }
         /* 传输中已有字符被输入环丢弃：宁可放弃也不写半截/坏文件 */
         if (ring_dropped) {
             uart_puts("输入在传输中丢失（请放慢 / 逐行粘贴），已放弃\n");
@@ -3656,27 +3738,45 @@ static void cmd_b64in(char *a)
         for (char *p = ln; *p; p++)
             if (*p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') q++;
         if ((q & 3) != 0) { uart_puts("本行字符数不是 4 的倍数，请按 76 字符折行粘贴\n"); bad = 1; break; }
-        int room = B64_LIMIT - got;
-        if (room <= 0) { uart_puts("超过 4KB 上限\n"); bad = 1; break; }
-        int r = b64_decode(ln, dec + got, room);   /* 带 cap：绝不越界写 */
-        if (r < 0) { uart_puts("含非法 base64 字符或超过 4KB 上限，已放弃\n"); bad = 1; break; }
-        got += r;
+        int r = b64_decode(ln, line_dec, (int)sizeof line_dec);
+        if (r < 0) { uart_puts("含非法 base64 字符或单行过长，已放弃\n"); bad = 1; break; }
+        /* 一行 57 字节可能跨 4KB 块边界，所以逐字节喂，攒满就落盘 */
+        for (int i = 0; i < r; i++) {
+            dec[got++] = line_dec[i];
+            total++;
+            if (got == B64_LIMIT) {
+                if (b64_flush(tino, dec, (u32)got) < 0) { bad = 1; break; }
+                got = 0;
+            }
+        }
+        if (bad) break;
     }
-    if (bad) return;
-    /* ring 溢出说明粘贴太快、丢过字符：宁可明确放弃，也绝不写出半截损坏文件。 */
-    if (ring_dropped) {
+    if (!bad && got && b64_flush(tino, dec, (u32)got) < 0) bad = 1;
+    if (!bad && ring_dropped) {
         uart_puts("输入缓冲溢出，有字符丢失，已放弃（请分次少量粘贴）\n");
+        bad = 1;
+    }
+    /* 帧完整性：只要出现了帧标记，就必须 BEGIN/END 成对且声明字节数与实收一致。
+       没出现帧标记 = 旧格式（手工粘贴 / 老脚本），保持兼容，不做总数校验。 */
+    if (!bad && (saw_begin || saw_end) &&
+        (!saw_begin || !saw_end || want != end_size || want != total)) {
+        uart_puts("帧头/帧尾不完整或字节数不符，已放弃\n");
+        bad = 1;
+    }
+    if (bad) { fs_unlink(tp); return; }
+
+    /* 全部成功才动目标：数据已完整落在临时 inode 里，这里只是改目录项。
+       若删除/改名失败，保留临时文件并明确告知路径，不静默丢数据。 */
+    if (fs_lookup(rp) >= 0 && fs_unlink(rp) < 0) {
+        uart_puts("无法覆盖目标（权限 / 是目录？）；完整数据仍在 ");
+        uart_puts(tp); uart_puts("\n");
         return;
     }
-    /* 输入全部合法之后才动文件系统，避免粘贴失败留下一个空文件 */
-    int ino = fs_lookup(rp);
-    if (ino < 0) ino = fs_createfile(rp);
-    if (ino == FS_DENIED) { uart_puts("权限不够：父目录不是你的\n"); return; }
-    if (ino < 0) { uart_puts("建不了文件（父目录缺？）\n"); return; }
-    int w = fs_setfile(ino, dec, (u32)got);
-    if (w == FS_DENIED) { uart_puts("权限不够：这个文件不是你的，root 才能改\n"); return; }
-    if (w < 0) { uart_puts("写失败（盘满？）\n"); return; }
-    uart_puts("已写入 "); uart_putdec((u32)got); uart_puts(" 字节 -> "); uart_puts(rp); uart_puts("\n");
+    if (fs_rename(tp, rp) < 0) {
+        uart_puts("替换失败；完整数据仍在 "); uart_puts(tp); uart_puts("\n");
+        return;
+    }
+    uart_puts("已写入 "); uart_putdec(total); uart_puts(" 字节 -> "); uart_puts(rp); uart_puts("\n");
 }
 
 static void cmd_help(char *a)
@@ -3695,8 +3795,8 @@ static void cmd_help(char *a)
         "  touch <路径>         建空文件；已存在则刷新修改时间\n"
         "  mv <源> <目标>       改名 / 移动文件（不支持目录）\n"
         "  stat <路径>          看 inode / 类型 / 大小 / 属主 / 时间\n"
-        "  b64out <路径>        文件编成 base64 文本带出系统（<=4KB，76字符折行）\n"
-        "  b64in  <路径>        粘贴 base64 还原文件（串口终端用，. 或空行结束）\n"
+        "  b64out <路径>        文件编成 base64 文本带出系统（任意大小，76字符折行+帧标记）\n"
+        "  b64in  <路径>        粘贴 base64 还原文件（任意大小，. 或空行结束）\n"
         "  管道: a | b          单级；右段可用 cat / wc / grep <词> / head [n] / write\n"
         "        ls /etc | wc | cat    （左段不能带 > <，右段可再接 > 写文件）\n"
         "  whoami               当前身份\n"

@@ -73,6 +73,7 @@ int  fs_readat(int ino, u32 off, u8 *buf, u32 cap); /* 从 off 读，返回实�
 int  fs_createfile(const char *path);               /* 建普通文件；已存在/父目录缺 → -1 */
 int  fs_mkdir(const char *path);                    /* 建目录 */
 int  fs_setfile(int ino, const u8 *buf, u32 len);   /* 截断重写；0 成功 */
+int  fs_append(int ino, const u8 *buf, u32 len);    /* 第四十八轮：流式追加写；0 成功 / FS_DENIED */
 int  fs_unlink(const char *path);                   /* 删文件或空目录；0 成功 */
 void fs_statfs(u32 *used, u32 *total);              /* 位图统计 */
 int  fs_filetype(int ino);                          /* FS_T_*（查不到 -1） */

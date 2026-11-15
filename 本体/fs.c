@@ -672,6 +672,49 @@ int fs_setfile(int ino, const u8 *buf, u32 len)
     return 0;
 }
 
+/* ---------------- 第四十八轮：流式追加写（大文件进出通道） ----------------
+   与 fs_setfile 的区别：调用方不必把整个文件放进内存，按任意长度分批喂即可，
+   每次从当前 in.size 接着写。b64in 用它把 base64 逐块落进临时文件，从而绕开
+   「4KB 静态解码缓冲」这个人为上限（FS 本身支持 10 直接 + 512 间接 ≈ 2MB）。
+
+   ⚠️ scratch 顺序与 fs_setfile 同源：bmap() 可能拿 fs_scratch 读写间接块表，
+   iput() 也要用它，所以必须「先 bmap 拿盘块号 → 再填 scratch → 全部块写完才落 inode」。
+   非整块覆写时要先 bread 把同块已有字节读回来（或整块清零），否则会踩掉前半块。
+
+   中途失败（盘满 / bmap 返回 0）可能已写入部分块但没落 inode；调用方负责丢弃
+   目标——b64in 写的是临时文件，失败直接 unlink，不影响真正的目标文件。 */
+int fs_append(int ino, const u8 *buf, u32 len)
+{
+    if (ino < 1 || (!buf && len)) return -1;
+    struct inode in;
+    iget(ino, &in);
+    if (in.type != FS_T_FILE) return -1;
+    if (!can_mutate(&in)) return FS_DENIED;    /* 与 fs_setfile 同一套权限 */
+
+    u32 off = 0;
+    while (off < len) {
+        u32 fblk  = in.size / FS_BLOCK;
+        u32 inner = in.size % FS_BLOCK;        /* 当前块内已写字节 */
+        u32 chunk = len - off;
+        if (chunk > FS_BLOCK - inner) chunk = FS_BLOCK - inner;
+
+        u32 b = bmap(&in, fblk, 1);           /* 可能改写 in.direct/indirect */
+        if (!b) return -1;                    /* 盘满或超过 522 块上限 */
+
+        u8 *blk = fs_scratch;                 /* bmap 用完 scratch 之后才轮到填内容 */
+        if (inner)      bread(b, blk);        /* 接在前半块后面：读回原内容 */
+        else if (chunk < FS_BLOCK) fs_memset(blk, 0, FS_BLOCK);  /* 新短块：补零 */
+        /* inner==0 且 chunk==FS_BLOCK：整块覆写，免清零（balloc_data 的约定） */
+        fs_memcpy(blk + inner, buf + off, chunk);
+        bwrite(b, blk);
+        in.size += chunk;
+        off += chunk;
+    }
+    in.mtime = tick / 10;
+    iput(ino, &in);                           /* 数据块全部写完才落 inode */
+    return 0;
+}
+
 int fs_unlink(const char *path)
 {
     char tmp[128];

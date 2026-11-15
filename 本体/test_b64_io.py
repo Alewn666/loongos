@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""LoongOS 第三十七轮 · 批次 2「文件进出通道」端到端测试（真实 pty 喂串口）。
+"""LoongOS 批次 2「文件进出通道」端到端测试（真实 pty 喂串口）。
+第三十七轮建通道，第四十八轮去掉 4KB 上限（流式写盘 + 临时文件原子替换）。
 
 覆盖：
   1. b64out 导出格式（76 字符折行、每行 4 的倍数、字节数标记）
@@ -10,6 +11,10 @@
   6. 空行结束、`.` 结束
   7. 无参数 / 文件不存在的报错
   8. help 清单列出新命令
+  9. >4KB 大文件（20KB+1，含高位字节）完整往返 + BEGIN/END 帧标记 + 无截断提示
+ 10. 带帧粘贴成功；漏 END 被帧校验拒绝且不留目标文件
+ 11. 覆盖已有文件：失败不动原内容，成功才替换（临时文件原子性）
+ 12. 失败后 .b64tmp 临时文件不残留
 """
 import os, subprocess, time, pty, select, base64, re
 
@@ -93,6 +98,27 @@ def main():
         send(end, 0.6)
         return norm(bytes(buf)[mark:])
 
+    def paste_fast(path, lines, chunk=48, pause=0.45):
+        """第四十八轮：8KB 输入环下分批快速粘贴 >4KB 文件，返回完整交互输出。
+
+        每批 48 行（约 3.7KB）一次写入，批间留时间让 QEMU 把字符收进 ring；
+        read_for 同时把串口输出读走，避免 TX 缓冲塞满卡住 uart_puts('\\n')。
+        末尾不靠固定 sleep，而是轮询到内核打印结束标志为止（写盘/帧校验都要时间）。
+        """
+        mark = len(buf)
+        send("b64in %s\r" % path, 0.3)
+        for i in range(0, len(lines), chunk):
+            os.write(master, ("\r".join(lines[i:i + chunk]) + "\r").encode())
+            read_for(pause)
+        os.write(master, b".\r")
+        for _ in range(60):
+            read_for(0.2)
+            tail = norm(bytes(buf)[mark:])
+            if "字节 -> " in tail or "已放弃" in tail or "完整数据仍在" in tail:
+                break
+        read_for(0.3)
+        return norm(bytes(buf)[mark:])
+
     try:
         print("== boot ==")
         read_for(8)
@@ -161,6 +187,59 @@ def main():
         send("help\r", 0.6)
         has("help 含 b64out", "b64out <路径>")
         has("help 含 b64in", "b64in  <路径>")
+
+        # ---------- 第四十八轮：突破 4KB 上限 ----------
+        print("== 9) 大文件（20KB+1，含高位字节）完整往返 ==")
+        payload = bytes(((i * 37 + 11) & 0xFF) for i in range(20481))
+        enc9 = base64.b64encode(payload).decode("ascii")
+        lines9 = [enc9[i:i + 76] for i in range(0, len(enc9), 76)]
+        check("构造数据 >4KB 且含非 ASCII",
+              len(payload) > 4096 and any(b >= 128 for b in payload))
+        r9 = paste_fast("/big.bin", lines9)
+        check("大文件写入回报 20481 字节", "已写入 20481 字节 -> /big.bin" in r9,
+              repr(r9[-300:]))
+        send("b64out /big.bin\r", 4.0)
+        t9 = text()
+        l9 = b64_lines(t9)
+        check("大文件导出 base64 逐行一致", l9 == lines9,
+              "行数 导出=%d 期望=%d" % (len(l9), len(lines9)))
+        has("导出带 BEGIN 帧头", "-- LOONGOS-B64 BEGIN 20481 --")
+        has("导出带 END 帧尾", "-- LOONGOS-B64 END 20481 --")
+        has("不再出现 4KB 截断提示", "已达 4KB 上限", expect=False)
+
+        print("== 10) 带帧粘贴 + 帧校验（漏 END 必须拒绝） ==")
+        framed = (["-- LOONGOS-B64 BEGIN 20481 --"] + lines9 +
+                  ["-- LOONGOS-B64 END 20481 --"])
+        r10 = paste_fast("/framed.bin", framed)
+        check("带帧粘贴成功", "已写入 20481 字节 -> /framed.bin" in r10,
+              repr(r10[-300:]))
+        r10b = paste_fast("/noend.bin",
+                          ["-- LOONGOS-B64 BEGIN 20481 --"] + lines9[:8])
+        check("漏 END 被帧校验拒绝", "帧头/帧尾不完整" in r10b,
+              repr(r10b[-300:]))
+        send("cat /noend.bin\r", 0.4)
+        has("帧校验失败不留目标文件", "没有这个")
+
+        print("== 11) 覆盖已有文件：失败不动原内容，成功才替换 ==")
+        short = base64.b64encode(b"ORIGINAL").decode("ascii")
+        r11a = paste("/over.txt", [short])
+        check("先写入原始内容", "已写入 8 字节 -> /over.txt" in r11a,
+              repr(r11a[-200:]))
+        send("b64in /over.txt\r", 0.3)
+        send("Zm9v!!!!\r", 0.3)
+        has("非法字符被拒", "含非法 base64 字符")
+        send("cat /over.txt\r", 0.4)
+        has("失败后原内容完好", "ORIGINAL")
+        news = base64.b64encode(b"REPLACED!").decode("ascii")
+        r11b = paste("/over.txt", [news])
+        check("成功覆盖", "已写入 9 字节 -> /over.txt" in r11b,
+              repr(r11b[-200:]))
+        send("cat /over.txt\r", 0.4)
+        has("覆盖后是新内容", "REPLACED!")
+
+        print("== 12) 失败后临时文件不残留 ==")
+        send("cat /.b64tmp\r", 0.4)
+        has("无 .b64tmp 残留", "没有这个")
 
     finally:
         os.close(master)
