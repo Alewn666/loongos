@@ -1,0 +1,81 @@
+{
+  "ts": "2026-11-15 17:16:52",
+  "boot": "iso",
+  "probe": false,
+  "kvm_capability": {
+    "ok": true,
+    "why": "aarch64 + /dev/kvm 可读可写"
+  },
+  "modes": {
+    "TCG": {
+      "mode": "TCG",
+      "boot": "iso",
+      "cmd": "qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a57 -m 256M -smp 1 -drive if=pflash,format=raw,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd -drive if=pflash,format=raw,file=/tmp/loongos_kvm_gfx_vars_tcg.fd -cdrom /vol1/1000/项目/loongos/arm/iso/自研内核ISO/loongos.iso -nographic -no-reboot -qmp unix:/tmp/loongos_kvm_gfx_tcg.sock,server=on,wait=off -device ramfb -device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0,port=1 -device usb-mouse,bus=xhci.0,port=2 -device usb-kbd,bus=xhci.0,port=3",
+      "colors": 93,
+      "surface": "800x600",
+      "d_menu": 0.932,
+      "d_app": 0.2645,
+      "d_drag": 0.4328,
+      "install_tail": " cls=0x000000000000000c\r\n[scsi]  0:3.0 id=0x0000000010011af4 cls=0x0000000000000001\r\n[nvme] 未找到 NVMe 控制器(class=0x010802)\r\n[install] 可用磁盘 1 块：\r\n  [0] virtio-blk  18 MB\r\n⚠️ 安装会清空目标磁盘！确认请敲: install 0 yes",
+      "bench": {
+        "sha2_field": 2,
+        "hw_hash": 1,
+        "kdf_us": 651694,
+        "memset_us": 1796,
+        "memcpy_us": 2143,
+        "gfx_fill_us": 121514,
+        "gfx_1k_us": 8289
+      },
+      "res": {
+        "sync_exc": 0,
+        "recovered": 0,
+        "nisv": 0,
+        "fatal": 0,
+        "trip": 0,
+        "sha256_mode": "硬件"
+      },
+      "sha256_mode": "硬件"
+    },
+    "KVM": {
+      "mode": "KVM",
+      "boot": "iso",
+      "cmd": "qemu-system-aarch64 -machine virt,gic-version=3 -cpu host -enable-kvm -m 256M -smp 1 -drive if=pflash,format=raw,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd -drive if=pflash,format=raw,file=/tmp/loongos_kvm_gfx_vars_kvm.fd -cdrom /vol1/1000/项目/loongos/arm/iso/自研内核ISO/loongos.iso -nographic -no-reboot -qmp unix:/tmp/loongos_kvm_gfx_kvm.sock,server=on,wait=off -device ramfb -device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0,port=1 -device usb-mouse,bus=xhci.0,port=2 -device usb-kbd,bus=xhci.0,port=3",
+      "colors": 94,
+      "surface": "800x600",
+      "d_menu": 0.9312,
+      "d_app": 0.2645,
+      "d_drag": 0.4328,
+      "install_tail": "0000d1b36 cls=0x000000000000000c\r\n[scsi]  0:3.0 id=0x0000000010011af4 cls=0x0000000000000001\r\n[nvme] 未找到 NVMe 控制器(class=0x010802)\r\n[install] 可用磁盘 1 块：\r\n  [0] virtio-blk  18 MB\r\n⚠️ 安装会清空目标磁盘！确认请敲: inst",
+      "bench": {
+        "sha2_field": 2,
+        "hw_hash": 1,
+        "kdf_us": 134417,
+        "memset_us": 79,
+        "memcpy_us": 318,
+        "gfx_fill_us": 2426,
+        "gfx_1k_us": 1195
+      },
+      "res": {
+        "sync_exc": 0,
+        "recovered": 0,
+        "nisv": 0,
+        "fatal": 0,
+        "trip": 0,
+        "sha256_mode": "硬件"
+      },
+      "sha256_mode": "硬件"
+    }
+  },
+  "summary": {
+    "TCG": {
+      "pass": 15,
+      "fail": 0,
+      "failed": []
+    },
+    "KVM": {
+      "pass": 15,
+      "fail": 0,
+      "failed": []
+    }
+  }
+}

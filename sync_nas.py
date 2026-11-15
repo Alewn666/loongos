@@ -101,6 +101,20 @@ FILES = [
     ('本体/LOONGOS_DESKTOP_TODO.md', '本体/LOONGOS_DESKTOP_TODO.md'),
     # 第五十轮：真机/KVM 双路复验准备（供 NAS 侧路线 A 直接取用；零内核源码改动）
     ('本体/test_kvm_dual.py',     '本体/test_kvm_dual.py'),
+    # 第五十二轮：真机 / KVM 图形桌面双路复验（TCG 15/15 + KVM 15/15）
+    # 注：README.md / docs/检查与修复记录.md / 两个 TODO 已在上面登记，此处只补新增产物。
+    ('本体/test_kvm_graphic.py',  '本体/test_kvm_graphic.py'),
+    ('本体/docs/真机KVM_图形复验报告.json', '本体/docs/真机KVM_图形复验报告.json'),
+    ('本体/LOONGOS_KVM_FIX_TODO.md', '本体/LOONGOS_KVM_FIX_TODO.md'),
+    ('本体/LOONGOS_HB_FIX_TODO.md',  '本体/LOONGOS_HB_FIX_TODO.md'),
+    # 真机图形证据截图
+    ('本体/docs/screenshots/真机KVM_图形交互总览.png', '本体/docs/screenshots/真机KVM_图形交互总览.png'),
+    ('本体/docs/screenshots/kvm_01_desktop.png',      '本体/docs/screenshots/kvm_01_desktop.png'),
+    ('本体/docs/screenshots/kvm_02_menu_open.png',    '本体/docs/screenshots/kvm_02_menu_open.png'),
+    ('本体/docs/screenshots/kvm_03_app_open.png',     '本体/docs/screenshots/kvm_03_app_open.png'),
+    ('本体/docs/screenshots/kvm_04_before_drag.png',  '本体/docs/screenshots/kvm_04_before_drag.png'),
+    ('本体/docs/screenshots/kvm_05_after_drag.png',   '本体/docs/screenshots/kvm_05_after_drag.png'),
+    ('本体/docs/screenshots/tcg_01_desktop.png',      '本体/docs/screenshots/tcg_01_desktop.png'),
 ]
 
 def md5_local(path):

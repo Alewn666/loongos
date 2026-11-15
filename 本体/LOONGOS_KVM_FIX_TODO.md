@@ -11,5 +11,13 @@
 > （`-cpu host -enable-kvm -gicv3`，健康计数全 0，KDF 真机加速约 5.4×）。第 49 轮 ISO
 > md5 `0a3af869…` 与本地定稿一致、已在 NAS 归档对账；本轮零内核源码改动故未重打 ISO。
 > 留痕见 `docs/检查与修复记录.md` 第五十一轮（含对第五十轮结论的更正与诚实边界）。
-> 注：路线 B 的**图形桌面 / 键鼠 / 装盘人工验收**仍未做，本脚本是 `-nographic` 纯串口双路，
-> 不冒充图形验收已完成；该项如需单独跟踪另立条目。
+> 第五十二轮（2026-11-15）**路线 B 的自动判据部分已销账**：新增 `本体/test_kvm_graphic.py`，
+> 在同一台飞牛 NAS aarch64 真机以 root 起独立临时 QEMU（AAVMF + 第 49 轮 ISO + ramfb
+> 800×600 + qemu-xhci 三 HID），用 QMP `screendump` 真实像素 + `input-send-event` 注入
+> 点击/拖拽 + HMP `sendkey`，**TCG 15/15 + KVM 15/15**：进桌面 / 开始菜单 / 应用窗口 /
+> 标题栏拖动 / Ctrl+Shift+F1 / 退出后键盘 / install（未发 yes）/ net / bench 图形态 /
+> res 健康全 0 全过；截图 `docs/screenshots/真机KVM_图形交互总览.png`、报告
+> `docs/真机KVM_图形复验报告.json`。**不启停/不改动任何用户 libvirt VM**。
+> 仍未做的只有「用户在 Web VNC 里手工拖拽的体感验收」——QMP 注入是模拟 HID，
+> 不等价于人工操作；触屏/手势、窗口缩放在真机的专项复验也仍单列保留。
+> 留痕见 `docs/检查与修复记录.md` 第五十二轮。
