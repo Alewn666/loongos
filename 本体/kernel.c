@@ -1304,6 +1304,31 @@ volatile u32 g_exc_trip = 0;        /* 熔断 / 嵌套异常 */
 volatile u32 g_tick_jumps = 0;      /* cntpct 回退 / 长暂停补拍截断次数 */
 volatile u32 g_irq_uart_ovf = 0;    /* 一次 UART IRQ 收满上限（FIFO 异常迹象） */
 
+/* 第五十三轮：高频中断专项压测（诊断量，显式初值 → .data，不挤 .bss 的 4KB 对齐链）。
+   g_irqstress 置位时做两件事：① handle_irq 抑制 task_switch（否则压测帧会被换到
+   task1 的栈上，q 寄存器从别的帧恢复，实验失真）；② 每次 TIMER IRQ 末尾调用
+   irqstress_poison() 把 q0..q31 全部投毒，由 boot.S 的 RESTORE_CTX 负责恢复。
+   这两条只在显式敲 `irqstress` 时生效，正常路径零影响。 */
+volatile u32 g_irqstress = 0;
+volatile u32 g_irqstress_poison = 0;
+extern void irqstress_poison(void);
+extern void irqstress_probe(u64 want, volatile u64 *irqs, const u64 *expect, u32 *out);
+/* 32 个 q 各不相同的期望值（低/高 64bit lane 一对）。故意都不等于
+   投毒值 0x5A5A5A5A5A5A5A5A，且彼此不同 → 不仅能测「漏存」，也能测「存错位」。 */
+#define IRQ_PAT(n) (0xA5A5000000000000ULL + (u64)(n)), \
+                   (0x5A5A000000000000ULL + (u64)(n) * 0x01010101ULL)
+static const u64 irq_expect[64] = {
+    IRQ_PAT(1),  IRQ_PAT(2),  IRQ_PAT(3),  IRQ_PAT(4),
+    IRQ_PAT(5),  IRQ_PAT(6),  IRQ_PAT(7),  IRQ_PAT(8),
+    IRQ_PAT(9),  IRQ_PAT(10), IRQ_PAT(11), IRQ_PAT(12),
+    IRQ_PAT(13), IRQ_PAT(14), IRQ_PAT(15), IRQ_PAT(16),
+    IRQ_PAT(17), IRQ_PAT(18), IRQ_PAT(19), IRQ_PAT(20),
+    IRQ_PAT(21), IRQ_PAT(22), IRQ_PAT(23), IRQ_PAT(24),
+    IRQ_PAT(25), IRQ_PAT(26), IRQ_PAT(27), IRQ_PAT(28),
+    IRQ_PAT(29), IRQ_PAT(30), IRQ_PAT(31), IRQ_PAT(32)
+};
+static u32 irq_out[6] = { 0xDEADBEEF, 0, 0, 0, 0, 0 };  /* 非零初值 → 落 .data */
+
 /* ⚠️ tick 由【硬件计数器真实经过的 cycle】驱动，不数 IRQ 个数。
  * 原因：QEMU TCG 下 cntp_tval_el0 按 freq/hz 设定后，实际 IRQ 触发率并不精确等于
  *   hz（实测设 1000Hz 只触发 ~558Hz），且 cntpct_el0 虚拟时间也不等于墙钟。
@@ -1480,8 +1505,9 @@ struct regs *handle_irq(struct regs *f)
                去掉 wfi 的深层原因之一）。桌面期间让 GUI 独占 CPU0，退出后自动恢复轮转。
                注：advanced 可能 >1（低频唤醒一次补多拍），但只在推进 tick 时轮转一次，
                保持「一个抢占点/节拍」的语义。 */
-            if (!g_desktop_active)
-                f = task_switch(f);    /* 抢占：换到下一个任务的帧 */
+            if (!g_desktop_active && !g_irqstress)
+                f = task_switch(f);    /* 抢占：换到下一个任务的帧
+                                          （压测期抑制：否则 RESTORE_CTX 会从 task1 帧恢复 q） */
         }
     }
     if (id >= 16) {                    /* PPI(30) 和 SPI(33) 都要 EOI；SGI 0~15 我们不用 */
@@ -1491,6 +1517,13 @@ struct regs *handle_irq(struct regs *f)
         sys_dsb();
         if (gic_ver == 3) icc_eoir1_write(iar);
         else              GICC_EOIR = iar;
+    }
+    /* 第五十三轮：压测激活时，每次 TIMER IRQ 在返回前把 q0..q31 全部投毒。
+       紧接着 boot.S 的 irq_entry 会走 RESTORE_CTX —— 800B 异常帧若漏存/错位
+       任何一个 q，脏值就会漏回压测命令，逐寄存器比对立刻报 mismatch。 */
+    if (g_irqstress && id == TIMER_IRQ) {
+        g_irqstress_poison++;
+        irqstress_poison();
     }
     return f;
 }
@@ -2991,6 +3024,53 @@ static void cmd_reboot(char *a)   { (void)a; do_reboot(); }
 static void cmd_shutdown(char *a) { (void)a; do_poweroff(); }
 static void cmd_halt(char *a)     { (void)a; do_poweroff(); }
 
+/* 第五十三轮：高频中断专项压测。刻意不写进 help / 行为基线（同 res / smpwork）。
+   用法：irqstress [N=200]  —— 把硬件 timer 提到 1000Hz，等 N 次真实 TIMER IRQ，
+   每次 IRQ 期间由 handle_irq 投毒 q0..q31，boot.S 的 RESTORE_CTX 恢复，
+   irqstress_probe() 逐寄存器回读比对低/高 64bit lane 并累计失配。 */
+static void cmd_irqstress(char *args)
+{
+    u32 want = 200;
+    if (args) {
+        while (*args == ' ') args++;
+        u32 v = 0;
+        while (*args >= '0' && *args <= '9') {
+            v = v * 10 + (u32)(*args - '0');
+            args++;
+        }
+        if (v >= 10 && v <= 2000) want = v;
+    }
+    u32 saved_hz = g_wake_hz;
+    g_irqstress_poison = 0;
+    g_irqstress = 1;                 /* 抑制抢占 + 开启投毒 */
+    timer_set_wake_hz(1000);         /* 真实 1000Hz 硬件唤醒 IRQ */
+    u64 t0 = bench_cnt();
+    irqstress_probe(want, &g_timer_irqs, irq_expect, irq_out);
+    u64 t1 = bench_cnt();
+    g_irqstress = 0;
+    timer_set_wake_hz(saved_hz);
+
+    u32 us = (u32)((t1 - t0) / (bench_hz() / 1000000));
+    u32 rounds = irq_out[0], mismatch = irq_out[1];
+    u32 irq0 = irq_out[2], irq1 = irq_out[3];
+    u32 calib = irq_out[4], timeout = irq_out[5];
+    uart_puts("[irqstress] want="); uart_putdec(want);
+    uart_puts(" hz=1000 elapsed="); uart_putdec(us); uart_puts(" us\n");
+    uart_puts("[irqstress] rounds="); uart_putdec(rounds);
+    uart_puts(" irq="); uart_putdec(irq0); uart_puts("->"); uart_putdec(irq1);
+    uart_puts(" poison="); uart_putdec(g_irqstress_poison);
+    uart_puts(" timeout="); uart_putdec(timeout); uart_puts("\n");
+    uart_puts("[irqstress] q_mismatch="); uart_putdec(mismatch);
+    uart_puts(" calib="); uart_putdec(calib); uart_puts("\n");
+    /* calib == 64 证明「irqstress_poison 真的把 32 个 q 的低/高 lane 全弄脏了」
+       （且比对逻辑能逐个检出）；poison >= want 证明每次 IRQ 都投了毒。
+       两者齐备，q_mismatch == 0 才能证明 RESTORE_CTX 完整恢复，而非压根没污染。 */
+    int ok = (mismatch == 0 && calib == 64 && timeout == 0 &&
+              rounds >= want && g_irqstress_poison >= want &&
+              (irq1 - irq0) >= want);
+    uart_puts(ok ? "[irqstress] RESULT PASS\n" : "[irqstress] RESULT FAIL\n");
+}
+
 static const struct cmdent CMDS[] = {
     { "ls",    cmd_ls    }, { "cat",   cmd_cat   }, { "write", cmd_write },
     { "mkdir", cmd_mkdir }, { "rm",    cmd_rm    }, { "df",    cmd_df    },
@@ -3006,6 +3086,7 @@ static const struct cmdent CMDS[] = {
     { "b64out", cmd_b64out }, { "b64in", cmd_b64in },   /* 批次2：文件进出通道 */
     { "res", cmd_res },        /* R 轮资源账诊断（刻意不写进 help，保行为基线逐字一致） */
     { "smpwork", cmd_smpwork },/* 阶段9 多核工作分派演示（刻意不写进 help / 行为基线） */
+    { "irqstress", cmd_irqstress }, /* 第五十三轮 高频中断压测（刻意不写进 help / 行为基线） */
     { "poweroff", cmd_poweroff }, { "shutdown", cmd_shutdown },
     { "halt", cmd_halt },         { "reboot", cmd_reboot },
     { 0, 0 }

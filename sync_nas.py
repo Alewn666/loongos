@@ -115,6 +115,12 @@ FILES = [
     ('本体/docs/screenshots/kvm_04_before_drag.png',  '本体/docs/screenshots/kvm_04_before_drag.png'),
     ('本体/docs/screenshots/kvm_05_after_drag.png',   '本体/docs/screenshots/kvm_05_after_drag.png'),
     ('本体/docs/screenshots/tcg_01_desktop.png',      '本体/docs/screenshots/tcg_01_desktop.png'),
+    # 第五十三轮：高频中断专项压测（故障注入 + 逐寄存器回读，真机 TCG/KVM 各 16/16）
+    # 注：kernel.c / boot.S / kernel.elf / bss_budget.txt / ISO / md5 / docs /
+    #     README.md 已在上面登记，此处只补新增脚本、改动的判据脚本与真机报告。
+    ('本体/test_irqstress.py',   '本体/test_irqstress.py'),
+    ('本体/test_desktop_p2.py',  '本体/test_desktop_p2.py'),
+    ('本体/docs/真机高频中断压测报告.json', '本体/docs/真机高频中断压测报告.json'),
 ]
 
 def md5_local(path):

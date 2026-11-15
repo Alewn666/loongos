@@ -1,0 +1,132 @@
+{
+  "ts": "2026-11-15 19:40:55",
+  "iso_md5": "7e94c50a03f3a57c980e14f35db49b4e",
+  "kvm_capability": {
+    "ok": true,
+    "why": "aarch64 + /dev/kvm 可读可写"
+  },
+  "modes": {
+    "TCG": {
+      "mode": "TCG",
+      "cmd": "qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a57 -m 256M -drive if=pflash,format=raw,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd -drive if=pflash,format=raw,file=/tmp/loong_irqstress_vars_tcg.fd -cdrom /tmp/loongos_irqstress.iso -nographic -no-reboot",
+      "res_before": {
+        "sync_exc": 0,
+        "recovered": 0,
+        "nisv": 0,
+        "fatal": 0,
+        "trip": 0,
+        "wake_hz": 10,
+        "timer_irqs": 2,
+        "sha256_mode": "硬件"
+      },
+      "run1": {
+        "want": 200,
+        "elapsed_us": 281967,
+        "rounds": 200,
+        "irq0": 3,
+        "irq1": 203,
+        "poison": 201,
+        "timeout": 0,
+        "q_mismatch": 0,
+        "calib": 64,
+        "result": "PASS",
+        "irq_delta": 200,
+        "irq_hz": 709.3,
+        "irq_interval_us": 1409.8
+      },
+      "run2": {
+        "want": 400,
+        "elapsed_us": 482572,
+        "rounds": 400,
+        "irq0": 203,
+        "irq1": 603,
+        "poison": 400,
+        "timeout": 0,
+        "q_mismatch": 0,
+        "calib": 64,
+        "result": "PASS",
+        "irq_delta": 400,
+        "irq_hz": 828.9,
+        "irq_interval_us": 1206.4
+      },
+      "res_after": {
+        "sync_exc": 0,
+        "recovered": 0,
+        "nisv": 0,
+        "fatal": 0,
+        "trip": 0,
+        "wake_hz": 10,
+        "timer_irqs": 603,
+        "sha256_mode": "硬件"
+      },
+      "kdf_auth_ok": true
+    },
+    "KVM": {
+      "mode": "KVM",
+      "cmd": "qemu-system-aarch64 -machine virt,gic-version=3 -cpu host -enable-kvm -m 256M -drive if=pflash,format=raw,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd -drive if=pflash,format=raw,file=/tmp/loong_irqstress_vars_kvm.fd -cdrom /tmp/loongos_irqstress.iso -nographic -no-reboot",
+      "res_before": {
+        "sync_exc": 0,
+        "recovered": 0,
+        "nisv": 0,
+        "fatal": 0,
+        "trip": 0,
+        "wake_hz": 10,
+        "timer_irqs": 2,
+        "sha256_mode": "硬件"
+      },
+      "run1": {
+        "want": 200,
+        "elapsed_us": 202343,
+        "rounds": 200,
+        "irq0": 2,
+        "irq1": 202,
+        "poison": 200,
+        "timeout": 0,
+        "q_mismatch": 0,
+        "calib": 64,
+        "result": "PASS",
+        "irq_delta": 200,
+        "irq_hz": 988.4,
+        "irq_interval_us": 1011.7
+      },
+      "run2": {
+        "want": 400,
+        "elapsed_us": 404186,
+        "rounds": 400,
+        "irq0": 202,
+        "irq1": 602,
+        "poison": 400,
+        "timeout": 0,
+        "q_mismatch": 0,
+        "calib": 64,
+        "result": "PASS",
+        "irq_delta": 400,
+        "irq_hz": 989.6,
+        "irq_interval_us": 1010.5
+      },
+      "res_after": {
+        "sync_exc": 0,
+        "recovered": 0,
+        "nisv": 0,
+        "fatal": 0,
+        "trip": 0,
+        "wake_hz": 10,
+        "timer_irqs": 602,
+        "sha256_mode": "硬件"
+      },
+      "kdf_auth_ok": true
+    }
+  },
+  "summary": {
+    "TCG": {
+      "pass": 16,
+      "fail": 0,
+      "failed": []
+    },
+    "KVM": {
+      "pass": 16,
+      "fail": 0,
+      "failed": []
+    }
+  }
+}

@@ -230,3 +230,263 @@ vectors:
     VEC irq_entry
     VEC fiq_entry
     VEC err_entry
+
+/* ==================================================================
+   第五十三轮：高频中断专项压测 —— 主动污染 NEON + 逐寄存器回读校验
+   ------------------------------------------------------------------
+   第五十一/五十二轮诚实边界：内核抢占 timer 是 10Hz，KDF 期间未必被高频
+   IRQ 打断，「800B 异常帧在真实高频中断下存 q0..q31」只证明 KDF 没被破坏，
+   未做逐寄存器验证。这里用故障注入把这条补严：
+
+     irqstress_poison()  —— IRQ 处理末尾把 q0..q31 全写成 0x5A 脏值；
+     irqstress_probe()   —— 先把 32 个 q 填成各不相同的 expect[] pattern，
+                            硬件 timer 提到 1000Hz，每来一次 IRQ 就逐寄存器
+                            回读低/高 64bit lane 比对，累计 mismatch。
+
+   若 SAVE_CTX/RESTORE_CTX 漏存或偏移错位任何一个 q，投毒值就会漏回来，
+   mismatch > 0。calibration 直接调用 irqstress_poison() 弄脏全部 32 个 q，
+   要求逐寄存器比对报满 64 个失配，验证「投毒生效 + 比对逻辑有效」，
+   杜绝判据恒真。全程只读 expect[]，只碰 caller-saved x0..x18 与已保存的
+   x19/x20/x29/x30；被 IRQ 打断时 SAVE_CTX 会把这些 x 与 q 一起保存恢复。
+   ================================================================== */
+
+.macro QPOISON simdop
+    movi \simdop, #0x5A
+.endm
+.macro QLOAD laneop, dreg, off, base
+    ldp x9, x10, [\base, #\off]
+    fmov \dreg, x9
+    ins \laneop, x10
+.endm
+.macro QCHECK laneop, dreg, off, base, bad
+    fmov x9, \dreg
+    umov x10, \laneop
+    ldp x17, x18, [\base, #\off]
+    cmp x9, x17
+    cset x16, ne
+    add \bad, \bad, x16
+    cmp x10, x18
+    cset x16, ne
+    add \bad, \bad, x16
+.endm
+
+.global irqstress_poison
+irqstress_poison:
+    QPOISON v0.16b
+    QPOISON v1.16b
+    QPOISON v2.16b
+    QPOISON v3.16b
+    QPOISON v4.16b
+    QPOISON v5.16b
+    QPOISON v6.16b
+    QPOISON v7.16b
+    QPOISON v8.16b
+    QPOISON v9.16b
+    QPOISON v10.16b
+    QPOISON v11.16b
+    QPOISON v12.16b
+    QPOISON v13.16b
+    QPOISON v14.16b
+    QPOISON v15.16b
+    QPOISON v16.16b
+    QPOISON v17.16b
+    QPOISON v18.16b
+    QPOISON v19.16b
+    QPOISON v20.16b
+    QPOISON v21.16b
+    QPOISON v22.16b
+    QPOISON v23.16b
+    QPOISON v24.16b
+    QPOISON v25.16b
+    QPOISON v26.16b
+    QPOISON v27.16b
+    QPOISON v28.16b
+    QPOISON v29.16b
+    QPOISON v30.16b
+    QPOISON v31.16b
+    ret
+
+/* x0=want_irqs  x1=&g_timer_irqs  x2=&irq_expect[0]  x3=&irq_out[0]
+   out: [0]=rounds [1]=q_mismatch [2]=irq_start_lo [3]=irq_end_lo
+        [4]=calibration（调用真实投毒后应为 64 个 lane 失配） [5]=timeout */
+.global irqstress_probe
+irqstress_probe:
+    stp x29, x30, [sp, #-32]!
+    stp x19, x20, [sp, #16]
+    mov x20, #0                 /* timeout 标志 */
+    str wzr, [x3, #20]         /* out[5] = 0 */
+
+    /* ① 32 个 q 填成各不相同的 expect[] pattern */
+    QLOAD v0.d[1], d0, 0, x2
+    QLOAD v1.d[1], d1, 16, x2
+    QLOAD v2.d[1], d2, 32, x2
+    QLOAD v3.d[1], d3, 48, x2
+    QLOAD v4.d[1], d4, 64, x2
+    QLOAD v5.d[1], d5, 80, x2
+    QLOAD v6.d[1], d6, 96, x2
+    QLOAD v7.d[1], d7, 112, x2
+    QLOAD v8.d[1], d8, 128, x2
+    QLOAD v9.d[1], d9, 144, x2
+    QLOAD v10.d[1], d10, 160, x2
+    QLOAD v11.d[1], d11, 176, x2
+    QLOAD v12.d[1], d12, 192, x2
+    QLOAD v13.d[1], d13, 208, x2
+    QLOAD v14.d[1], d14, 224, x2
+    QLOAD v15.d[1], d15, 240, x2
+    QLOAD v16.d[1], d16, 256, x2
+    QLOAD v17.d[1], d17, 272, x2
+    QLOAD v18.d[1], d18, 288, x2
+    QLOAD v19.d[1], d19, 304, x2
+    QLOAD v20.d[1], d20, 320, x2
+    QLOAD v21.d[1], d21, 336, x2
+    QLOAD v22.d[1], d22, 352, x2
+    QLOAD v23.d[1], d23, 368, x2
+    QLOAD v24.d[1], d24, 384, x2
+    QLOAD v25.d[1], d25, 400, x2
+    QLOAD v26.d[1], d26, 416, x2
+    QLOAD v27.d[1], d27, 432, x2
+    QLOAD v28.d[1], d28, 448, x2
+    QLOAD v29.d[1], d29, 464, x2
+    QLOAD v30.d[1], d30, 480, x2
+    QLOAD v31.d[1], d31, 496, x2
+
+    /* ② calibration：调用**真实投毒函数**弄脏全部 32 个 q，逐寄存器比对
+          必须报 64 个失配（32 寄存器 × 2 个 64bit lane）。这一步同时验证
+          「比对逻辑有效」与「irqstress_poison 确实改写了每一个 q」，
+          杜绝后面的 PASS 只是因为压根没污染。 */
+    bl irqstress_poison
+    ldr x30, [sp, #8]          /* bl 覆盖了返回地址，从栈上取回 */
+    mov x6, #0
+    QCHECK v0.d[1], d0, 0, x2, x6
+    QCHECK v1.d[1], d1, 16, x2, x6
+    QCHECK v2.d[1], d2, 32, x2, x6
+    QCHECK v3.d[1], d3, 48, x2, x6
+    QCHECK v4.d[1], d4, 64, x2, x6
+    QCHECK v5.d[1], d5, 80, x2, x6
+    QCHECK v6.d[1], d6, 96, x2, x6
+    QCHECK v7.d[1], d7, 112, x2, x6
+    QCHECK v8.d[1], d8, 128, x2, x6
+    QCHECK v9.d[1], d9, 144, x2, x6
+    QCHECK v10.d[1], d10, 160, x2, x6
+    QCHECK v11.d[1], d11, 176, x2, x6
+    QCHECK v12.d[1], d12, 192, x2, x6
+    QCHECK v13.d[1], d13, 208, x2, x6
+    QCHECK v14.d[1], d14, 224, x2, x6
+    QCHECK v15.d[1], d15, 240, x2, x6
+    QCHECK v16.d[1], d16, 256, x2, x6
+    QCHECK v17.d[1], d17, 272, x2, x6
+    QCHECK v18.d[1], d18, 288, x2, x6
+    QCHECK v19.d[1], d19, 304, x2, x6
+    QCHECK v20.d[1], d20, 320, x2, x6
+    QCHECK v21.d[1], d21, 336, x2, x6
+    QCHECK v22.d[1], d22, 352, x2, x6
+    QCHECK v23.d[1], d23, 368, x2, x6
+    QCHECK v24.d[1], d24, 384, x2, x6
+    QCHECK v25.d[1], d25, 400, x2, x6
+    QCHECK v26.d[1], d26, 416, x2, x6
+    QCHECK v27.d[1], d27, 432, x2, x6
+    QCHECK v28.d[1], d28, 448, x2, x6
+    QCHECK v29.d[1], d29, 464, x2, x6
+    QCHECK v30.d[1], d30, 480, x2, x6
+    QCHECK v31.d[1], d31, 496, x2, x6
+    str w6, [x3, #16]          /* out[4] = 64 才说明投毒与比对都生效 */
+    /* 重新填回 pattern，进入主循环 */
+    QLOAD v0.d[1], d0, 0, x2
+    QLOAD v1.d[1], d1, 16, x2
+    QLOAD v2.d[1], d2, 32, x2
+    QLOAD v3.d[1], d3, 48, x2
+    QLOAD v4.d[1], d4, 64, x2
+    QLOAD v5.d[1], d5, 80, x2
+    QLOAD v6.d[1], d6, 96, x2
+    QLOAD v7.d[1], d7, 112, x2
+    QLOAD v8.d[1], d8, 128, x2
+    QLOAD v9.d[1], d9, 144, x2
+    QLOAD v10.d[1], d10, 160, x2
+    QLOAD v11.d[1], d11, 176, x2
+    QLOAD v12.d[1], d12, 192, x2
+    QLOAD v13.d[1], d13, 208, x2
+    QLOAD v14.d[1], d14, 224, x2
+    QLOAD v15.d[1], d15, 240, x2
+    QLOAD v16.d[1], d16, 256, x2
+    QLOAD v17.d[1], d17, 272, x2
+    QLOAD v18.d[1], d18, 288, x2
+    QLOAD v19.d[1], d19, 304, x2
+    QLOAD v20.d[1], d20, 320, x2
+    QLOAD v21.d[1], d21, 336, x2
+    QLOAD v22.d[1], d22, 352, x2
+    QLOAD v23.d[1], d23, 368, x2
+    QLOAD v24.d[1], d24, 384, x2
+    QLOAD v25.d[1], d25, 400, x2
+    QLOAD v26.d[1], d26, 416, x2
+    QLOAD v27.d[1], d27, 432, x2
+    QLOAD v28.d[1], d28, 448, x2
+    QLOAD v29.d[1], d29, 464, x2
+    QLOAD v30.d[1], d30, 480, x2
+    QLOAD v31.d[1], d31, 496, x2
+
+    /* ③ 主循环：每来一次真实 TIMER IRQ 就做一轮 32×2 逐寄存器比对 */
+    mov x6, #0                 /* mismatch 累计 */
+    mov x7, #0                 /* rounds */
+    mov x19, #0                /* 轮询计数（防 IRQ 不来时挂死） */
+    mov x8, #0x1000
+    lsl x8, x8, #16            /* x8 = 2^28 轮询上限 */
+    ldr x4, [x1]               /* 起始 IRQ 计数 */
+    str w4, [x3, #8]           /* out[2] */
+    add x5, x4, x0             /* 目标 IRQ 计数 */
+1:
+    ldr x15, [x1]
+    cmp x15, x4
+    b.ne 2f                    /* IRQ 计数变了 → 做检查 */
+    add x19, x19, #1
+    cmp x19, x8
+    b.ge 4f                    /* 超时：不挂死，明确失败 */
+    b 1b
+2:
+    mov x4, x15
+    QCHECK v0.d[1], d0, 0, x2, x6
+    QCHECK v1.d[1], d1, 16, x2, x6
+    QCHECK v2.d[1], d2, 32, x2, x6
+    QCHECK v3.d[1], d3, 48, x2, x6
+    QCHECK v4.d[1], d4, 64, x2, x6
+    QCHECK v5.d[1], d5, 80, x2, x6
+    QCHECK v6.d[1], d6, 96, x2, x6
+    QCHECK v7.d[1], d7, 112, x2, x6
+    QCHECK v8.d[1], d8, 128, x2, x6
+    QCHECK v9.d[1], d9, 144, x2, x6
+    QCHECK v10.d[1], d10, 160, x2, x6
+    QCHECK v11.d[1], d11, 176, x2, x6
+    QCHECK v12.d[1], d12, 192, x2, x6
+    QCHECK v13.d[1], d13, 208, x2, x6
+    QCHECK v14.d[1], d14, 224, x2, x6
+    QCHECK v15.d[1], d15, 240, x2, x6
+    QCHECK v16.d[1], d16, 256, x2, x6
+    QCHECK v17.d[1], d17, 272, x2, x6
+    QCHECK v18.d[1], d18, 288, x2, x6
+    QCHECK v19.d[1], d19, 304, x2, x6
+    QCHECK v20.d[1], d20, 320, x2, x6
+    QCHECK v21.d[1], d21, 336, x2, x6
+    QCHECK v22.d[1], d22, 352, x2, x6
+    QCHECK v23.d[1], d23, 368, x2, x6
+    QCHECK v24.d[1], d24, 384, x2, x6
+    QCHECK v25.d[1], d25, 400, x2, x6
+    QCHECK v26.d[1], d26, 416, x2, x6
+    QCHECK v27.d[1], d27, 432, x2, x6
+    QCHECK v28.d[1], d28, 448, x2, x6
+    QCHECK v29.d[1], d29, 464, x2, x6
+    QCHECK v30.d[1], d30, 480, x2, x6
+    QCHECK v31.d[1], d31, 496, x2, x6
+    add x7, x7, #1
+    cmp x15, x5
+    b.lt 1b
+    b 5f
+4:
+    mov x20, #1
+5:
+    str w7, [x3, #0]           /* out[0] = rounds */
+    str w6, [x3, #4]           /* out[1] = q_mismatch */
+    str w4, [x3, #12]          /* out[3] = irq_end */
+    str w20, [x3, #20]         /* out[5] = timeout */
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+

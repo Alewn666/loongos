@@ -193,7 +193,11 @@ def main():
         print("  %s %s %s" % ("✓" if ok else "✗", name, detail))
 
     try:
-        if not wait_log("[desktop]", 40):
+        # 第五十三轮：等「图形桌面已就绪」而不是任意 [desktop] 子串。
+        # 内核启动期会先打「[desktop] 已装系统：开始菜单不显示安装程序」，
+        # 用宽松子串会让下面的判据 2 在桌面真正起来之前就返回，误报
+        # 「开机默认直接进桌面」失败（全套回归第 5 项偶发 FAIL 的根因）。
+        if not wait_log("[desktop] 图形桌面已就绪", 40):
             print("[P2] ✗ 40s 内未启动到桌面，日志尾部：\n" + log()[-2000:])
             return 1
         q = Qmp(QMP)
