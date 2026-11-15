@@ -179,5 +179,43 @@
     "逐项状态副本": "docs/演进路线_逐项状态.md",
     "轮次清单": "LOONGOS_ROUTE_TODO.md",
     "检查记录": "docs/检查与修复记录.md 第五十四轮"
+  },
+  "md5_crosscheck": {
+    "kernel_elf": "5f45ab1b18b1321dc7a78edd02708ff6",
+    "iso_tree_kernel_elf": "5f45ab1b18b1321dc7a78edd02708ff6",
+    "esp_img_kernel_elf": "5f45ab1b18b1321dc7a78edd02708ff6",
+    "payload_img_kernel_elf": "5f45ab1b18b1321dc7a78edd02708ff6",
+    "all_match": true,
+    "iso_md5": "d10029e3773293ca361a931dd3eb3109",
+    "iso_md5_file_match": true
+  },
+  "delivery": {
+    "git_commit": "33185e2",
+    "git_commit_files": 24,
+    "git_push": "origin main  8c209fe..33185e2  OK",
+    "iso_in_git": false,
+    "iso_in_git_reason": "按 .gitignore 惯例（*.iso / *.iso.*）不入 git，走 NAS 同步 + Releases 分发",
+    "nas_sync_executed": false,
+    "nas_sync_reason": "NAS SSH 通道本轮 14 次探测（约 14 分钟）不可达；最后一次成功为 21:55 前后第 53 轮 IRQ 压测后台命令",
+    "nas_artifacts_pending": [
+      "iso/loongos.iso",
+      "iso/loongos.iso.md5",
+      "mm.c/h",
+      "rtc.c/h",
+      "test_round54.py",
+      "test_mm_rtc_host.c",
+      "docs/演进路线_逐项状态.md",
+      "docs/第五十四轮_地基能力判据报告.json",
+      "LOONGOS_ROUTE_TODO.md",
+      "README.md",
+      "sync_nas.py",
+      "docs/检查与修复记录.md"
+    ],
+    "pending_commands": [
+      "NAS_HOST=<主机> NAS_PORT=<端口> NAS_USER=<用户> NAS_PASS=<口令> python3 sync_nas.py",
+      "R54_ISO=<NAS 上新 ISO 路径> python3 test_round54.py   # 补真机 TCG+KVM 双路",
+      "回取 /tmp/loong_round54_report.json 并更新本报告"
+    ],
+    "honest_note": "GitHub 已同步；NAS 未同步、真机 KVM 双路未执行，均如实标注，不谎报完成"
   }
 }
