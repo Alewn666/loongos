@@ -58,6 +58,27 @@ int main(void)
     to_hex(h1, 32, hex);
     ok(strstr(hex, "6c6f6f6e6732303236") == NULL, "hash has no plaintext 'loong2026' hex");
 
+    /* ---- 第五十四轮：常量时间比较 ct_memeq（演进路线 3.3）---- */
+    const char *A = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    char B[65];
+    strcpy(B, A);
+    ok(ct_memeq(A, B, 64) == 1, "ct_memeq 等长相等返回 1");
+    ok(ct_memeq(A, A, 0) == 1, "ct_memeq n=0 返回 1");
+    /* 每一个差异位置都必须被检出（覆盖「只在头几字节比较」的偷懒实现） */
+    int all_diff = 1;
+    for (int pos = 0; pos < 64; pos++) {
+        strcpy(B, A);
+        B[pos] = (char)(B[pos] == 'x' ? 'y' : 'x');
+        if (ct_memeq(A, B, 64) != 0) { all_diff = 0; break; }
+    }
+    ok(all_diff, "ct_memeq 全部 64 个差异位置逐一可检出");
+    /* 多字节差异 / 长短相同但内容全异 */
+    ok(ct_memeq("aaaaaaaa", "aaaaaaab", 8) == 0, "ct_memeq 末字节差异可检出");
+    ok(ct_memeq("aaaaaaaa", "bbbbbbbb", 8) == 0, "ct_memeq 全异可检出");
+    /* 不等长语义：只比较给定长度，前 n 字节相同应返回相等 */
+    ok(ct_memeq("abcdefgh", "abcdXXXX", 4) == 1, "ct_memeq 仅比较前 n 字节");
+    ok(ct_memeq("abcdefgh", "abcdXXXX", 8) == 0, "ct_memeq 第 5 字节起差异可检出");
+
     printf("== %d/%d passed ==\n", total - fails, total);
     return fails ? 1 : 0;
 }

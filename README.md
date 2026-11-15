@@ -211,6 +211,8 @@ loongos/
 │   ├── blkdev.h blkdev.c # 块设备统一抽象层：驱动表 + 统一门面
 │   ├── usb_kbd.c virtio_*.c nvme.c pci.c virtio_rng.c uefi_stub.c
 │   ├── gfx.h gfx.c gfx_draw.h desktop.c desktop.h gfxterm.c gfxterm.h
+│   ├── mm.c mm.h rtc.c rtc.h      # 第五十四轮：物理页分配器 + kmalloc / PL031 墙钟
+│   ├── test_round54.py test_mm_rtc_host.c  # 第五十四轮：双路判据 / 宿主单测
 │   ├── font8x16.h font_cjk.h linker.ld auth_cred.h
 │   ├── user/             # 用户态 ELF 样例程序
 │   ├── build.sh build_iso.sh build_image.sh build_pe.py
@@ -228,14 +230,15 @@ loongos/
 
 ## 诚实的边界
 
-- 用户态目前提供 `write` / `open` / `read` / `close` / `lseek` / `exit` 等系统调用，还没有堆分配器，内存全是静态 BSS；EL0 有 30 秒看门狗防止用户程序卡死内核。桌面与窗口同样是**内核态静态结构**，应用不是独立进程，一个窗口崩溃会影响整个系统。
+- 用户态目前提供 `write` / `open` / `read` / `close` / `lseek` / `exit` 等系统调用；**第五十四轮起内核有了动态内存地基**（`mm.c` 物理页分配器 + 8 档 size-class 的 `kmalloc/kfree/kzalloc`，放在独立 8MB RAM 窗口、不占 BSS），但**用户态仍无堆、无 `mmap`/`malloc`**，桌面与窗口依旧是内核态静态结构、应用不是独立进程，一个窗口崩溃会影响整个系统。EL0 有 30 秒看门狗防止用户程序卡死内核。
+- **「对齐 Linux/BSD」目前只做实了地基，不是全部完成**：第五十四轮按用户提供的《LoongOS 演进路线》落地了优先级 0 的 `mm.c`（动态内存）、`rtc.c`（PL031 真实墙钟）、常量时间口令比较，以及 `date`/`mmstat`/`mmtest`/`sysctl`/`uptime`/`free`/`version`/`ls -l` 等低风险增量项；**VFS、每进程 TTBR0、fork/exec/wait、用户态 shell、TTY/信号、socket、ZFS-lite、Jail-lite 等架构级能力一项都未实现**。逐项状态（含 2.2 验收②不满足、违背「不在 kernel.c 加 cmd_*」等技术债）见 [演进路线逐项状态](本体/docs/演进路线_逐项状态.md) 与 [LOONGOS_ROUTE_TODO](本体/LOONGOS_ROUTE_TODO.md)；本轮 `test_round54.py` 本地 TCG 22/22、全套回归 15/15，数据见 [第五十四轮判据报告](本体/docs/第五十四轮_地基能力判据报告.json)。**真机 KVM 双路本轮未复验**（NAS SSH 通道 14 次探测不可达），报告 KVM 列为「—」= 未执行。
 - **多核 SMP 默认关闭，不是「已支持多核」**：QEMU 加 `-machine virt,virtualization=on` 时 PSCI 能拉起 `cpu1` 并在线，但从核定时期中断进不了处理程序，`wfi` 会满速空转烧核（实测 2.5 秒涨 5000 万+ 次）。本轮已修好从核向量表的 128B 槽距（原 IRQ 槽错落在 `+0x14` 而非 `0x280`）与 PSCI conduit 探测（无 EL3/EL2 时优雅跳过，不再刷异常转储）；剩下的是 GIC CPU interface 打通。`-DSMP_ENABLE` 仅供调试。
 - **磁盘别用 `virtio-scsi-pci` 测**：驱动对 transitional 设备主动放弃（真机 PCIe 上改写 64 位 BAR 会 external abort，代码里有 2026-10-25 实测记录）。QEMU 用 `-device virtio-blk-pci` 即走 virtio-blk 路径，8MB 盘能读写、能格式化、能持久挂载；NVMe 盘走 `nvme.c` 原生驱动，装盘与持久化已通过端到端验证。
 - **AAVMF 没有 NVMe 引导驱动**：NVMe 盘只能由内核起来后识别，不能作为 UEFI 启动盘；安装仍从 ISO/光盘引导。
 - **字库有已知缺陷**：`font_cjk.h` 里 `·`(U+00B7) 字形本身是两条竖线，部分框形字（口/回/窗）缺底横——是 885 个字形的历史数据问题，尚未整体更换；桌面文案已避开这些字。
 - **图形桌面与键鼠已在真机 KVM 双路复验，但走的是 QMP 自动注入、不是人工 VNC 体感**：第五十一轮用 `test_kvm_dual.py` 在飞牛 NAS aarch64 真机上以 root 跑通 `-enable-kvm -cpu host -gicv3` 的 **TCG 14/14 + KVM 14/14**（`-nographic` 纯串口）；第五十二轮用 `本体/test_kvm_graphic.py` 在同一台真机起**独立临时 QEMU**（AAVMF + ISO + ramfb 800×600 + qemu-xhci 三 HID），以 QMP `screendump` 真实像素 + `input-send-event` 注入点击/拖拽 + HMP `sendkey` 跑完 **TCG 15/15 + KVM 15/15**——开机进桌面、开始菜单、应用窗口、标题栏拖动、Ctrl+Shift+F1 返回终端、退出后键盘、`install`（**未发 `yes`**，停在「确认请敲」）、`net`、`bench` 图形态渲染、`res` 健康计数全 0 全部通过；截图见 [真机KVM_图形交互总览](本体/docs/screenshots/真机KVM_图形交互总览.png)，数据见 `本体/docs/真机KVM_图形复验报告.json`。这是第一次在**有帧缓冲**的真机 KVM 上跑到 `bench` 的 gfx 分支：全屏填充 x10 由 TCG `121514us` 降到 KVM `2426us`（约 50×），`SHA2=2` / 硬件哈希=1、NISV/同步异常=0。**已补上**：第五十三轮用故障注入做了高频中断专项压测——把硬件 timer 提到 1000Hz，每次 TIMER IRQ 在 `handle_irq` 末尾把**全部 32 个 q 寄存器投毒**，`本体/test_irqstress.py` 逐次回读比对低/高 64bit lane，真机 KVM 双路数百次真实 IRQ 下 `q_mismatch=0`、`calib=64`，证明 800B 异常帧完整保存/恢复 q0..q31（留痕见 `docs/检查与修复记录.md` 第五十三轮，数据见 `本体/docs/真机高频中断压测报告.json`）。**仍未做**：用户在 Web VNC 里手工拖拽的体感验收（QMP 注入模拟 HID ≠ 人工操作）、触屏/多点手势与窗口缩放在真机的专项复验；「装好系统后从硬盘启动进桌面」的真机覆盖、`SHA2=0` 回退纯 C 的真机实测也仍单列保留。
 - 输入是**事件驱动 + 连续轮询的混合**（R 轮）：xHCI 无 IRQ，键鼠仍靠 `usb_kbd_poll()` 轮询收割，但 R 轮起桌面空闲会 `wfi` 睡眠、由 120~1000Hz 自适应唤醒 IRQ 叫醒（有输入时全速不睡），宿主 CPU 从 50% 降到 0.6%；没有触摸 / 多点触控 / 手势；**最小化（第三十五轮）与窗口缩放（第四十九轮）已完成**，右键菜单仍在后续清单里。xHCI 未接 MSI 中断，高频唤醒是为「纯轮询设备要低延迟」付出的固定小成本；CPU 数字来自 QEMU TCG 沙箱，真机 KVM 下绝对值会不同。
-- **安全性按「教学/实验单机内核」评估，不是可联网日常系统**：`docs/安全审计报告.md` 记录了完整分级发现。第三十六轮已修 H1/H2/H3（文件管理器越界写、ELF `phoff` 回绕、`u_strcpy` 越过用户区上界，见 `path.h` 纯函数层 + `test_path_host.c` 24/24）；**仍存在**：开机即 root 无登录门禁、口令哈希非常量时间比较、网络栈无认证、EL0 用户程序继承 root 文件权限。另有 NAS SSH 明文口令曾进入 public 仓库历史（源码已止血，仍需轮换口令 + 清洗历史）。接公网前应视为裸奔。 第三十八轮已完成 S1 的 Git 历史清洗，但 GitHub 旧对象仍可访问，NAS 口令必须立即轮换（详见 `docs/安全审计报告.md` 第十节）。
+- **安全性按「教学/实验单机内核」评估，不是可联网日常系统**：`docs/安全审计报告.md` 记录了完整分级发现。第三十六轮已修 H1/H2/H3（文件管理器越界写、ELF `phoff` 回绕、`u_strcpy` 越过用户区上界，见 `path.h` 纯函数层 + `test_path_host.c` 24/24）；**仍存在**：开机即 root 无登录门禁、网络栈无认证、EL0 用户程序继承 root 文件权限。第五十四轮已把 `shadow_verify()` 的口令哈希比较改为 `ct_memeq()` 常量时间（`volatile` + 全循环、`test_crypto.c` 16/16 含 64 个差异位置逐一检出），**但**只做了软件层保证，未做硬件功耗/时序侧信道实测；9 位 rwx / gid / setuid / login 门禁仍缺。另有 NAS SSH 明文口令曾进入 public 仓库历史（源码已止血，仍需轮换口令 + 清洗历史）。接公网前应视为裸奔。 第三十八轮已完成 S1 的 Git 历史清洗，但 GitHub 旧对象仍可访问，NAS 口令必须立即轮换（详见 `docs/安全审计报告.md` 第十节）。
 - **桌面文本编辑器容量 4KB，且「只读优先」**：`ed_buf[4096]`。超过 4095B **或含非 ASCII 字节**的文件一律进入**只读模式**——按 UTF-8 码点绘制（中文不再乱码、CJK 双宽正确步进），但禁用编辑与保存，避免 `fs_setfile` 把大文件截断重写、或 ASCII 编辑插坏多字节序列。中文**输入**不支持（USB HID 键盘只产 ASCII、无输入法），所以含中文的文件只能查看不能改。第四十九轮之前这里是 1500B 缓冲且**不提示**，点一下「保存」就会静默把大文件截断成 1499B；现由 `test_desktop_apps.py` 的 22 项判据（含串口 `stat` 复核点过保存后大小不变）锁住。文件管理器同时补齐大小显示、新建文件/目录与删除二次确认。
 - **文件进出通道**：`b64out`/`b64in` 经串口终端逐行粘贴 base64（每行字符数为 4 的倍数，单独一行 `.` 或空行结束）。第四十八轮起**不再有 4KB 上限**——`b64in` 攒满一块就流式写盘，容量由文件系统决定（10 直接块 + 512 间接块 ≈ 2MB）。没有 U 盘驱动（USB 只做键鼠）、没有应用层文件传输协议（TCP 只有协议栈），这仍是唯一的通用进出方式；交互提示走串口，图形终端里不建议用。`b64out` 输出带 `-- LOONGOS-B64 BEGIN <n> --` / `END <n> --` 帧标记，粘贴时校验总字节数，漏帧或字节不符即放弃；不带帧的旧格式仍兼容。所有失败路径都写同目录 `.b64tmp` 临时文件，**目标文件原封不动**、也不会留下半截文件；一次性粘贴过快导致输入 ring（8KB）溢出时同样明确放弃（`ring_dropped` 安全网保留）。超过 ~2MB 的文件仍需分块，或等更完整的通道。
 - **网页 VNC 的鼠标固定偏移**来自客户端画布留白 / 缩放没扣（VNC 走相对模式时，内核光标从屏幕中心累加位移，与客户端物理光标起点本就不同），内核改不了 VNC：`开始菜单 → 鼠标校准` 点一次靶心即可补偿，`mousecal` 命令可查询 / 手设 / 清零，并打印绝对/相对报告数判断 VNC 走哪种模式。偏移存 `/etc/mousecal`，未装盘（内存盘）时重启会丢。P2.2 已修复「相对位移被吞、鼠标不跟随」的回归。
@@ -249,7 +252,10 @@ loongos/
 - [本体/docs/桌面系统_架构与路线.md](本体/docs/桌面系统_架构与路线.md) — 早期图形化架构与分期清单（其中「只有 write/exit 两个系统调用」的现状描述已过时）
 - [本体/docs/内核空间预算与扩容指引.md](本体/docs/内核空间预算与扩容指引.md) — 内核链接布局、BSS 余量 ±4 KB 对齐碎片根因、预算守卫与扩容路径
 - [本体/docs/系统资源调配.md](本体/docs/系统资源调配.md) — R 轮：CPU/时钟/内存三类资源的调配设计、7 组 DMA 地址对照实验、`res` 资源账与量化验收
-- [本体/docs/检查与修复记录.md](本体/docs/检查与修复记录.md) — 逐轮设计取舍与排障实录（第三十一轮 = R 轮）
+- [本体/docs/检查与修复记录.md](本体/docs/检查与修复记录.md) — 逐轮设计取舍与排障实录（第三十一轮 = R 轮，第五十四轮 = 动态内存/RTC 地基）
+- [本体/docs/演进路线_逐项状态.md](本体/docs/演进路线_逐项状态.md) — 第五十四轮对《对齐 Linux/BSD 演进路线》逐项核对的诚实状态副本
+- [本体/LOONGOS_ROUTE_TODO.md](本体/LOONGOS_ROUTE_TODO.md) — 第 55–61+ 轮架构级任务清单与技术债登记
+- [本体/docs/第五十四轮_地基能力判据报告.json](本体/docs/第五十四轮_地基能力判据报告.json) — 第五十四轮 22 项双路判据、宿主单测、全套回归与真机 KVM 未执行留痕
 - `LOONGOS_*_TODO.md` 与 `docs/检查与修复记录*.md` — 各阶段任务清单
 
 ## 许可证

@@ -21,6 +21,8 @@
 #include "auth_cred.h" /* 默认账号凭据：盐/迭代数/预计算哈希（内核镜像零明文口令） */
 #include "usb_kbd.h"/* 阶段6①：xHCI + USB HID 键盘 */
 #include "desktop.h"/* 桌面 P1：开机默认进图形桌面 */
+#include "mm.h"     /* 第五十四轮：物理页分配器 + kmalloc（演进路线 2.1） */
+#include "rtc.h"    /* 第五十四轮：PL031 真实墙钟（演进路线 2.2） */
 
 typedef unsigned long u64;
 typedef unsigned int  u32;
@@ -1050,7 +1052,15 @@ static void gic_init(void)
    但池本身常驻 .bss），加上 G_nics[] 等状态，把内核上界顶过 0x40218000 →
    USER_BASE 再上移 0x40218000→0x40230000（留约 40KB 余量；池 + 元数据约 49KB）。
    代码段=EL0 可执行可读（PXN，EL1 不执行用户代码）；data/栈=EL0 可读写（UXN） */
-#define USER_BASE 0x40230000UL       /* 用户区 0x40230000-0x403FFFFF，独立 L3（l3_user）。
+/* 第五十四轮（扩容指引「方案 2」轻量版）：新增 mm/rtc/date/sysctl 等约 16KB
+   .text/.rodata 把 __nvmedma_end 顶到旧 USER_BASE=0x40230000，余量归零、守卫拦截。
+   上移 32KB 到 0x40238000，恢复 32KB「充裕」档余量。连锁面已逐项核对：
+     - -Ttext=0x40240000 仍落在 [USER_BASE, USER_END) 内（间隙 64KB→32KB），
+       用户程序 ELF 链接地址 / USER_END / UARGS_ADDR / EL0 栈 / 内嵌 ELF blob 全不动；
+     - fill_pt(USER_BASE, USER_END, ...) 与 cmd_run 的 vaddr 校验都用宏自动跟随；
+     - l3_user 管 0x40200000-0x403FFFFF，USER_BASE 仍在其中，页索引不回绕；
+     - golden_behavior.txt 的 mmu/tasks 地址输出全部被规范化成 0xADDR，逐字不受影响。 */
+#define USER_BASE 0x40238000UL       /* 用户区 0x40238000-0x403FFFFF，独立 L3（l3_user）。
                                         内核 .bss 可延伸到 0x40200000 起的那几页（PROT_RAM，EL1 专用），
                                         用户区权限只从 USER_BASE 起覆盖，互不干扰。 */
 #define USER_END  0x40400000UL
@@ -2274,9 +2284,9 @@ static int shadow_verify(const char *name, const char *pw)
             char got[65];
             sha256_iter(salt, 8, pw, iter, h);
             to_hex(h, 32, got);
-            for (u32 j = 0; j < 64; j++)
-                if (got[j] != buf[c3 + 1 + j]) return -1;
-            return 0;
+            /* 第五十四轮：常量时间比较，去掉「前几字节猜对就慢一点」的
+               时序侧信道（演进路线 3.3）。64 个 hex 字符恒长比对。 */
+            return ct_memeq(got, buf + c3 + 1, 64) ? 0 : -1;
         }
         if (p < (u32)n) p++;
     }
@@ -2327,6 +2337,15 @@ static void cmd_crash(char *a);
 static void cmd_mmu(char *a);
 static void cmd_tasks(char *a);
 static void cmd_el0(char *a);
+/* 第五十四轮新命令（定义体在 CMDS 表之前） */
+static void cmd_date(char *a);
+static void cmd_mmstat(char *a);
+static void cmd_mmtest(char *a);
+static void cmd_sysctl(char *a);
+static void cmd_uptime(char *a);
+static void cmd_free(char *a);
+static void cmd_version(char *a);
+static void ls_cb_long(const struct dirent *de, int ino, void *arg);
 static void cmd_help(char *a);
 static void cmd_touch(char *a);
 static void cmd_mv(char *a);
@@ -3071,6 +3090,251 @@ static void cmd_irqstress(char *args)
     uart_puts(ok ? "[irqstress] RESULT PASS\n" : "[irqstress] RESULT FAIL\n");
 }
 
+/* ==================== 第五十四轮：地基能力命令集 ====================
+ * 文档《LoongOS 演进路线：对齐 Linux/BSD》优先级 0（2.1/2.2）与优先级 2
+ * 里「落地即可」的小项（sysctl / uptime / free / version / ls -l）。
+ *
+ * ⚠️ 全部刻意不写进 cmd_help / golden_behavior.txt —— 与前几轮的 res /
+ *    smpwork / irqstress 同一策略：新增能力不扰动 29 条逐字基线。
+ * 环境变量式的静态数据（版本号 / 开机墙钟）用文件内 static 变量，避免
+ * 往 loongos.h 塞一堆新 extern。
+ */
+#define LOS_VERSION  "LoongOS 54.0-foundation (aarch64 / armvirt)"
+
+static u64 g_boot_wall = 0;        /* 内核启动瞬间的墙钟 Unix 秒（rtc_init 后记录） */
+
+/* 简易十进制解析（无 libc）：只处理可选负号 + 数字，返回 0/1 */
+static int parse_i32(const char *s, int *out)
+{
+    if (!s || !*s) return 0;
+    int neg = 0, v = 0;
+    if (*s == '-') { neg = 1; s++; }
+    else if (*s == '+') s++;
+    if (!*s) return 0;
+    while (*s) {
+        if (*s < '0' || *s > '9') return 0;
+        v = v * 10 + (*s - '0');
+        s++;
+    }
+    *out = neg ? -v : v;
+    return 1;
+}
+
+/* date —— 真实墙钟（演进路线 2.2 主验收）
+ *   date            显示本地时间 + UTC epoch + 时区 + RTC 状态
+ *   date tz <分钟>   设时区（如 date tz 480 / date tz -300）
+ *   date -u          强制按 UTC+0 显示一次（不改当前 TZ 设置） */
+static void cmd_date(char *a)
+{
+    char *w = next_word(&a);
+    if (w && fs_strcmp(w, "tz") == 0) {
+        char *v = next_word(&a);
+        int m;
+        if (!v || !parse_i32(v, &m)) { uart_puts("用法: date tz <分钟>  (如 480 / -300)\n"); return; }
+        rtc_set_tz(m);
+        uart_puts("[date] 时区设为 UTC");
+        if (m >= 0) { uart_puts("+"); uart_putdec((u32)(m / 60)); }
+        else { uart_puts("-"); uart_putdec((u32)(-m / 60)); }
+        uart_puts(" (offset="); if (m < 0) uart_puts("-");
+        uart_putdec((u32)(m < 0 ? -m : m)); uart_puts(" min)\n");
+        return;
+    }
+    int saved = rtc_tz(), force_utc = 0;
+    if (w && fs_strcmp(w, "-u") == 0) { rtc_set_tz(0); force_utc = 1; }
+
+    u64 ep = rtc_now();
+    char buf[64];
+    if (ep) rtc_format(ep, buf, sizeof buf);
+    else { buf[0] = 0; }
+    uart_puts("[date] local  = ");
+    uart_puts(ep ? buf : "(RTC 不可用)");
+    uart_puts("\n");
+    uart_puts("[date] epoch  = "); uart_putdec((u32)ep); uart_puts(" s (UTC)\n");
+    if (ep && !force_utc) {
+        rtc_set_tz(0);
+        rtc_format(ep, buf, sizeof buf);
+        uart_puts("[date] utc    = "); uart_puts(buf); uart_puts("\n");
+    }
+    uart_puts("[date] tz     = UTC");
+    if (saved >= 0) uart_puts("+"); else uart_puts("-");
+    uart_putdec((u32)((saved < 0 ? -saved : saved) / 60));
+    uart_puts(":");
+    uart_putdec((u32)((saved < 0 ? -saved : saved) % 60));
+    uart_puts("  source=PL031(0x09010000)  valid=");
+    uart_putdec((u32)rtc_valid()); uart_puts("\n");
+    rtc_set_tz(saved);
+}
+
+/* mmstat —— 堆水位（演进路线 2.1 验收：build.sh 打印布局，运行期查水位） */
+static void cmd_mmstat(char *a)
+{
+    (void)a;
+    u32 tp, fp, ub, pb, lv, ac, fc, ec, bfc;
+    mm_stat(&tp, &fp, &ub, &pb, &lv, &ac, &fc, &ec, &bfc);
+    uart_puts("[mm ] heap   = "); uart_puthex(mm_heap_base());
+    uart_puts(" bytes="); uart_putdec(mm_heap_bytes());
+    uart_puts(" page="); uart_putdec((u32)4096); uart_puts("B\n");
+    uart_puts("[mm ] pages  = "); uart_putdec(tp);
+    uart_puts(" free="); uart_putdec(fp);
+    uart_puts(" used="); uart_putdec(tp - fp); uart_puts("\n");
+    uart_puts("[mm ] objs   = live="); uart_putdec(lv);
+    uart_puts(" used_bytes="); uart_putdec(ub);
+    uart_puts(" peak_bytes="); uart_putdec(pb); uart_puts("\n");
+    uart_puts("[mm ] counts = alloc="); uart_putdec(ac);
+    uart_puts(" free="); uart_putdec(fc);
+    uart_puts(" fail="); uart_putdec(ec);
+    uart_puts(" badfree="); uart_putdec(bfc); uart_puts("\n");
+    uart_puts("[mm ] audit  = "); uart_putdec((u32)kmalloc_audit());
+    uart_puts("  (0=健康)\n");
+    uart_puts("[mm ] BSS 余量="); uart_putdec((u32)(USER_BASE - (u64)__nvmedma_end));
+    uart_puts(" B（堆不占 BSS，余量不受影响）\n");
+}
+
+/* mmtest —— 1000 次分配/释放零泄漏自检（可复现判据，非「串口说成功」） */
+static void cmd_mmtest(char *a)
+{
+    (void)a;
+    int r = kmalloc_test();
+    u32 tp, fp, ub, pb, lv, ac, fc, ec, bfc;
+    mm_stat(&tp, &fp, &ub, &pb, &lv, &ac, &fc, &ec, &bfc);
+    uart_puts("[mmtest] rounds=1000x2  result=");
+    uart_puts(r == 0 ? "PASS" : "FAIL");
+    uart_puts("  bad="); uart_putdec((u32)r); uart_puts("\n");
+    uart_puts("[mmtest] after: live="); uart_putdec(lv);
+    uart_puts(" used_bytes="); uart_putdec(ub);
+    uart_puts(" peak_bytes="); uart_putdec(pb);
+    uart_puts(" free_pages="); uart_putdec(fp); uart_puts("\n");
+    uart_puts("[mmtest] audit="); uart_putdec((u32)kmalloc_audit());
+    uart_puts("  alloc="); uart_putdec(ac);
+    uart_puts(" free="); uart_putdec(fc);
+    uart_puts(" badfree="); uart_putdec(bfc); uart_puts("\n");
+}
+
+/* uptime —— 开机时长（tick/10 秒） + 开机墙钟 */
+static void cmd_uptime(char *a)
+{
+    (void)a;
+    u32 sec = (u32)(tick / 10);
+    uart_puts("[uptime] up "); uart_putdec(sec); uart_puts(" s (");
+    uart_putdec(sec / 3600); uart_puts("h ");
+    uart_putdec((sec / 60) % 60); uart_puts("m ");
+    uart_putdec(sec % 60); uart_puts("s)");
+    uart_puts("  boot_wall="); uart_putdec((u32)g_boot_wall);
+    uart_puts("  now_wall="); uart_putdec((u32)rtc_now()); uart_puts("\n");
+}
+
+/* free —— 堆 + 静态区余量（对应 /proc/meminfo 思路，但本轮不入 VFS） */
+static void cmd_free(char *a)
+{
+    (void)a;
+    u32 tp, fp, ub, pb, lv, ac, fc, ec, bfc;
+    mm_stat(&tp, &fp, &ub, &pb, &lv, &ac, &fc, &ec, &bfc);
+    u32 heap_total = tp * 4096u, heap_free = fp * 4096u;
+    if (heap_total > 1024u) { heap_total /= 1024u; heap_free /= 1024u; }
+    uart_puts("[free] 动态堆(独立 RAM 窗口, 不占 BSS): total=");
+    uart_putdec(heap_total); uart_puts(" KB  free=");
+    uart_putdec(heap_free); uart_puts(" KB  used_bytes=");
+    uart_putdec(ub); uart_puts(" B\n");
+    uart_puts("[free] 静态区: .bss 余量=");
+    uart_putdec((u32)(USER_BASE - (u64)__nvmedma_end));
+    uart_puts(" B  mm.audit="); uart_putdec((u32)kmalloc_audit()); uart_puts("\n");
+}
+
+/* version —— 内核/OS 版本（sysctl kern.version 的数据源） */
+static void cmd_version(char *a)
+{
+    (void)a;
+    uart_puts(LOS_VERSION); uart_puts("\n");
+    uart_puts("  arch=aarch64  mm=on  rtc=PL031  sha2=");
+    uart_puts(sha256_hw_enabled() ? "hw" : "c"); uart_puts("\n");
+}
+
+/* sysctl —— BSD 风格键值查询（演进路线四「sysctl 落地即可」）
+ *   sysctl -a           列出全部
+ *   sysctl <key>        查单个
+ * 支持：kern.version / kern.ostype / kern.uptime / kern.heap_free /
+ *       kern.heap_peak / kern.tz / kern.rtc / hw.ncpu / hw.pagesize /
+ *       hw.sha2 / kern.clocksource */
+static void cmd_sysctl(char *a)
+{
+    char *key = next_word(&a);
+    int list_all = (key && fs_strcmp(key, "-a") == 0);
+    if (!key) { uart_puts("用法: sysctl -a | sysctl <key>  (如 kern.version / hw.ncpu)\n"); return; }
+
+    u32 tp, fp, ub, pb, lv, ac, fc, ec, bfc;
+    mm_stat(&tp, &fp, &ub, &pb, &lv, &ac, &fc, &ec, &bfc);
+    u32 ncpu = 0;
+    for (int i = 0; i < 4; i++) if (smp_online[i]) ncpu++;
+
+    /* 单键快速路径：命中即打印并返回 */
+    struct kv { const char *k; const char *sv; u32 nv; int is_str; };
+    struct kv tab[] = {
+        { "kern.version",     LOS_VERSION, 0, 1 },
+        { "kern.ostype",      "LoongOS", 0, 1 },
+        { "kern.uptime",      0, (u32)(tick / 10), 0 },
+        { "kern.heap_free",   0, fp, 0 },
+        { "kern.heap_peak",   0, pb, 0 },
+        { "kern.heap_used",   0, ub, 0 },
+        { "kern.heap_audit",  0, (u32)kmalloc_audit(), 0 },
+        { "kern.tz",          0, (u32)rtc_tz(), 0 },
+        { "kern.rtc",         0, (u32)rtc_valid(), 0 },
+        { "kern.clocksource", "armv8-generic-timer + pl031", 0, 1 },
+        { "hw.ncpu",          0, ncpu, 0 },
+        { "hw.pagesize",      0, 4096u, 0 },
+        { "hw.sha2",          0, (u32)sha256_hw_enabled(), 0 },
+        { "hw.machine",       "aarch64", 0, 1 },
+        { 0, 0, 0, 0 }
+    };
+    if (!list_all) {
+        for (int i = 0; tab[i].k; i++) {
+            if (fs_strcmp(key, tab[i].k) == 0) {
+                uart_puts(tab[i].k); uart_puts(" = ");
+                if (tab[i].is_str) uart_puts(tab[i].sv);
+                else uart_putdec(tab[i].nv);
+                uart_puts("\n");
+                return;
+            }
+        }
+        uart_puts("sysctl: unknown oid '"); uart_puts(key);
+        uart_puts("'（sysctl -a 列全部）\n");
+        return;
+    }
+    for (int i = 0; tab[i].k; i++) {
+        uart_puts(tab[i].k); uart_puts(" = ");
+        if (tab[i].is_str) uart_puts(tab[i].sv);
+        else uart_putdec(tab[i].nv);
+        uart_puts("\n");
+    }
+}
+
+/* ls -l —— 长格式（演进路线 2.2 的第一眼破绽：mtime 不再是「开机第几秒」）
+ * ⚠️ 只在参数以 "-l" 开头时走这里；无参数 / `ls /etc` 等既有形式逐字不变，
+ *    golden_behavior.txt 的 4 条 ls 命令完全不受影响。 */
+static void ls_cb_long(const struct dirent *de, int ino, void *arg)
+{
+    (void)arg;
+    int t = fs_filetype(ino);
+    int mode = fs_inode_mode(ino);
+    int uid  = fs_inode_uid(ino);
+    /* 展示层 9 位 rwx：教学版目前只有 FM_PRIVATE，其余沿用 Unix 惯用默认值
+       （目录 755 / 普通文件 644），私密文件收敛成 600。真实 9 位 ACL/gid/setuid
+       属于演进路线 3.3，需配合 VFS 一起做，本轮不冒充已实现。 */
+    const char *perm;
+    if (t == FS_T_DIR) perm = (mode > 0 && (mode & FM_PRIVATE)) ? "drwx------" : "drwxr-xr-x";
+    else               perm = (mode > 0 && (mode & FM_PRIVATE)) ? "-rw-------" : "-rw-r--r--";
+    uart_puts(perm);
+    uart_puts(" "); uart_putdec((u32)(uid < 0 ? 0 : uid));
+    uart_puts(" root ");
+    if (t == FS_T_FILE) uart_putdec((u32)fs_filesize(ino));
+    else uart_puts("0");
+    uart_puts("  ");
+    u64 w = fs_inode_wall(ino);
+    if (w) { char b[64]; rtc_format(w, b, sizeof b); uart_puts(b); }
+    else   uart_puts("(无墙钟)");
+    uart_puts("  "); uart_puts(de->name); uart_puts("\n");
+}
+
+
 static const struct cmdent CMDS[] = {
     { "ls",    cmd_ls    }, { "cat",   cmd_cat   }, { "write", cmd_write },
     { "mkdir", cmd_mkdir }, { "rm",    cmd_rm    }, { "df",    cmd_df    },
@@ -3087,6 +3351,10 @@ static const struct cmdent CMDS[] = {
     { "res", cmd_res },        /* R 轮资源账诊断（刻意不写进 help，保行为基线逐字一致） */
     { "smpwork", cmd_smpwork },/* 阶段9 多核工作分派演示（刻意不写进 help / 行为基线） */
     { "irqstress", cmd_irqstress }, /* 第五十三轮 高频中断压测（刻意不写进 help / 行为基线） */
+    /* 第五十四轮：地基能力命令集（刻意不写进 help / 行为基线） */
+    { "date", cmd_date }, { "mmstat", cmd_mmstat }, { "mmtest", cmd_mmtest },
+    { "sysctl", cmd_sysctl }, { "uptime", cmd_uptime }, { "free", cmd_free },
+    { "version", cmd_version },
     { "poweroff", cmd_poweroff }, { "shutdown", cmd_shutdown },
     { "halt", cmd_halt },         { "reboot", cmd_reboot },
     { 0, 0 }
@@ -3412,6 +3680,15 @@ static void cmd_ls(char *a)
 {
     char rp[128];
     const char *path;
+    /* 第五十四轮：ls -l 长格式（真实墙钟 mtime）。只在这个新参数形式下走
+       新回调；无参数 / `ls /etc` 等既有形式逐字不变，golden 基线不受影响。 */
+    int long_fmt = 0;
+    if (a && a[0] == '-' && a[1] == 'l' && (a[2] == 0 || a[2] == ' ')) {
+        long_fmt = 1;
+        a += 2;
+        while (*a == ' ') a++;
+        if (!*a) a = 0;
+    }
     if (a && *a) {
         if (path_resolve(a, rp, sizeof rp) < 0) { uart_puts("路径太长\n"); return; }
         path = rp;
@@ -3421,7 +3698,7 @@ static void cmd_ls(char *a)
     int ino = fs_lookup(path);
     if (ino < 0) { uart_puts("没有这个路径: "); uart_puts(path); uart_puts("\n"); return; }
     if (!fs_isdir(ino)) { uart_puts("f  "); uart_puts(path); uart_puts("  "); uart_putdec((u32)fs_filesize(ino)); uart_puts("B\n"); return; }
-    fs_list(ino, ls_cb, 0);
+    fs_list(ino, long_fmt ? ls_cb_long : ls_cb, 0);
 }
 static void cmd_cat(char *a)
 {
@@ -3978,6 +4255,41 @@ void kernel_main(unsigned long bootinfo)
 
     mmu_init();
     uart_puts("[mmu ] MMU 已开启：内核 text 只读、data 可写、设备 Device 映射\n");
+
+    /* ---- 第五十四轮地基初始化：全部静默，golden_behavior.txt 启动日志逐字不变 ----
+     * 顺序有讲究：必须排在 mmu_init 之后（堆窗口/PL031 都要走页表映射），
+     * 且排在 fs_init 之前（这样格式化演示文件时 inode.wall 就能盖真实墙钟）。
+     * ① RTC：读 PL031，判定读数可信度；② mm：从候选 RAM 窗口里挑一个不和
+     *    GOP 帧缓冲 / ramfb / ESP 镜像重叠的 8MB 段；③ fs 注入墙钟回调。
+     * 三者都不 uart_puts，也不改任何既有打印。 */
+    rtc_init();
+    {
+        const u64 cand[3] = { MM_WIN_CAND0, MM_WIN_CAND1, MM_WIN_CAND2 };
+        u64 win = MM_WIN_CAND0;
+        for (int ci = 0; ci < 3; ci++) {
+            u64 s = cand[ci], e = s + MM_WIN_SIZE;
+            int clash = 0;
+            /* GOP 帧缓冲（UEFI bootinfo） */
+            if (g_bi && g_bi->magic == BOOTINFO_MAGIC && g_bi->base && g_bi->size) {
+                u64 fs_ = g_bi->base, fe = g_bi->base + g_bi->size;
+                if (s < fe && fs_ < e) clash = 1;
+            }
+            /* ramfb 显示缓冲 FB_PHYS（裸 ELF 启动路径） */
+            {
+                u64 fs_ = 0x41000000UL, fe = fs_ + (u64)FB_STRIDE * FB_H;
+                if (s < fe && fs_ < e) clash = 1;
+            }
+            /* ESP 镜像缓冲（安装器要用，绝不能被堆踩） */
+            if (g_bi && g_bi->img_addr && g_bi->img_size) {
+                u64 fs_ = g_bi->img_addr, fe = g_bi->img_addr + g_bi->img_size;
+                if (s < fe && fs_ < e) clash = 1;
+            }
+            if (!clash) { win = s; break; }
+        }
+        mm_init((void *)win, (u32)MM_WIN_SIZE);
+    }
+    fs_set_wallclock(rtc_now);
+    g_boot_wall = rtc_now();          /* uptime 的开机墙钟基准 */
 
     /* 阶段9：拉起从核（默认启用——用户要求「把核心都用起来」）。
        从核平时 wfi 真睡（宿主 CPU ≈0%），只在收到 SGI 时被唤醒认领工作；

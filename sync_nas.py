@@ -121,6 +121,21 @@ FILES = [
     ('本体/test_irqstress.py',   '本体/test_irqstress.py'),
     ('本体/test_desktop_p2.py',  '本体/test_desktop_p2.py'),
     ('本体/docs/真机高频中断压测报告.json', '本体/docs/真机高频中断压测报告.json'),
+    # 第五十四轮：演进路线地基能力（动态内存 + 真实墙钟 + 常量时间比较）
+    # 注：kernel.c / kernel.elf / build.sh / bss_budget.txt / crypto.c/h / fs.c/h /
+    #     ISO / iso.md5 / docs/检查与修复记录.md / README.md 已在上面登记，
+    #     此处只补本轮新增的编译单元、单测、判据脚本、状态文档与报告。
+    ('本体/mm.c',                 '本体/mm.c'),
+    ('本体/mm.h',                 '本体/mm.h'),
+    ('本体/rtc.c',                '本体/rtc.c'),
+    ('本体/rtc.h',                '本体/rtc.h'),
+    ('本体/test_mm_rtc_host.c',   '本体/test_mm_rtc_host.c'),
+    ('本体/test_crypto.c',        '本体/test_crypto.c'),
+    ('本体/test_fs_host.c',       '本体/test_fs_host.c'),
+    ('本体/test_round54.py',      '本体/test_round54.py'),
+    ('本体/docs/演进路线_逐项状态.md', '本体/docs/演进路线_逐项状态.md'),
+    ('本体/docs/第五十四轮_地基能力判据报告.json', '本体/docs/第五十四轮_地基能力判据报告.json'),
+    ('本体/LOONGOS_ROUTE_TODO.md', '本体/LOONGOS_ROUTE_TODO.md'),
 ]
 
 def md5_local(path):

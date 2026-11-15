@@ -25,6 +25,7 @@ UCFLAGS="-nostdlib -ffreestanding -static -fno-stack-protector -fno-pie -O2 -Wal
 
 # ---- 内核编译单元：唯一事实来源（顺序即链接顺序，勿随意重排）----
 KERN_SRCS="boot.S kernel.c fs.c crypto.c usb_kbd.c \
+           mm.c rtc.c \
            blkdev.c virtio_blk.c virtio_blk_legacy.c virtio_scsi.c virtio_net.c \
            net.c tcp.c smp.c nvme.c virtio_rng.c pci.c \
            nic.c e1000.c rtl8139.c \
@@ -226,5 +227,31 @@ BEGIN {
     printf "align_gap_bytes=%d\n", gap    >> bf
     close(bf)
 }' || exit 1
+
+# --- 第五十四轮：动态堆布局守卫（演进路线 2.1 验收「build.sh 打印堆起始」）------
+# 堆在【内核镜像之外的固定 RAM 窗口】，不占 BSS，因此不改变上面的预算账。
+# 这里静态校验三件事：① 窗口 >= USER_END（不能和用户程序区重叠）；
+# ② 窗口避开 ramfb 显示缓冲 0x41000000 起的 ~1.92MB；③ 窗口在 QEMU virt
+# 的 128MB RAM 内（0x40000000-0x48000000）。运行期实际选窗由 kernel.c 的
+# mm_pick_window() 再依据 UEFI bootinfo 做一次 GOP/ESP 镜像避让。
+MM_C0=$(sed -n 's/^#define[[:space:]]*MM_WIN_CAND0[[:space:]]*\(0x[0-9A-Fa-f]*\).*/\1/p' mm.h | head -1)
+MM_SZ=$(sed -n 's/^#define[[:space:]]*MM_WIN_SIZE[[:space:]]*(\(.*\)).*/\1/p' mm.h | head -1)
+printf '[heap] 动态堆候选窗口 C0=%s  大小=8MB(2048 页 x 4KB)  控制页=窗口第 0 页\n' "$MM_C0"
+printf '[heap] 不占 BSS：mm.c 仅 1 个控制页指针(8B)，位图/页归属表全在控制页内\n'
+printf '[heap] 构建期静态守卫：USER_END=%s  ramfb=0x41000000  RAM 上界=0x48000000(-m 128M)\n' "$USER_END"
+awk -v c0="$MM_C0" -v ue="$USER_END" '
+function h2d(s,  i,ch,v,n){n=0;s=tolower(s);sub(/^0x/,"",s);
+  for(i=1;i<=length(s);i++){ch=substr(s,i,1);v=index("0123456789abcdef",ch)-1;if(v<0)return -1;n=n*16+v}return n}
+BEGIN {
+    # ⚠️ mawk 不认 0x 前缀的数字字面量（会当字符串 → ram=0 / fb 变拼接串），
+    #    这里一律用十进制常量：0x41000000=1090519040, 0x48000000=1207959552
+    c=h2d(c0); u=h2d(ue); fb=1090519040+3200*600; ram=1207959552;
+    if (c<0 || u<0) { print "X 堆窗口/USER_END 解析失败"; exit 1 }
+    if (c < u)               { print "X 堆窗口落在用户程序区内"; exit 1 }
+    if (c < fb)              { print "X 堆窗口与 ramfb 显示缓冲重叠"; exit 1 }
+    if (c + 8*1024*1024 > ram){ print "X 堆窗口超出 -m 128M 的物理 RAM"; exit 1 }
+    print "[heap][guard] OK 窗口 >= USER_END、避开 ramfb、在 128MB RAM 内"
+}' || exit 1
+
 echo "== kernel.elf 构建完成 =="
 ls -la kernel.elf build/hello.elf build/bad.elf

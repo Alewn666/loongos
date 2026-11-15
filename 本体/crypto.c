@@ -264,3 +264,17 @@ void to_hex(const u8 *in, u32 n, char *out)
     }
     out[n * 2] = 0;
 }
+
+/* 第五十四轮：常量时间比较（演进路线 3.3 / 安全审计遗留项）。
+ * 关键：① 循环次数恒为 n，与内容无关；② 用 volatile 累加器阻止编译器
+ * 把「已经不等了」优化成提前退出；③ 不对秘密字节做 if/分支跳转。
+ * 返回 (diff == 0)，比较本身不泄漏「从第几个字节开始不同」。 */
+int ct_memeq(const void *a, const void *b, u32 n)
+{
+    const volatile u8 *x = (const volatile u8 *)a;
+    const volatile u8 *y = (const volatile u8 *)b;
+    volatile u32 diff = 0;
+    for (u32 i = 0; i < n; i++)
+        diff |= (u32)(x[i] ^ y[i]);
+    return diff == 0;
+}

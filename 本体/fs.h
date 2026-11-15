@@ -46,7 +46,11 @@ struct inode {
     u64 mtime;                /* 秒（用 tick/10） */
     u64 direct[10];           /* 10 个直接块 */
     u64 indirect;             /* 一个间接块（512 个块号）→ 最大文件 2MB+40KB */
-    u64 _pad[2];              /* 16B 补齐（u64 需 8 对齐，必须紧跟 indirect） */
+    /* 第五十四轮：复用 16B 补齐位的前 8B 存「真实墙钟 Unix 秒」。
+       inode 总大小仍 128B、磁盘布局逐字节不变；mtime 继续是开机秒数
+       （tick/10），stat/ls 的既有输出与 golden_behavior.txt 保持逐字一致。 */
+    u64 wall;                 /* 真实墙钟（rtc_now），0 = 无墙钟（宿主单测 / RTC 不可用） */
+    u64 _pad;                 /* 8B 补齐（u64 需 8 对齐，必须紧跟 indirect） */
     u16 uid;                  /* 属主 uid（阶段5）：0 = root */
     u8  mode;                 /* FM_* 位（阶段5） */
     u8  _rsv;                 /* 保留 */
@@ -84,6 +88,11 @@ int  fs_touch(const char *path);                    /* 不存在建空文件；�
 int  fs_rename(const char *oldp, const char *newp);/* 改目录项（inode 号不变，不做数据搬运） */
 int  fs_inode_mtime(int ino);                       /* mtime（秒，开机起算）；查不到 -1 */
 int  fs_inode_mode(int ino);                        /* FM_* 位；查不到 -1 */
+/* 第五十四轮：真实墙钟。fs.c 不直接依赖 rtc.c（宿主单测零改动），由
+   kernel.c 在 rtc_init 之后注入回调；未注入 / RTC 不可用时恒 0。 */
+void fs_set_wallclock(u64 (*fn)(void));
+u64  fs_wall_now(void);                             /* 当前墙钟（回调），0 = 不可用 */
+u64  fs_inode_wall(int ino);                        /* inode 记录的创建/修改墙钟，0 = 无 */
 
 /* —— 阶段5：身份与权限 ——
  * 规则（教学版 DAC）：

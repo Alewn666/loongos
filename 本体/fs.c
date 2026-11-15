@@ -84,6 +84,19 @@ static void bwrite(u32 b, const void *buf)
     fs_memcpy(fs_disk + (u32)b * FS_BLOCK, buf, FS_BLOCK);
 }
 
+/* ---------------- 第五十四轮：真实墙钟（演进路线 2.2） ----------------
+ * fs.c 里 8 处写 mtime 的点同时写 inode.wall。为避免让 fs.c 直接依赖
+ * rtc.c（会破坏 test_fs_host.c 的「只补 4 个外部符号桩」编译方式），这里
+ * 用可注入回调：kernel.c 在 rtc_init 之后 fs_set_wallclock(rtc_now)，
+ * 宿主单测不注入 → fs_wall_now() 恒 0 → inode.wall=0，磁盘布局与旧版一致。
+ * mtime 语义不变（tick/10，开机秒数），stat 输出与 golden 基线逐字不变。 */
+static u64 (*fs_wallclk)(void) = 0;
+void fs_set_wallclock(u64 (*fn)(void)) { fs_wallclk = fn; }
+u64  fs_wall_now(void) { return fs_wallclk ? fs_wallclk() : 0UL; }
+
+/* 所有 mtime 写入点统一走这个宏：既写开机秒数，也盖真实墙钟。 */
+#define STAMP(inp)  do { (inp).mtime = tick / 10; (inp).wall = fs_wall_now(); } while (0)
+
 /* ---------------- 当前操作者（阶段5 DAC） ---------------- */
 static int fs_uid = 0;      /* 0 = root；su 切换用户时 shell 调 fs_setuid 同步 */
 void fs_setuid(int uid) { fs_uid = uid; }
@@ -108,6 +121,7 @@ void fs_memcpy(void *d, const void *s, u32 n)
         while (n && ((u64)pd & 7)) { *pd++ = *ps++; n--; }
         u64 *xd = (u64 *)pd; const u64 *xs = (const u64 *)ps;
         while (n >= 64) {
+#if defined(__aarch64__)
             u64 a, b;
             __asm__ volatile(
                 "ldp %0, %1, [%2]\n\t"
@@ -119,6 +133,10 @@ void fs_memcpy(void *d, const void *s, u32 n)
                 "ldp %0, %1, [%2, #48]\n\t"
                 "stp %0, %1, [%3, #48]"
                 : "=&r"(a), "=&r"(b) : "r"(xs), "r"(xd) : "memory");
+#else
+            /* 宿主单元测试（x86）纯 C 回退：语义与 4×ldp/stp 一致 */
+            for (int k = 0; k < 8; k++) xd[k] = xs[k];
+#endif
             xs += 8; xd += 8; n -= 64;
         }
         while (n >= 8) { *xd++ = *xs++; n -= 8; }
@@ -137,12 +155,16 @@ void fs_memset(void *d, int v, u32 n)
     while (n && ((u64)p & 7)) { *p++ = b; n--; }     /* 头部对齐 */
     u64 *q = (u64 *)p;
     while (n >= 64) {                                /* 主体：64B/轮 */
+#if defined(__aarch64__)
         __asm__ volatile(
             "stp %0, %0, [%1]\n\t"
             "stp %0, %0, [%1, #16]\n\t"
             "stp %0, %0, [%1, #32]\n\t"
             "stp %0, %0, [%1, #48]"
             :: "r"(pat), "r"(q) : "memory");
+#else
+        for (int k = 0; k < 8; k++) q[k] = pat;
+#endif
         q += 8; n -= 64;
     }
     while (n >= 8) { *q++ = pat; n -= 8; }           /* 剩余整字 */
@@ -220,7 +242,7 @@ static int ialloc(u16 type, u16 uid)
             in.type = type;
             in.nlink = 1;
             in.uid = uid;                   /* 属主（阶段5） */
-            in.mtime = tick / 10;
+            STAMP(in);
             iput((int)i, &in);
             return (int)i;
         }
@@ -324,7 +346,7 @@ static int dir_add(int dino, const char *name, int ino)
             bread(b, blk);
             fs_memcpy(blk + (i * sizeof(de)) % FS_BLOCK, &de, sizeof(de));
             bwrite(b, blk);
-            di.mtime = tick / 10;
+            STAMP(di);
             iput(dino, &di);
             return 0;
         }
@@ -344,7 +366,7 @@ static int dir_add(int dino, const char *name, int ino)
     fs_memcpy(nblk, &de, sizeof(de));
     bwrite(b, nblk);
     di.size += FS_BLOCK;
-    di.mtime = tick / 10;
+    STAMP(di);
     iput(dino, &di);
     return 0;
 }
@@ -658,7 +680,7 @@ int fs_setfile(int ino, const u8 *buf, u32 len)
         off += chunk;
     }
     in.size = len;
-    in.mtime = tick / 10;
+    STAMP(in);
     iput(ino, &in);                          /* 新引用先落盘 */
 
     /* ④释放旧块：新块绝不会和旧块重号——旧块一直占着位图，balloc 挑不到它们 */
@@ -710,7 +732,7 @@ int fs_append(int ino, const u8 *buf, u32 len)
         in.size += chunk;
         off += chunk;
     }
-    in.mtime = tick / 10;
+    STAMP(in);
     iput(ino, &in);                           /* 数据块全部写完才落 inode */
     return 0;
 }
@@ -757,7 +779,7 @@ int fs_unlink(const char *path)
         fs_memcpy(blk + (u32)slot * sizeof(de) % FS_BLOCK, &de, sizeof(de));
         bwrite(b, blk);
     }
-    di.mtime = tick / 10;
+    STAMP(di);
     iput(pino, &di);
     ifree(ino);
     return 0;
@@ -824,6 +846,14 @@ int fs_inode_mode(int ino)
     return in.type == FS_T_NONE ? -1 : (int)in.mode;
 }
 
+u64 fs_inode_wall(int ino)
+{
+    if (ino < 1 || ino >= (int)FS_NINODE) return 0UL;
+    struct inode in;
+    iget(ino, &in);
+    return in.type == FS_T_NONE ? 0UL : in.wall;
+}
+
 int fs_touch(const char *path)
 {
     int ino = fs_lookup(path);
@@ -832,7 +862,7 @@ int fs_touch(const char *path)
     iget(ino, &in);
     if (in.type == FS_T_NONE) return -1;
     if (!can_mutate(&in)) return FS_DENIED;        /* 只有属主 / root 能刷新时间 */
-    in.mtime = tick / 10;
+    STAMP(in);
     iput(ino, &in);
     return ino;
 }
@@ -890,7 +920,7 @@ int fs_rename(const char *oldp, const char *newp)
         fs_memcpy(blk + (u32)slot * sizeof(de) % FS_BLOCK, &de, sizeof(de));
         bwrite(b, blk);
     }
-    di.mtime = tick / 10;
+    STAMP(di);
     iput(spino, &di);
     return ino;
 }

@@ -22,4 +22,10 @@ void to_hex(const u8 *in, u32 n, char *out);
 /* 第四十七轮：1 = 正在使用 ARMv8 密码扩展，0 = 纯 C 回退（诊断/基准用） */
 int  sha256_hw_enabled(void);
 
+/* 第五十四轮（安全加固，演进路线 3.3）：常量时间内存比较。
+ * 全程不提前 return、不对秘密字节做分支，返回 1=相等 / 0=不等。
+ * 用于替换 shadow_verify 里「逐字节不等就 return」的口令哈希比对，
+ * 消除「前几个字节猜对了就慢一点」的时序侧信道。 */
+int  ct_memeq(const void *a, const void *b, u32 n);
+
 #endif
