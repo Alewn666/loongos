@@ -217,8 +217,10 @@ loongos/
 │   ├── test_usysfd_host.c test_round55.py  # 第五十五轮：fd/pipe 宿主单测 / 判据
 │   ├── vfs.h vfs.c test_vfs_host.c  # 第五十六轮：VFS 挂载层 + /dev /proc + 宿主单测
 │   ├── test_round56.py           # 第五十六轮：VFS 双路判据
+│   ├── proc.h proc.c test_proc_host.c  # 第五十七轮：进程表状态机 + 全拷贝 / 宿主单测 30/30
+│   ├── test_round57.py user/u57_proc.c  # 第五十七轮：进程模型双路判据 / EL0 用户程序
 │   ├── font8x16.h font_cjk.h linker.ld auth_cred.h
-│   ├── user/             # 用户态 ELF 样例（u55_systest/u55_sh 管道、u56_vfs 伪文件系统）
+│   ├── user/             # 用户态 ELF 样例（u55 管道、u56_vfs 伪文件系统、u57_proc 进程 fork/wait）
 │   ├── build.sh build_iso.sh build_image.sh build_pe.py
 │   ├── bss_budget.txt    # 内核空间预算基线（build.sh 自动维护，纳入版本库）
 │   ├── golden_behavior.txt  # 行为黄金基线：启动日志 + 29 条命令
@@ -234,8 +236,8 @@ loongos/
 
 ## 诚实的边界
 
-- 用户态系统调用：历史 0~5 号 `write` / `open` / `read` / `close` / `lseek` / `exit` 逐字不变；**第五十五轮扩到 20 个**，新增 `getcwd/chdir/getpid/stat/fstat/dup/dup2/pipe/mkdir/unlink/rename/kill/getdents/creat`（6~19 号），统一 fd 对象层 `usysfd.c`（文件/pipe/console），**pipe 环形缓冲用第五十四轮的 `kmalloc` 动态分配**、close 时 `kfree`（实测跨 run 零泄漏）。`user/u55_sh.c` 用真 pipe + dup2 装配 `ls|grep|wc` 全链路（数据真的流过内核 pipe 对象）。**关键边界：仍是「一次 `run` 一个 ELF、exit 回内核」的单进程模型**——没有 `fork`/`execve`/`wait`，管道是单进程内分阶段装配（非三进程并发），`u55_sh` 是管道演示程序、不是交互 shell；用户态仍无 `malloc`/`mmap`。桌面与窗口依旧是内核态静态结构、应用不是独立进程。EL0 有 30 秒看门狗。第五十四轮起内核有动态内存地基（`mm.c` 8MB 窗口 + 8 档 size-class，不占 BSS）。用户态 ELF 不随 ISO 分发，由判据脚本经 `b64in` 临时注入 `/home`。**第五十六轮起内核有 VFS 挂载层** `vfs.c/h`（挂载表 + `vnode_ops`）：开机挂 `/proc`（`meminfo`/`uptime`/`version`/`cpuinfo`/`mounts`，数据来自真实 `mm_stat`/`tick`）与 `/dev`（`null`/`zero`/`console`/`tty`），`cat`/`ls` 与用户态 `SYS_vfsread` 可读；老路径优先保证 29 条基线逐字不变。VFS 是渐进式接管两个挂载点，**未**把 `fs_*` 全量改成 `vfs_*`、未挂载真实 FAT32/EXT2，跨挂载点 `cp` 也未做。
-- **「对齐 Linux/BSD」目前只做实了地基 + syscall 扩容 + VFS 伪文件系统，不是全部完成**：第五十四轮落地优先级 0 的 `mm.c`（动态内存）、`rtc.c`（真实墙钟）、常量时间口令比较与低风险小项；第五十五轮把 **11 个点名 syscall 全部做实**（另补 3 个）+ `ls|grep|wc` 真管道；第五十六轮落地 **VFS 抽象 + `/dev` `/proc`**（procfs 真实数据、`cat /proc/meminfo` 对账一致），三轮均严守 §七零新增 `cmd_*`。**每进程 TTBR0、fork/exec/wait、用户态交互 shell、TTY/信号、socket、ZFS-lite、Jail-lite 等架构级能力未实现**；VFS 也未全量替换上层（`fs_*` 未改 `vfs_*`）、无真实 FAT32/EXT2 挂载、跨挂载点 `cp` 未做。逐项状态（含 2.2 验收②不满足、第 54 轮 7 个 `cmd_*` 技术债未迁出、2.3 shell 迁出依赖第 57 轮进程模型）见 [演进路线逐项状态](本体/docs/演进路线_逐项状态.md) 与 [LOONGOS_ROUTE_TODO](本体/LOONGOS_ROUTE_TODO.md)；`test_round54.py` 22/22、`test_round55.py` 25/25、`test_round56.py` 19/19（均本地 TCG），全套回归 15/15，数据见 [第五十四轮报告](本体/docs/第五十四轮_地基能力判据报告.json)、[第五十五轮报告](本体/docs/第五十五轮_syscall判据报告.json)、[第五十六轮报告](本体/docs/第五十六轮_VFS判据报告.json)。**真机 KVM 双路三轮均未复验**（NAS SSH 通道持续不可达），报告 KVM 列为「—」= 未执行。
+- 用户态系统调用：历史 0~5 号 `write` / `open` / `read` / `close` / `lseek` / `exit` 逐字不变；**第五十五轮扩到 20 个**，新增 `getcwd/chdir/getpid/stat/fstat/dup/dup2/pipe/mkdir/unlink/rename/kill/getdents/creat`（6~19 号），统一 fd 对象层 `usysfd.c`（文件/pipe/console），**pipe 环形缓冲用第五十四轮的 `kmalloc` 动态分配**、close 时 `kfree`（实测跨 run 零泄漏）。`user/u55_sh.c` 用真 pipe + dup2 装配 `ls|grep|wc` 全链路（数据真的流过内核 pipe 对象）。**关键边界：仍是「一次 `run` 一个 ELF、exit 回内核」的单进程模型**——没有 `fork`/`execve`/`wait`，管道是单进程内分阶段装配（非三进程并发），`u55_sh` 是管道演示程序、不是交互 shell；用户态仍无 `malloc`/`mmap`。桌面与窗口依旧是内核态静态结构、应用不是独立进程。EL0 有 30 秒看门狗。第五十四轮起内核有动态内存地基（`mm.c` 8MB 窗口 + 8 档 size-class，不占 BSS）。用户态 ELF 不随 ISO 分发，由判据脚本经 `b64in` 临时注入 `/home`。**第五十六轮起内核有 VFS 挂载层** `vfs.c/h`（挂载表 + `vnode_ops`）：开机挂 `/proc`（`meminfo`/`uptime`/`version`/`cpuinfo`/`mounts`，数据来自真实 `mm_stat`/`tick`）与 `/dev`（`null`/`zero`/`console`/`tty`），`cat`/`ls` 与用户态 `SYS_vfsread` 可读；老路径优先保证 29 条基线逐字不变。VFS 是渐进式接管两个挂载点，**未**把 `fs_*` 全量改成 `vfs_*`、未挂载真实 FAT32/EXT2，跨挂载点 `cp` 也未做。**第五十七轮起内核有进程模型地基** `proc.c/h`：每进程独立用户地址空间（复制 L3 表 + 独立物理页，切 `l2_ram[1]` 基址），合作式 `fork`/`wait`/`procexit`/`getpid`（syscall 22~25），800B 异常帧整体拷贝做上下文切换（boot.S 零改）；实测「子进程改自己全局变量=0x2222，父仍=0x1111」地址隔离、僵尸回收无残留、跨 run 零泄漏。**边界**：合作式非抢占、fork 全拷贝非 COW、`execve` 返回 -1 占位、fd 未每进程化、仅一层 fork、`mmap` 未做。
+- **「对齐 Linux/BSD」目前只做实了地基 + syscall 扩容 + VFS 伪文件系统 + 进程模型地基，不是全部完成**：第五十四轮落地优先级 0 的 `mm.c`（动态内存）、`rtc.c`（真实墙钟）、常量时间口令比较与低风险小项；第五十五轮把 **11 个点名 syscall 全部做实**（另补 3 个）+ `ls|grep|wc` 真管道；第五十六轮落地 **VFS 抽象 + `/dev` `/proc`**（procfs 真实数据、`cat /proc/meminfo` 对账一致）；第五十七轮落地 **进程模型地基**（`proc.c/h` + 每进程独立地址空间 + 合作式 `fork/wait/procexit` + 地址隔离实测），四轮均严守 §七零新增 `cmd_*`。**抢占式调度、真 `execve`、fd 每进程化、用户态交互 shell、TTY/信号、socket、ZFS-lite、Jail-lite 等架构级能力未实现**；VFS 也未全量替换上层、跨挂载点 `cp` 未做。逐项状态（含 2.2 验收②不满足、第 54 轮 7 个 `cmd_*` 技术债未迁出、2.3 shell 迁出仍需 execve+fd 每进程化）见 [演进路线逐项状态](本体/docs/演进路线_逐项状态.md) 与 [LOONGOS_ROUTE_TODO](本体/LOONGOS_ROUTE_TODO.md)；`test_round54.py` 22/22、`test_round55.py` 25/25、`test_round56.py` 19/19、`test_round57.py` 21/21（均本地 TCG），全套回归 15/15，数据见 [第五十四轮报告](本体/docs/第五十四轮_地基能力判据报告.json)、[第五十五轮报告](本体/docs/第五十五轮_syscall判据报告.json)、[第五十六轮报告](本体/docs/第五十六轮_VFS判据报告.json)、[第五十七轮报告](本体/docs/第五十七轮_进程模型判据报告.json)。**真机 KVM 双路四轮均未复验**（NAS SSH 通道持续不可达），报告 KVM 列为「—」= 未执行。
 - **多核 SMP 默认关闭，不是「已支持多核」**：QEMU 加 `-machine virt,virtualization=on` 时 PSCI 能拉起 `cpu1` 并在线，但从核定时期中断进不了处理程序，`wfi` 会满速空转烧核（实测 2.5 秒涨 5000 万+ 次）。本轮已修好从核向量表的 128B 槽距（原 IRQ 槽错落在 `+0x14` 而非 `0x280`）与 PSCI conduit 探测（无 EL3/EL2 时优雅跳过，不再刷异常转储）；剩下的是 GIC CPU interface 打通。`-DSMP_ENABLE` 仅供调试。
 - **磁盘别用 `virtio-scsi-pci` 测**：驱动对 transitional 设备主动放弃（真机 PCIe 上改写 64 位 BAR 会 external abort，代码里有 2026-10-25 实测记录）。QEMU 用 `-device virtio-blk-pci` 即走 virtio-blk 路径，8MB 盘能读写、能格式化、能持久挂载；NVMe 盘走 `nvme.c` 原生驱动，装盘与持久化已通过端到端验证。
 - **AAVMF 没有 NVMe 引导驱动**：NVMe 盘只能由内核起来后识别，不能作为 UEFI 启动盘；安装仍从 ISO/光盘引导。
@@ -256,12 +258,13 @@ loongos/
 - [本体/docs/桌面系统_架构与路线.md](本体/docs/桌面系统_架构与路线.md) — 早期图形化架构与分期清单（其中「只有 write/exit 两个系统调用」的现状描述已过时）
 - [本体/docs/内核空间预算与扩容指引.md](本体/docs/内核空间预算与扩容指引.md) — 内核链接布局、BSS 余量 ±4 KB 对齐碎片根因、预算守卫与扩容路径
 - [本体/docs/系统资源调配.md](本体/docs/系统资源调配.md) — R 轮：CPU/时钟/内存三类资源的调配设计、7 组 DMA 地址对照实验、`res` 资源账与量化验收
-- [本体/docs/检查与修复记录.md](本体/docs/检查与修复记录.md) — 逐轮设计取舍与排障实录（第三十一轮 = R 轮，第五十四轮 = 动态内存/RTC，第五十五轮 = syscall/管道，第五十六轮 = VFS/伪文件系统）
-- [本体/docs/演进路线_逐项状态.md](本体/docs/演进路线_逐项状态.md) — 第五十四+五十五+五十六轮对《对齐 Linux/BSD 演进路线》逐项核对的诚实状态副本
+- [本体/docs/检查与修复记录.md](本体/docs/检查与修复记录.md) — 逐轮设计取舍与排障实录（第三十一轮 = R 轮，第五十四轮 = 动态内存/RTC，第五十五轮 = syscall/管道，第五十六轮 = VFS/伪文件系统，第五十七轮 = 进程模型）
+- [本体/docs/演进路线_逐项状态.md](本体/docs/演进路线_逐项状态.md) — 第五十四+五十五+五十六+五十七轮对《对齐 Linux/BSD 演进路线》逐项核对的诚实状态副本
 - [本体/LOONGOS_ROUTE_TODO.md](本体/LOONGOS_ROUTE_TODO.md) — 第 55–61+ 轮架构级任务清单与技术债登记
 - [本体/docs/第五十四轮_地基能力判据报告.json](本体/docs/第五十四轮_地基能力判据报告.json) — 第五十四轮 22 项双路判据、宿主单测、全套回归与真机 KVM 未执行留痕
 - [本体/docs/第五十五轮_syscall判据报告.json](本体/docs/第五十五轮_syscall判据报告.json) — 第五十五轮 25 项双路判据、14 个新 syscall、`ls|grep|wc` 真管道零泄漏证据与真机 KVM 未执行留痕
 - [本体/docs/第五十六轮_VFS判据报告.json](本体/docs/第五十六轮_VFS判据报告.json) — 第五十六轮 19 项双路判据、VFS 挂载、`/proc` 真实数据对账、devfs 读写与老路径零扰动证据
+- [本体/docs/第五十七轮_进程模型判据报告.json](本体/docs/第五十七轮_进程模型判据报告.json) — 第五十七轮 21 项双路判据、fork/wait/procexit、父子地址隔离、僵尸回收零残留与真机 KVM 未执行留痕
 - `LOONGOS_*_TODO.md` 与 `docs/检查与修复记录*.md` — 各阶段任务清单
 
 ## 许可证

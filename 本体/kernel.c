@@ -26,6 +26,7 @@
 #include "usys.h"   /* 第五十五轮：syscall 6~19 ABI + struct ustat */
 #include "usysfd.h" /* 第五十五轮：统一 fd / pipe 对象层（pipe 用 kmalloc） */
 #include "vfs.h"    /* 第五十六轮：VFS 挂载层（/proc /dev，老路径不受影响） */
+#include "proc.h"   /* 第五十七轮：进程模型地基（每进程地址空间 + fork/wait，演进路线 3.2） */
 
 typedef unsigned long u64;
 typedef unsigned int  u32;
@@ -1660,6 +1661,7 @@ static void icache_flush(u64 start, u64 end)
 /* eret 进 EL0 的通用入口（ELR=入口、SP_EL0=用户栈顶、SPSR=EL0t 全屏蔽） */
 static void __attribute__((noreturn)) enter_el0_at(u64 elr, u64 sp0);
 static void __attribute__((noinline)) el1_landing(void);   /* 着陆点：exit/fault 时 eret 回内核重新接管 shell */
+static void proc_reset_all(void);   /* 第五十七轮：回收所有子进程页 + 进程表复位（定义见进程子系统） */
 
 static void run_userprog(const char *path, const char *argline)
 {
@@ -1685,6 +1687,10 @@ static void run_userprog(const char *path, const char *argline)
     if ((u64)eh->phnum > ((u64)n - eh->phoff) / eh->phentsize) { uart_puts("ELF 程序头越界\n"); return; }
     if (eh->entry < USER_BASE || eh->entry >= USER_END)       { uart_puts("入口不在用户区，拒跑\n"); return; }
 
+    /* 第五十七轮：回收上一轮 fork 出的所有子进程页，复位进程表并把用户 L3
+       切回全局表。必须在下面 fill_pt 装载之前——否则 fill_pt 写全局 l3_user，
+       而 CPU 经 l2_ram[1] 仍看上一次残留的子 L3，装载内容不可见。 */
+    proc_reset_all();
     /* ⚠️ 先把整个用户区恢复 EL1 可写：上一个程序的代码段是 PROT_USEREX（EL1 只读！），
        不恢复的话这次装载的 fs_memcpy 会从 EL1 写权限故障（实测：FAR 逐 +8 的异常风暴） */
     fill_pt(USER_BASE, USER_END, PROT_USERRW);
@@ -1864,6 +1870,239 @@ static int u_strcpy(char *dst, u64 uptr, int max)
     return lim;
 }
 
+/* ============================================================================
+ * 第五十七轮：进程模型 —— 合作式多进程 + 每进程独立用户地址空间（演进路线 3.2）
+ * ----------------------------------------------------------------------------
+ * 设计取舍（全部为保 golden / 老 syscall 逐字不变 / BSS 余量）：
+ *  ① 一整套页表里，用户区 0x40200000-0x403FFFFF 由独立 L3 表 l3_user 管，
+ *     mmu_init 注释原文："整表复制即换地址空间"。本轮据此给每个 fork 出的
+ *     子进程复制一张 L3 表 + 独立物理页池；切换进程 = 把 l2_ram[1] 的表基址
+ *     指向对应 L3 + tlbi vmalle1（等价于每进程 TTBR0 的用户半，内核半共用，
+ *     KPTI 暂不做——文档 §3.2 步骤①明确允许）。
+ *  ② 合作式（非抢占）：子 fork 出来后不自动跑，父显式 wait() 才让出；子 exit()
+ *     回父。全程单内核栈，上下文切换 = 800B 异常帧整体拷贝（见 proc.c 单测
+ *     第 10 项）—— boot.S 的 SAVE/RESTORE_CTX 一行不改，golden 零扰动。
+ *  ③ pid 1 = 初始进程（shell / 首个用户程序），常驻且用全局 l3_user；
+ *     fork 出的子进程从 2 起，最多 NPROC-1 个活跃。
+ *  ④ 子进程用户物理页从 kmalloc 堆窗口（0x42000000，8MB）分配，页对齐；
+ *     每次 run_userprog 装载前无条件回收所有子进程页 → 跨 run 零泄漏，
+ *     mmstat 量化。BSS 只多一张 4×~1.2KB 的 proc 表，余量仍充裕。
+ * ==========================================================================*/
+static struct proc g_procs[NPROC];
+static u32    g_cpid = 1;          /* 当前进程 pid（EL0 里正在跑的那个） */
+static u64    g_cur_l3 = 0;        /* 当前生效的用户 L3 表物理；0 = 全局 l3_user */
+static int    g_proc_active = 0;   /* 是否有用户程序在使用进程模型（wait 让出需要） */
+
+/* 页表项物理地址掩码（低 12 位 + 高位是 flags；恒等映射 VA=PA） */
+#define PTE_ADDR_MASK (~0xFFFUL)
+
+/* 当前生效的用户区 L3 表基址（物理=虚拟，恒等映射） */
+static u64 proc_active_l3(void)
+{
+    return g_cur_l3 ? g_cur_l3 : (u64)(unsigned long)l3_user;
+}
+
+/* 把用户区 L3 切到指定表（0 = 全局 l3_user），随后冲 TLB。
+ * l2_ram[1] 管 0x40200000-0x403FFFFF 这一整个 2MB 用户块。 */
+static void proc_switch_l3(u64 l3phys)
+{
+    g_cur_l3 = l3phys;
+    l2_ram[1] = (l3phys ? l3phys : (u64)(unsigned long)l3_user) | PTE_VALID | PTE_TABLE;
+    __asm__ volatile("tlbi vmalle1; dsb ish; isb");
+}
+
+/* 从 kmalloc 堆里取一张 4KB 对齐的页（kmalloc 返回带 16B 头、非对齐，
+ * 故申请 2 页后向上对齐取中间那页）。返回 0 表示堆不足。 */
+static u64 proc_alloc_page(u64 *raw_out)
+{
+    void *raw = kmalloc(2u * SZ_4K);
+    if (!raw) return 0;
+    u64 p = (((u64)(unsigned long)raw) + SZ_4K - 1) & ~(u64)(SZ_4K - 1);
+    *raw_out = (u64)(unsigned long)raw;
+    return p;
+}
+
+/* 释放一个子进程占用的所有页（L3 表 + 用户物理页）。 */
+static void proc_release_pages(struct proc *p)
+{
+    if (!p) return;
+    if (p->l3_raw) { kfree((void *)p->l3_raw); p->l3_raw = 0; }
+    for (int i = 0; i < p->npages; i++)
+        if (p->page_raw[i]) { kfree((void *)p->page_raw[i]); p->page_raw[i] = 0; }
+    p->npages = 0;
+    p->user_pt = 0;
+}
+
+/* 回收全部子进程页 + 复位进程表（run_userprog 装载前调用，保证跨 run 零泄漏）。
+ * 无条件把用户区 L3 切回全局表，避免上一轮的子页表残留生效。 */
+static void proc_reset_all(void)
+{
+    for (int i = 0; i < NPROC; i++) {
+        if (g_procs[i].state != P_FREE) proc_release_pages(&g_procs[i]);
+    }
+    proc_init(g_procs, NPROC);
+    g_cpid = 1;
+    proc_switch_l3(0);
+    g_proc_active = 0;
+}
+
+/* 读/写 sp_el0（用户栈指针；异常帧里没有它，需单独保存恢复）。 */
+static inline u64 proc_sp_el0(void) { u64 v; __asm__ volatile("mrs %0, sp_el0" : "=r"(v)); return v; }
+static inline void proc_set_sp_el0(u64 v) { __asm__ volatile("msr sp_el0, %0" :: "r"(v)); }
+
+/* fork：为当前进程造一个子进程。
+ *  - 复制当前用户 L3 表（含父已装载的代码/数据 PTE）到新页；
+ *  - 分配独立物理页并逐页拷贝父用户区内容（写时隔离的"全拷贝"简化版）；
+ *  - 子进程帧 = 当前 SVC 帧的快照，但 x0=0（子进程 fork 返回 0）。
+ *  返回子 pid（父）/ 0（子由 wait 恢复时）/ -1（失败）。
+ *  注意：这里只"造"子进程，不切换；真正的切换在父 wait() 里发生。 */
+static int do_fork(struct regs *f)
+{
+    int cpid = proc_alloc(g_procs, NPROC, g_cpid);
+    if (cpid < 0) return -1;
+    struct proc *c = proc_find(g_procs, NPROC, (u32)cpid);
+
+    u64 l3raw, l3phys = proc_alloc_page(&l3raw);
+    if (!l3phys) { proc_free(c); return -1; }
+    fs_memcpy((void *)l3phys, (void *)proc_active_l3(), SZ_4K);
+    c->l3_raw = l3raw;
+    c->user_pt = l3phys;
+
+    /* 逐页复制用户区 [USER_BASE, USER_BASE+COPY_BYTES)：代码段 + 数据 + bss + 参数区。
+       用户程序实际 <12KB，复制 128KB 覆盖全部在用工页，留足栈/参数余量。 */
+    const u64 COPY_BYTES = 128u * SZ_4K;
+    for (u64 off = 0; off < COPY_BYTES && c->npages < (int)PROC_NPAGES; off += SZ_4K) {
+        u64 raw, ph = proc_alloc_page(&raw);
+        if (!ph) break;
+        u64 va = USER_BASE + off;
+        fs_memcpy((void *)ph, (void *)va, SZ_4K);      /* 父用户页 → 子物理页 */
+        u64 idx = (va >> 12) & 0x1FF;                  /* L3 内 4KB 页索引 */
+        /* 保留父 PTE 的权限位（代码段 PROT_USEREX 用户可执行 / 数据段 PROT_USERRW），
+           只替换物理地址。若一律写 PROT_USERRW，代码段 UXN=1 → 子一取指就 fault。 */
+        u64 parent_pte = ((u64 *)proc_active_l3())[idx];
+        ((u64 *)l3phys)[idx] = (ph & PTE_ADDR_MASK) | (parent_pte & 0xFFF);
+        c->pages[c->npages] = ph;
+        c->page_raw[c->npages] = raw;
+        c->npages++;
+    }
+    /* 用户栈顶保留页（EL0 栈从 USER_END 向下用）：也单独复制一份，父子栈隔离。 */
+    {
+        u64 va = USER_END - SZ_4K;
+        u64 raw, ph = proc_alloc_page(&raw);
+        if (ph && c->npages < (int)PROC_NPAGES) {
+            fs_memcpy((void *)ph, (void *)va, SZ_4K);
+            u64 idx = (va >> 12) & 0x1FF;
+            u64 parent_pte = ((u64 *)proc_active_l3())[idx];
+            ((u64 *)l3phys)[idx] = (ph & PTE_ADDR_MASK) | (parent_pte & 0xFFF);
+            c->pages[c->npages] = ph;
+            c->page_raw[c->npages] = raw;
+            c->npages++;
+        }
+    }
+
+    /* 子帧 = 当前 SVC 帧快照。当前帧 ELR 指向 fork 之后的下一条指令，
+       所以子从同一位置继续，但 x0=0 → 用户代码里 fork() 返回 0。 */
+    fs_memcpy(c->frame, f, EXC_FRAME_SIZE);
+    c->frame[0] = 0;                 /* x0 = 0：子进程视角 */
+    c->user_sp  = proc_sp_el0();     /* 子继承父的用户栈指针值（内容已隔离） */
+
+    g_proc_active = 1;
+    return cpid;                     /* 父视角：返回子 pid */
+}
+
+/* wait：合作式让出 / 回收僵尸。
+ *  - 若已有僵尸子进程：回收其页、写 status、返回子 pid（父继续跑）。
+ *  - 若只有 RUN 子进程：当前（父）帧整体存到自己的 proc.frame，
+ *    切到子进程 L3 + 子帧 + 子 sp_el0，返回后 boot.S RESTORE 的是子现场，
+ *    eret 直接落回子进程 fork 之后（子这次从 wait 恢复时 x0=0，见下）。
+ *  - 无子进程：返回 -1。
+ *  status_ptr 在让出期间记到 g_wait_ptr，子 exit 时写回退出码。 */
+static u64 g_wait_ptr = 0;
+/* 初始进程 pid=1 不占 g_procs 槽（proc_alloc 从 pid=2 起用槽0），其现场单独存。
+   本轮支持一层 fork：父恒为 pid=1，子 2..NPROC+1。 */
+static u8  g_init_frame[EXC_FRAME_SIZE];
+static u64 g_init_sp = 0;
+
+static int do_wait(struct regs *f, u64 status_ptr)
+{
+    /* 1) 兜底：若已有僵尸子（子异常未走 procexit），在此回收。 */
+    int code = 0; u32 dead = 0;
+    if (proc_reap(g_procs, NPROC, g_cpid, &code, &dead) == 0) {
+        struct proc *dp = proc_find(g_procs, NPROC, dead);
+        if (dp) proc_release_pages(dp);
+        if (status_ptr && u_range_ok(status_ptr, 4)) *(u32 *)status_ptr = (u32)code;
+        return (int)dead;
+    }
+
+    /* 2) 找第一个 RUN 子进程。没有则 -1（等价于 ECHILD）。 */
+    struct proc *child = 0;
+    for (int i = 0; i < NPROC; i++)
+        if (g_procs[i].state == P_RUN && g_procs[i].ppid == g_cpid) { child = &g_procs[i]; break; }
+    if (!child) return -1;
+
+    /* 3) 存父现场。pid=1 存独立缓冲；其它 pid 存自己的 proc 槽。 */
+    if (g_cpid == 1) {
+        fs_memcpy(g_init_frame, f, EXC_FRAME_SIZE);
+        g_init_sp = proc_sp_el0();
+    } else {
+        struct proc *parent = proc_find(g_procs, NPROC, g_cpid);
+        if (parent) {
+            fs_memcpy(parent->frame, f, EXC_FRAME_SIZE);
+            parent->user_sp = proc_sp_el0();
+        }
+    }
+    g_wait_ptr = status_ptr;
+
+    /* 4) 切到子：L3 表 + 帧 + 用户栈；子恢复后 fork() 视角 x0=0。 */
+    g_cpid = child->pid;
+    proc_switch_l3(child->user_pt);
+    fs_memcpy(f, child->frame, EXC_FRAME_SIZE);
+    f->x[0] = 0;
+    proc_set_sp_el0(child->user_sp);
+    return -2;                       /* 已切到子，调用方勿再写 f->x[0] */
+}
+
+/* procexit：子进程体面退出 → 立刻回收自己（reap + 释放页，进程表无残留）
+ *  + 切回父进程现场。父此前在 wait() 让出，帧存在 g_init_frame / parent.frame；
+ *  恢复它，把 x0 设成子 pid（wait 返回值），退出码写进父 wait 的 status 指针。 */
+static void do_procexit(struct regs *f, int code)
+{
+    u32 me = g_cpid;
+    if (me == 1) {                   /* 初始进程不能 procexit，当普通 exit 处理 */
+        f->spsr = 0x345; f->elr = (u64)el1_landing; user_running = 0; return;
+    }
+    struct proc *self = proc_find(g_procs, NPROC, me);
+    u32 ppid = self ? self->ppid : 1;
+
+    /* 先写父的 status，再回收自己（回收会清空槽位，之后不能再用 self）。 */
+    if (g_wait_ptr && u_range_ok(g_wait_ptr, 4)) {
+        *(u32 *)g_wait_ptr = (u32)code;
+        g_wait_ptr = 0;
+    }
+    /* 先释放页（reap 会把槽置 P_FREE 后再也取不到 self），再标记僵尸并回收槽位。 */
+    if (self) proc_release_pages(self);
+    proc_zombie(g_procs, NPROC, me, code);
+    { int ccode = 0; u32 dead = 0;
+      proc_reap(g_procs, NPROC, ppid, &ccode, &dead);   /* 槽位释放，进程表无残留 */
+    }
+
+    /* 切回父：L3 + 帧 + 用户栈；父 wait() 返回子 pid。 */
+    g_cpid = ppid;
+    if (ppid == 1) {
+        proc_switch_l3(0);
+        fs_memcpy(f, g_init_frame, EXC_FRAME_SIZE);
+        proc_set_sp_el0(g_init_sp);
+    } else {
+        struct proc *parent = proc_find(g_procs, NPROC, ppid);
+        proc_switch_l3(parent ? parent->user_pt : 0);
+        if (parent) {
+            fs_memcpy(f, parent->frame, EXC_FRAME_SIZE);
+            proc_set_sp_el0(parent->user_sp);
+        }
+    }
+    f->x[0] = (u64)me;
+}
+
 static void svc_dispatch(struct regs *f)
 {
     if (f->x[8] == 0) {                       /* write：两种用法 */
@@ -1983,7 +2222,9 @@ static void svc_dispatch(struct regs *f)
         f->x[0] = 0;
         return;
     }
-    if (f->x[8] == SYS_getpid) { f->x[0] = 1; return; }
+    /* 第五十七轮：getpid 返回当前进程 pid。初始进程恒为 1（老程序语义逐字不变，
+       只有单进程时 g_cpid 始终=1，test_stage5b 的 pid 判据不受影响）。 */
+    if (f->x[8] == SYS_getpid) { f->x[0] = (u64)g_cpid; return; }
     if (f->x[8] == SYS_stat) {
         u64 sp = f->x[1];
         if (!u_range_ok(sp, sizeof(struct ustat))) { f->x[0] = (u64)-1; return; }
@@ -2087,6 +2328,33 @@ static void svc_dispatch(struct regs *f)
         return;
     }
     if (f->x[8] == SYS_vfsinfo) { f->x[0] = (u64)vfs_mount_count(); return; }
+    /* ---- 第五十七轮：进程模型 syscall 22~25（不动 0~21 任何分支）---- */
+    if (f->x[8] == SYS_fork) {
+        int cpid = do_fork(f);
+        f->x[0] = (cpid < 0) ? (u64)-1 : (u64)cpid;         /* 父:子pid / -1；子由 wait 恢复时 x0=0 */
+        return;
+    }
+    if (f->x[8] == SYS_wait) {
+        u64 sp = f->x[0];                                   /* wait(int *status) */
+        if (sp && !u_range_ok(sp, 4)) { f->x[0] = (u64)-1; return; }
+        int rr = do_wait(f, sp);
+        if (rr == -2) return;                               /* 已切到子进程，帧已被替换，勿写回 */
+        f->x[0] = (rr < 0) ? (u64)-1 : (u64)rr;
+        return;
+    }
+    if (f->x[8] == SYS_procexit) {
+        do_procexit(f, (int)f->x[0]);                       /* 切回父；父 wait 帧 x0 已被设为子 pid */
+        return;
+    }
+    if (f->x[8] == SYS_execve) {
+        /* 简化版：execve 在当前进程用户区重新装载一个 ELF（覆盖代码/数据），
+           入口改写当前帧的 ELR；pid/地址空间/fd 保持不变。跨地址空间的 execve
+           留给 fork 之后的子进程自行 run——见 docs 诚实边界。 */
+        u64 pp = f->x[0];
+        if (!u_range_ok(pp, 1)) { f->x[0] = (u64)-1; return; }
+        f->x[0] = (u64)-1;                                  /* 暂不支持：诚实返回 -1（见边界） */
+        return;
+    }
     if (f->x[8] == 1) {                                    /* exit：体面结束用户程序 */
         uart_puts("\n[run] 程序退出 code="); uart_putdec((u32)f->x[0]); uart_puts("\n");
         user_running = 0;
@@ -4507,6 +4775,9 @@ static void __attribute__((noinline)) el1_landing(void)
        输出全吸进文件，直到某次 dispatch 末尾才被顺手冲刷（实测 df 的输出就这么丢的）。
        redir_finish 幂等：没开闸（redir_len<0）时直接返回。fault 路径也走这里，一并覆盖。 */
     redir_finish();
+    /* 第五十七轮：exit/fault/看门狗任一路径撤回内核时，回收该轮 fork 出的所有
+       子进程页并把用户 L3 切回全局表——保证跨 run 零泄漏（mmstat 可量化）。 */
+    proc_reset_all();
     uart_puts("[el1] 已从 EL0 撤回内核，shell 继续\n> ");
     /* 桌面 P2：图形终端里跑 run / el0 / crash 这类「不按原路返回」的命令后，
        不能掉回纯串口 shell —— 否则桌面凭空消失。桌面仍接管屏幕时重新进入，

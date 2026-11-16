@@ -87,4 +87,14 @@ static inline long u_vfsread(const char *p, void *b, long n) {
 }
 static inline long u_vfsinfo(void) { return sys_call(SYS_vfsinfo, 0, 0); }
 
+/* ---------------- 第五十七轮：进程模型 syscall 22~25 ----------------
+ * ABI 编号由 ../proc.h 定义（用户态/内核/宿主单测共用）。 */
+#include "../proc.h"
+static inline long u_fork(void)                       { return sys_call(SYS_fork, 0, 0); }
+static inline long u_wait(int *status)                { return sys_call(SYS_wait, (long)status, 0); }
+static inline long u_procexit(long code)              { return sys_call(SYS_procexit, code, 0); }
+static inline long u_execve(const char *p, char *const *argv) {
+    return sys_call(SYS_execve, (long)p, (long)argv);
+}
+
 #endif

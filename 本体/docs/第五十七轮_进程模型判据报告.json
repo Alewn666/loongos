@@ -1,0 +1,146 @@
+{
+  "title": "LoongOS 第五十七轮 进程模型判据报告",
+  "kernel_md5": "6d4673493688a731782beb60e3f83ab2",
+  "elf_proc_md5": "614e5ab00c907d213c53c2674d53c352",
+  "generated": "2026-11-16 21:40:12",
+  "modes": {
+    "TCG": {
+      "mode": "TCG",
+      "cmd": "qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a57 -m 256M -kernel /workspace/安卓/loongos/本体/kernel.elf -nographic -no-reboot",
+      "u57proc": {
+        "pid_before": "0x1",
+        "shared_before": "0x1111",
+        "fork_ret": "2",
+        "child_forkret": "0",
+        "child_shared_w": "0x2222",
+        "child_shared_r": "0x2222",
+        "child_pid": "2",
+        "wait_ret": "2",
+        "status": "7",
+        "shared_after": "0x1111",
+        "pid_after": "1",
+        "pass": "5",
+        "fail": "0"
+      },
+      "res_after": {
+        "sync": 0,
+        "nisv": 0,
+        "fiq": 0,
+        "trip": 0
+      },
+      "checks": [
+        {
+          "name": "1 内核横幅 + shell 提示符就绪",
+          "ok": true,
+          "detail": "未见横幅/提示符"
+        },
+        {
+          "name": "2 help 仍含 run 命令（golden 命令集未删）",
+          "ok": true,
+          "detail": "help\n\n命令清单:\n\n  ls [路径]            列目录（无路径=当前目录）\n\n  cd [路径]            切换当前目录（默认 /；支持 . .. 和相对路径）\n\n  pwd                 "
+        },
+        {
+          "name": "3 cat /etc/hostname 仍为 myos（老 fs 路径逐字不变）",
+          "ok": true,
+          "detail": "cat /etc/hostname\n\nmyos\n> "
+        },
+        {
+          "name": "4 u55test.elf（老程序）注入字节一致",
+          "ok": true,
+          "detail": "写入 11296 / 期望 11296"
+        },
+        {
+          "name": "5 老 syscall 程序仍体面退出 code=0（0~21 零扰动）",
+          "ok": true,
+          "detail": "_self_rc=0\n[R55] chk kill_self_ok ok\n[R55] stat_badptr_rc=-1\n[R55] chk stat_reject_badptr ok\n[R55] PASS=35\n[R55] FAIL=0\n[R55] ==== u55test done ====\n\n\n[run] 程序退出 code=0\n\n[el1] 已从 EL0 撤回内核，shell 继续\n\n> "
+        },
+        {
+          "name": "6 u57proc.elf 经 b64 注入字节数一致",
+          "ok": true,
+          "detail": "写入 9576 / 期望 9576"
+        },
+        {
+          "name": "7 ls /home 含新程序",
+          "ok": true,
+          "detail": "ls /home\n\nd  .\n\nd  ..\n\nf  readme.txt  214B\n\nd  demo\n\nf  u55test  11296B\n\nf  u57proc  9576B\n\n> "
+        },
+        {
+          "name": "8 用户程序跑完并体面退出 code=0（无 EL0 fault）",
+          "ok": true,
+          "detail": "red_w=0x2222\n[R57] child_shared_r=0x2222\n[R57] child_pid=2\n[R57] child_exit\n[R57] wait_ret=2\n[R57] status=7\n[R57] shared_after=0x1111\n[R57] pid_after=1\n[R57] pass=5\n[R57] fail=0\n[R57] done\n\n\n[run] 程序退出 code=0\n\n[el1] 已从 EL0 撤回内核，shell 继续\n\n> "
+        },
+        {
+          "name": "9 自报 pass=5 且 fail=0",
+          "ok": true,
+          "detail": "pass=5 fail=0"
+        },
+        {
+          "name": "10 pid_before=1（初始进程，老 getpid 语义）",
+          "ok": true,
+          "detail": "0x1"
+        },
+        {
+          "name": "11 fork_ret>=2（子进程 pid 从 2 起）",
+          "ok": true,
+          "detail": "2"
+        },
+        {
+          "name": "12 wait_ret==fork_ret（wait 返回子 pid）",
+          "ok": true,
+          "detail": "wait=2 fork=2"
+        },
+        {
+          "name": "13 status=7（子进程 procexit 退出码正确回传）",
+          "ok": true,
+          "detail": "7"
+        },
+        {
+          "name": "14 shared_before=0x1111 且 child 见到自己写 0x2222",
+          "ok": true,
+          "detail": "before=0x1111 cw=0x2222 cr=0x2222"
+        },
+        {
+          "name": "14b 子进程视角 fork() 返回 0",
+          "ok": true,
+          "detail": "0"
+        },
+        {
+          "name": "15 地址隔离：shared_after=0x1111（子改自己页未污染父）",
+          "ok": true,
+          "detail": "0x1111"
+        },
+        {
+          "name": "16 child_pid==fork_ret（子进程视角 getpid=子 pid）",
+          "ok": true,
+          "detail": "child=2 fork=2"
+        },
+        {
+          "name": "17 pid_after=1（父从 wait 恢复后仍是初始进程）",
+          "ok": true,
+          "detail": "1"
+        },
+        {
+          "name": "18 二次 run 同样 pass=5 fail=0（跨 run 进程表干净可复用）",
+          "ok": true,
+          "detail": "] wait_ret=2\n[R57] status=7\n[R57] shared_after=0x1111\n[R57] pid_after=1\n[R57] pass=5\n[R57] fail=0\n[R57] done\n\n\n[run] 程序退出 code=0\n\n[el1] 已从 EL0 撤回内核，shell 继续\n\n> "
+        },
+        {
+          "name": "19 mmstat audit=0（子进程页全部回收，堆无泄漏）",
+          "ok": true,
+          "detail": "mmstat\n\n[mm ] heap   = 0x0000000042000000 bytes=8388608 page=4096B\n\n[mm ] pages  = 2048 free=2040 used=8\n\n[mm ] objs   = live=2 used_bytes=16384 peak_bytes=188416\n\n[mm ] counts = alloc=45 free=43 fail"
+        },
+        {
+          "name": "20 结束后 res 健康计数全 0（进程切换未触发异常）",
+          "ok": true,
+          "detail": "健康: 同步异常=0  自愈/回shell=0  NISV=0  FIQ/SErr=0  熔断=0"
+        }
+      ],
+      "summary": {
+        "total": 21,
+        "pass": 21,
+        "fail": 0,
+        "failed": []
+      }
+    }
+  }
+}

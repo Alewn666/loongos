@@ -47,7 +47,8 @@ typedef unsigned long  u64;
 #define SYS_creat     19    /* creat(path) -> 0 / -1（建空文件；供用户态写文件/rename 验证） */
 #define SYS_vfsread   20    /* vfsread(path,buf,len) -> 字节数 / -1（读 /proc /dev 伪文件） */
 #define SYS_vfsinfo   21    /* vfsinfo() -> 挂载点数量 */
-#define SYS_max       22    /* 号上限（不含） */
+/* 22~25 定义在 proc.h（第五十七轮进程模型），号段连续、语义见该文件 */
+#define SYS_max       26    /* 号上限（不含） */
 
 /* ---- stat 的用户可见结构（32B，纯定长，无指针，方便用户态解析）----
  * 偏移：size@0 ino@4 type@8 mode@10 uid@12 nlink@14 mtime@16 _pad@20 wall@24。

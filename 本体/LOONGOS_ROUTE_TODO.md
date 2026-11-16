@@ -49,14 +49,19 @@
 - [ ] VFS 全量替换上层（`fs.c` 降级 loongfs 后端、所有 `fs_*` 改 `vfs_*`、加 FAT32/EXT2 `/mnt` 挂载）：未做，留后续轮次
 - [ ] `sysctl`/`free`/`uptime` 从命令补成 `/proc` 伪文件并删命令：`/proc` 侧已补，命令式保留未删（保基线）
 
-## 第 57 轮：进程模型（最硬的活，顺序不可跳）
+## 第 57 轮：进程模型（2026-11-16 完成地基 + 合作式 fork/wait，最硬的活第一步）
 
-- [ ] ① 每进程 TTBR0 + 内核空间共用映射（保留 `-DSINGLE_AS` 回退开关）
-- [ ] ② `fork`（先全拷贝，COW 后加）
-- [ ] ③ `execve` + `exit` + `wait` + 僵尸回收
-- [ ] ④ 全局 `g_fd` 改 `proc->files`（不改则 `du` 结果直接错）
-- [ ] `vmalloc` 内核栈（销第 54 轮遗留）
-- [ ] 进程隔离 fault 测试；`sh -c "ls"` 跑完进程表无残留
+- [x] ① 每进程独立用户地址空间：复制用户 L3 表 + 独立物理页池，切 `l2_ram[1]` 基址 + TLBI；内核半共用（等价 TTBR0 用户半，KPTI 暂不做，符合文档口径）
+- [x] ② `fork` 全拷贝：`SYS_fork` 逐页复制父用户区到子独立物理页（保留父 PTE 权限）；`test_proc_host.c` 30/30 + TCG 实测「子改 0x2222 父仍 0x1111」
+- [x] ③ `wait`/`procexit`/僵尸回收：`SYS_wait` 让出/回收、`SYS_procexit` 退出码回传、二次 run 进程表无残留、`mmstat audit=0`
+- [x] `proc.c/h` 进程表状态机（分配/僵尸/回收）+ 800B 帧整体拷贝上下文切换（boot.S 零改）
+- [x] `getpid` 门控增强（单进程恒 1，老程序逐字不变）；syscall 22~25；golden 29 条逐字一致
+- [x] `test_round57.py` 本地 TCG 21/21；全套回归 15/15；BSS 余量 16KB
+- [ ] ③ 真 `execve`（当前 `SYS_execve` 返回 -1 占位，见 §零点六边界 3）—— 第 58 轮随 fd 每进程化一起
+- [ ] ④ 全局 `g_fd` 改 `proc->files`（不改则严格 POSIX fork 语义不全，见边界 4）—— 第 58 轮
+- [ ] 抢占式调度 / 时间片 / COW / 多进程并发 —— 后续大工程（本轮合作式一层 fork）
+- [ ] `vmalloc` 内核栈 / 用户 mmap（销第 54 轮遗留）—— 第 58 轮+
+- [ ] 2.3 shell 迁出内核（需 execve + fd 每进程化 + 交互 shell）—— 第 58 轮+
 
 ## 第 58 轮：TTY + 信号 + 作业控制
 
