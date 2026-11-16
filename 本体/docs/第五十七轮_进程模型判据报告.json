@@ -142,5 +142,15 @@
         "failed": []
       }
     }
+  },
+  "iso_md5": "11fd226738a7780c4a87632f517f11c7",
+  "github_commits": [
+    "c3562b0",
+    "5f36878"
+  ],
+  "sync": {
+    "github": "pushed 75bf138..5f36878",
+    "nas": "未执行：SSH 56484 不可达(ConnectionRefusedError)，如实留痕",
+    "kvm": "未执行：宿主x86_64无aarch64 KVM；KVM列=—"
   }
 }
