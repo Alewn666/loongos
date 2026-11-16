@@ -162,6 +162,18 @@ FILES = [
     ('本体/test_round56.py',        '本体/test_round56.py'),
     ('本体/docs/第五十六轮_VFS判据报告.json', '本体/docs/第五十六轮_VFS判据报告.json'),
     ('本体/docs/演进路线_逐项状态.md', '本体/docs/演进路线_逐项状态.md'),
+    # 第五十七轮：进程模型地基 + 每进程地址空间 + 合作式 fork/wait
+    # 注：kernel.c / kernel.elf / kernel.o / build.sh / bss_budget.txt /
+    #     golden_behavior.txt / docs/检查与修复记录.md / README.md / usys.h /
+    #     ISO / iso.md5 / 演进路线_逐项状态.md / LOONGOS_ROUTE_TODO.md 已在上面登记，
+    #     此处只补本轮新增的编译单元、宿主单测、用户态 ELF、判据脚本与报告。
+    ('本体/user/user.h',            '本体/user/user.h'),
+    ('本体/proc.h',                 '本体/proc.h'),
+    ('本体/proc.c',                 '本体/proc.c'),
+    ('本体/test_proc_host.c',       '本体/test_proc_host.c'),
+    ('本体/user/u57_proc.c',        '本体/user/u57_proc.c'),
+    ('本体/test_round57.py',        '本体/test_round57.py'),
+    ('本体/docs/第五十七轮_进程模型判据报告.json', '本体/docs/第五十七轮_进程模型判据报告.json'),
 ]
 
 def md5_local(path):

@@ -149,8 +149,10 @@
     "5f36878"
   ],
   "sync": {
-    "github": "pushed 75bf138..5f36878",
-    "nas": "未执行：SSH 56484 不可达(ConnectionRefusedError)，如实留痕",
-    "kvm": "未执行：宿主x86_64无aarch64 KVM；KVM列=—"
+    "github": "pushed 75bf138..5f36878..f224b6b",
+    "nas": "已同步 2026-11-16 22:12：sync_nas.py 新增/更新39·跳过65·失败0；入口 114.66.28.185:56484（此前误探 192.168.1.1）；远端5项md5复核全一致(VERIFY_ALL_OK)",
+    "nas_verify": "ISO 11fd226738a7 / proc.c 9e23bd69b73e / proc.h c6f1f4e550eb / test_round57.py a13808ff503c / kernel.elf 6d4673493688 本地=远端",
+    "sync_note": "早期记录「NAS 未通」系误探错误地址所致，已在本轮通道恢复后补同步，历史留痕不篡改、以追加补记说明",
+    "kvm": "未执行：宿主x86_64无aarch64 KVM；本轮仅同步，未在NAS启动判据；KVM列=—"
   }
 }
