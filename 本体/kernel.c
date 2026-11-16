@@ -23,6 +23,8 @@
 #include "desktop.h"/* 桌面 P1：开机默认进图形桌面 */
 #include "mm.h"     /* 第五十四轮：物理页分配器 + kmalloc（演进路线 2.1） */
 #include "rtc.h"    /* 第五十四轮：PL031 真实墙钟（演进路线 2.2） */
+#include "usys.h"   /* 第五十五轮：syscall 6~19 ABI + struct ustat */
+#include "usysfd.h" /* 第五十五轮：统一 fd / pipe 对象层（pipe 用 kmalloc） */
 
 typedef unsigned long u64;
 typedef unsigned int  u32;
@@ -1605,6 +1607,7 @@ static int path_resolve(const char *in, char *out, int cap);
 /* 用户程序由 build.sh 编成独立 ELF（-Ttext=0x40219000，见 build.sh UCFLAGS），再用 objcopy -I binary
    把 ELF 文件本身嵌进内核镜像（符号 _binary_<名>_start/_end），开机写进 /bin */
 
+static char g_ucwd[128] = "/";   /* 第五十五轮：syscall 独立 cwd，run_userprog 每次复位 */
 static u8 elf_buf[65536];           /* 装载缓冲：用户程序最大 64KB */
 static int user_running = 0;        /* 用户程序跑在 EL0 期间=1（SVC/fault 走用户路径） */
 
@@ -1733,6 +1736,10 @@ static void run_userprog(const char *path, const char *argline)
     uart_puts("[run] 装载 "); uart_puts(path);
     uart_puts(" entry="); uart_puthex(eh->entry);
     uart_puts(" → 进 EL0（syscall: x8=0 write/2 open/3 read/4 close/5 lseek · x8=1 exit）\n");
+    /* 第五十五轮：每次装载用户程序前复位 fd/pipe 对象层（释放上一次残留的
+       ring，保证跨 run 零泄漏，可由 mmstat 量化）与 syscall 独立 cwd。静默。 */
+    ufd_reset();
+    g_ucwd[0] = '/'; g_ucwd[1] = 0;
     user_running = 1;
     enter_el0_at(eh->entry, USER_END);                               /* 一去不复返，exit/fault 回着陆点 */
 }
@@ -1743,6 +1750,99 @@ static void run_userprog(const char *path, const char *argline)
 #define NFDBUF 512
 static struct { int ino; int used; u32 off; u32 len; } g_fd[NFDS];
 static u8 g_fdbuf[NFDS][NFDBUF];
+
+/* ---------------- 第五十五轮：syscall 扩容的用户态对象隔离 ----------------
+ * 三条硬约束（都是为让 29 条 golden_behavior.txt 与 test_stage5b_elf.py
+ * 33 项判据逐字不变）：
+ *  ① cwd：syscall 用**独立的 g_ucwd**，与 shell 的 cwd 彻底隔离；u_resolve
+ *     复刻 path_resolve 的规范化但以 g_ucwd 为基准，绝不改 path_resolve 本身。
+ *  ② fd：usysfd.c 的新对象从 fd 6 起，历史 g_fd 占 3..5，0/1/2 是 console。
+ *     is_ufd_obj 只在「fd 确实指向 pipe 对象」时为真；未 dup2 时 0/1/2 恒
+ *     CONSOLE、3..5 恒 FREE，钩子一律不触发，0/3/4 号走原有代码路径。
+ *  ③ getdents：fs_list 回调先累积到内核静态 g_dents，再统一拷进用户缓冲，
+ *     回调里不直接碰用户指针，避免逐项越界。 */
+static char g_dents[2048];   /* g_ucwd 定义前置到 run_userprog 之前（见 elf_buf 区） */
+
+static int u_range_ok(u64 p, u64 n)
+{
+    return p >= USER_BASE && p <= USER_END && n <= (USER_END - p) && n <= 65536;
+}
+static int is_ufd_obj(u64 fd)
+{
+    if (fd >= UFD_MAX) return 0;
+    int k = ufd_kind((int)fd);
+    return (k == UFD_PIPE_R || k == UFD_PIPE_W);
+}
+
+/* 以 g_ucwd 为基准规范化路径（复刻 path_resolve，基准换成 g_ucwd） */
+static int u_resolve(const char *in, char *out, int cap)
+{
+    char tmp[288];
+    int n;
+    if (in && *in == '/') {
+        n = (int)fs_strlen(in);
+        if (n >= (int)sizeof tmp) return -1;
+        fs_memcpy(tmp, in, (u32)n + 1);
+    } else {
+        int cl = (int)fs_strlen(g_ucwd);
+        int il = in ? (int)fs_strlen(in) : 0;
+        if (cl + 1 + il >= (int)sizeof tmp) return -1;
+        fs_memcpy(tmp, g_ucwd, (u32)cl);
+        tmp[cl] = '/';
+        fs_memcpy(tmp + cl + 1, in ? in : "", (u32)il + 1);
+    }
+    int o = 0;
+    out[o++] = '/';
+    for (int i = 0; tmp[i]; ) {
+        int s = i;
+        while (tmp[i] && tmp[i] != '/') i++;
+        int len = i - s;
+        while (tmp[i] == '/') i++;
+        if (len == 0 || (len == 1 && tmp[s] == '.')) continue;
+        if (len == 2 && tmp[s] == '.' && tmp[s + 1] == '.') {
+            if (o > 1) {
+                int e = o - 1;
+                while (e > 0 && out[e] != '/') e--;
+                o = (e == 0) ? 1 : e;
+            }
+            continue;
+        }
+        if (o > 1) { if (o + 1 >= cap) return -1; out[o++] = '/'; }
+        if (o + len >= cap) return -1;
+        fs_memcpy(out + o, tmp + s, (u32)len);
+        o += len;
+    }
+    out[o] = 0;
+    return 0;
+}
+
+static void fill_ustat(int ino, void *up)
+{
+    struct ustat st;
+    int sz = fs_filesize(ino);   st.size  = (u32)(sz < 0 ? 0 : sz);
+    st.ino   = (u32)ino;
+    int ty = fs_filetype(ino);   st.type  = (u16)(ty < 0 ? 0 : ty);
+    int mo = fs_inode_mode(ino); st.mode  = (u16)(mo < 0 ? 0 : mo);
+    int ui = fs_inode_uid(ino);  st.uid   = (u16)(ui < 0 ? 0 : ui);
+    st.nlink = 1;
+    int mt = fs_inode_mtime(ino);st.mtime = (u32)(mt < 0 ? 0 : mt);
+    st._pad  = 0;
+    st.wall  = fs_inode_wall(ino);
+    fs_memcpy(up, &st, sizeof st);
+}
+
+struct dents_ctx { u32 len; u32 cap; int overflow; };
+static void dents_cb(const struct dirent *de, int ino, void *arg)
+{
+    (void)ino;
+    struct dents_ctx *c = (struct dents_ctx *)arg;
+    u32 nl = fs_strlen(de->name);
+    if (c->len + nl + 1 >= c->cap) { c->overflow = 1; return; }
+    fs_memcpy(g_dents + c->len, de->name, nl);
+    c->len += nl;
+    g_dents[c->len++] = '\n';
+    g_dents[c->len] = 0;
+}
 
 /* 把用户态字符串拷进内核缓冲：先卡指针范围，再找 NUL，最多 max-1 字节。
    第三十六轮修 H3：原实现只校验 uptr 起点，循环读到 uptr+i 会越过 USER_END
@@ -1783,6 +1883,13 @@ static void svc_dispatch(struct regs *f)
         /* POSIX 风格 write(fd,buf,len)：只支持 fd=1/2（串口） */
         {
             u64 fd = f->x[0], p = f->x[1], len = f->x[2];
+            /* 第五十五轮：fd 指向 pipe 对象（含 dup2 重定向后的 0/1/2）时走
+               usysfd 环形缓冲；未 dup2 时 is_ufd_obj 恒 false，下面原逻辑逐字不变。 */
+            if (is_ufd_obj(fd)) {
+                if (!u_range_ok(p, len)) { f->x[0] = (u64)-1; return; }
+                f->x[0] = (u64)ufd_write((int)fd, (const u8 *)p, (u32)len);
+                return;
+            }
             if (fd != 1 && fd != 2) {
                 /* USER_BASE 上调后，老接口 write(内核地址,len) 会被当成本分支的
                    非法 fd；补回越界指针诊断日志，否则坏程序只静默拿到 -1。*/
@@ -1816,6 +1923,12 @@ static void svc_dispatch(struct regs *f)
     }
     if (f->x[8] == 3) {                       /* read(fd, buf, len) */
         u64 fd = f->x[0], p = f->x[1], len = f->x[2];
+        /* 第五十五轮：pipe 读端（含 dup2 后的 fd0）走 usysfd；其余逐字不变。 */
+        if (is_ufd_obj(fd)) {
+            if (!u_range_ok(p, len)) { f->x[0] = (u64)-1; return; }
+            f->x[0] = (u64)ufd_read((int)fd, (u8 *)p, (u32)len);
+            return;
+        }
         if (fd < 3 || fd >= NFDS || !g_fd[fd].used) { f->x[0] = (u64)-1; return; }
         if (p < USER_BASE || p + len < p || p + len > USER_END) { f->x[0] = (u64)-1; return; }
         u32 avail = g_fd[fd].len - g_fd[fd].off;
@@ -1827,6 +1940,11 @@ static void svc_dispatch(struct regs *f)
     }
     if (f->x[8] == 4) {                       /* close(fd) */
         u64 fd = f->x[0];
+        /* 第五十五轮：pipe/被 dup2 的标准流走 usysfd（close(1) 恢复 console）。 */
+        if (is_ufd_obj(fd)) {
+            f->x[0] = (u64)ufd_close((int)fd);
+            return;
+        }
         if (fd < 3 || fd >= NFDS || !g_fd[fd].used) { f->x[0] = (u64)-1; return; }
         g_fd[fd].used = 0; g_fd[fd].ino = 0; g_fd[fd].off = g_fd[fd].len = 0;
         f->x[0] = 0;
@@ -1841,6 +1959,119 @@ static void svc_dispatch(struct regs *f)
         if ((u32)npos > g_fd[fd].len) npos = (long)g_fd[fd].len;
         g_fd[fd].off = (u32)npos;
         f->x[0] = (u64)npos;
+        return;
+    }
+    /* ---------------- 第五十五轮：新增 syscall 6~19 ----------------
+     * 全部走真实 fs_* 后端 / usysfd 对象层；fs_* 成功返回 ino(>0) 的一律
+     * 规整为用户态约定的 0，失败(<0) 规整为 -1；用户指针一律先 u_range_ok。 */
+    if (f->x[8] == SYS_getcwd) {
+        u64 p = f->x[0], len = f->x[1];
+        u32 cl = fs_strlen(g_ucwd);
+        if (!u_range_ok(p, len) || (u64)cl + 1 > len) { f->x[0] = (u64)-1; return; }
+        fs_memcpy((void *)p, g_ucwd, cl + 1);
+        f->x[0] = (u64)cl;
+        return;
+    }
+    if (f->x[8] == SYS_chdir) {
+        char pb[128], rp[128];
+        if (u_strcpy(pb, f->x[0], sizeof pb) < 0) { f->x[0] = (u64)-1; return; }
+        if (u_resolve(pb, rp, sizeof rp) < 0)      { f->x[0] = (u64)-1; return; }
+        int ino = fs_lookup(rp);
+        if (ino < 0 || !fs_isdir(ino))            { f->x[0] = (u64)-1; return; }
+        fs_memcpy(g_ucwd, rp, fs_strlen(rp) + 1);
+        f->x[0] = 0;
+        return;
+    }
+    if (f->x[8] == SYS_getpid) { f->x[0] = 1; return; }
+    if (f->x[8] == SYS_stat) {
+        u64 sp = f->x[1];
+        if (!u_range_ok(sp, sizeof(struct ustat))) { f->x[0] = (u64)-1; return; }
+        char pb[128], rp[128];
+        if (u_strcpy(pb, f->x[0], sizeof pb) < 0) { f->x[0] = (u64)-1; return; }
+        if (u_resolve(pb, rp, sizeof rp) < 0)      { f->x[0] = (u64)-1; return; }
+        int ino = fs_lookup(rp);
+        if (ino < 0)                               { f->x[0] = (u64)-1; return; }
+        fill_ustat(ino, (void *)sp);
+        f->x[0] = 0;
+        return;
+    }
+    if (f->x[8] == SYS_fstat) {
+        u64 fd = f->x[0], sp = f->x[1];
+        if (!u_range_ok(sp, sizeof(struct ustat))) { f->x[0] = (u64)-1; return; }
+        if (fd < 3 || fd >= NFDS || !g_fd[fd].used) { f->x[0] = (u64)-1; return; }
+        fill_ustat(g_fd[fd].ino, (void *)sp);
+        f->x[0] = 0;
+        return;
+    }
+    if (f->x[8] == SYS_dup) {
+        u64 fd = f->x[0];
+        if (fd >= UFD_MAX || !is_ufd_obj(fd)) { f->x[0] = (u64)-1; return; }
+        f->x[0] = (u64)ufd_dup((int)fd);
+        return;
+    }
+    if (f->x[8] == SYS_dup2) {
+        u64 oldfd = f->x[0], newfd = f->x[1];
+        if (oldfd >= UFD_MAX || newfd >= UFD_MAX || !is_ufd_obj(oldfd)) {
+            f->x[0] = (u64)-1; return;
+        }
+        f->x[0] = (u64)ufd_dup2((int)oldfd, (int)newfd);
+        return;
+    }
+    if (f->x[8] == SYS_pipe) {
+        u64 p = f->x[0];
+        if (!u_range_ok(p, 8)) { f->x[0] = (u64)-1; return; }
+        int fds[2] = { -1, -1 };
+        int rr = ufd_pipe(fds);
+        if (rr == 0) fs_memcpy((void *)p, fds, 8);
+        f->x[0] = (u64)rr;
+        return;
+    }
+    if (f->x[8] == SYS_mkdir || f->x[8] == SYS_unlink ||
+        f->x[8] == SYS_creat) {
+        char pb[128], rp[128];
+        if (u_strcpy(pb, f->x[0], sizeof pb) < 0) { f->x[0] = (u64)-1; return; }
+        if (u_resolve(pb, rp, sizeof rp) < 0)      { f->x[0] = (u64)-1; return; }
+        int rr;
+        if (f->x[8] == SYS_mkdir)       rr = fs_mkdir(rp);
+        else if (f->x[8] == SYS_unlink) rr = fs_unlink(rp);
+        else                            rr = fs_createfile(rp);
+        f->x[0] = (rr < 0) ? (u64)-1 : 0;
+        return;
+    }
+    if (f->x[8] == SYS_rename) {
+        char po[128], ro[128], pn[128], rn[128];
+        if (u_strcpy(po, f->x[0], sizeof po) < 0) { f->x[0] = (u64)-1; return; }
+        if (u_strcpy(pn, f->x[1], sizeof pn) < 0) { f->x[0] = (u64)-1; return; }
+        if (u_resolve(po, ro, sizeof ro) < 0)      { f->x[0] = (u64)-1; return; }
+        if (u_resolve(pn, rn, sizeof rn) < 0)      { f->x[0] = (u64)-1; return; }
+        int rr = fs_rename(ro, rn);
+        f->x[0] = (rr < 0) ? (u64)-1 : 0;
+        return;
+    }
+    if (f->x[8] == SYS_kill) {
+        u64 pid = f->x[0], sig = f->x[1];
+        /* 单进程模型：没有其它进程可杀；pid!=1 一律拒，pid==1 的 TERM
+           也只回 0 不真杀（真信号 / 进程组是第 58 轮）。 */
+        if (pid != 1 || sig != USIG_TERM) { f->x[0] = (u64)-1; return; }
+        f->x[0] = 0;
+        return;
+    }
+    if (f->x[8] == SYS_getdents) {
+        u64 p = f->x[1], len = f->x[2];
+        if (!u_range_ok(p, len)) { f->x[0] = (u64)-1; return; }
+        char pb[128], rp[128];
+        if (u_strcpy(pb, f->x[0], sizeof pb) < 0) { f->x[0] = (u64)-1; return; }
+        if (u_resolve(pb, rp, sizeof rp) < 0)      { f->x[0] = (u64)-1; return; }
+        int ino = fs_lookup(rp);
+        if (ino < 0 || !fs_isdir(ino))            { f->x[0] = (u64)-1; return; }
+        g_dents[0] = 0;
+        struct dents_ctx c = { 0, (u32)sizeof g_dents, 0 };
+        fs_list(ino, dents_cb, &c);
+        u32 n = c.len;
+        if (n > (u32)len) n = (u32)len;
+        fs_memcpy((void *)p, g_dents, n);
+        if (n < (u32)len) ((u8 *)p)[n] = 0;   /* 顺手补 NUL（有余量时） */
+        f->x[0] = (u64)n;
         return;
     }
     if (f->x[8] == 1) {                                    /* exit：体面结束用户程序 */
@@ -4290,6 +4521,7 @@ void kernel_main(unsigned long bootinfo)
     }
     fs_set_wallclock(rtc_now);
     g_boot_wall = rtc_now();          /* uptime 的开机墙钟基准 */
+    ufd_init();                        /* 第五十五轮：fd/pipe 对象层开机态（静默） */
 
     /* 阶段9：拉起从核（默认启用——用户要求「把核心都用起来」）。
        从核平时 wfi 真睡（宿主 CPU ≈0%），只在收到 SGI 时被唤醒认领工作；

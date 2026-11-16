@@ -1,0 +1,422 @@
+{
+  "title": "LoongOS 第五十五轮 · syscall 扩容 + 用户态管道判据报告",
+  "kernel_md5": "65e788c916e442de45d2f797b8658aa2",
+  "elftest_md5": "6fd283fe02dbb0fa80c43431157751d0",
+  "elftest_size": 11296,
+  "elfsh_md5": "b856945bfd0f0b4c40e31f4491d67711",
+  "elfsh_size": 8512,
+  "generated": "2026-11-16 09:00:39",
+  "modes": {
+    "TCG": {
+      "mode": "TCG",
+      "cmd": "qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a57 -m 256M -kernel /workspace/安卓/loongos/本体/kernel.elf -nographic -no-reboot",
+      "inject": {
+        "u55test": {
+          "bytes": 11296,
+          "expect": 11296,
+          "ok": true
+        },
+        "u55sh": {
+          "bytes": 8512,
+          "expect": 8512,
+          "ok": true
+        }
+      },
+      "u55test": {
+        "pass_self": 35,
+        "fail_self": 0,
+        "chk_count": 35,
+        "key_values": {
+          "getcwd_rc": "1",
+          "getcwd_val": "/",
+          "chdir_etc_rc": "0",
+          "getcwd_after_chdir": "/etc",
+          "chdir_root_rc": "0",
+          "chdir_bad_rc": "-1",
+          "getpid": "1",
+          "stat_hostname_rc": "0",
+          "stat_size": "5",
+          "stat_type": "2",
+          "stat_uid": "0",
+          "stat_bad_rc": "-1",
+          "stat_relative_rc": "0",
+          "getdents_etc_rc": "28",
+          "getdents_etc_val": ".",
+          "getdents_bad_rc": "-1",
+          "mkdir_rc": "0",
+          "mkdir_stat_rc": "0",
+          "mkdir_stat_type": "1",
+          "mkdir_dup_rc": "-1",
+          "creat_rc": "0",
+          "creat_stat_type": "2",
+          "rename_rc": "0",
+          "rename_old_gone": "1",
+          "rename_new_here": "1",
+          "unlink_rc": "0",
+          "unlink_again_rc": "-1",
+          "unlink_dir_rc": "0",
+          "open_fd": "3",
+          "read_n": "5",
+          "read_val": "myos",
+          "lseek_set0": "0",
+          "close_rc": "0",
+          "fstat_rc": "0",
+          "fstat_size": "5",
+          "fstat_bad_rc": "-1",
+          "pipe_rc": "0",
+          "pipe_rfd": "6",
+          "pipe_wfd": "7",
+          "pipe_write_n": "14",
+          "pipe_read_val": "PIPE-ROUNDTRIP",
+          "dup_fd": "8",
+          "dup2_rc": "1",
+          "dup2_read_val": "REDIR",
+          "kill_badpid_rc": "-1",
+          "kill_self_rc": "0",
+          "stat_badptr_rc": "-1",
+          "PASS": "35",
+          "FAIL": "0"
+        }
+      },
+      "u55sh": {
+        "pass_self": 7,
+        "fail_self": 0,
+        "key_values": {
+          "ls_bytes": "28",
+          "ls_lines": "5",
+          "pipeA_rfd": "6",
+          "pipeA_wfd": "7",
+          "pipeB_rfd": "8",
+          "pipeB_wfd": "9",
+          "dup2_ls_rc": "1",
+          "ls_write_n": "28",
+          "grep_read_n": "28",
+          "grep_src_lines": "5",
+          "grep_kept_lines": "1",
+          "grep_bytes": "9",
+          "grep_result": "hostname",
+          "dup2_grep_rc": "1",
+          "grep_write_n": "9",
+          "wc_read_n": "9",
+          "wc_lines": "1",
+          "wc_words": "1",
+          "wc_bytes": "9",
+          "PASS": "7",
+          "FAIL": "0"
+        }
+      },
+      "u55sh_passwd": {
+        "key_values": {
+          "ls_bytes": "28",
+          "ls_lines": "5",
+          "pipeA_rfd": "6",
+          "pipeA_wfd": "7",
+          "pipeB_rfd": "8",
+          "pipeB_wfd": "9",
+          "dup2_ls_rc": "1",
+          "ls_write_n": "28",
+          "grep_read_n": "28",
+          "grep_src_lines": "5",
+          "grep_kept_lines": "1",
+          "grep_bytes": "7",
+          "grep_result": "passwd",
+          "dup2_grep_rc": "1",
+          "grep_write_n": "7",
+          "wc_read_n": "7",
+          "wc_lines": "1",
+          "wc_words": "1",
+          "wc_bytes": "7",
+          "PASS": "7",
+          "FAIL": "0"
+        }
+      },
+      "repeat": {
+        "runs": 3,
+        "all_ok": true,
+        "mmstat_audit": 0,
+        "live": 0,
+        "used_bytes": 0,
+        "alloc": 11,
+        "free": 11,
+        "fail": 0,
+        "badfree": 0
+      },
+      "res_health": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "checks": [
+        {
+          "name": "内核横幅 + shell 提示符就绪",
+          "ok": true,
+          "detail": "未见横幅/提示符"
+        },
+        {
+          "name": "u55test.elf 经 b64 注入字节数一致",
+          "ok": true,
+          "detail": "写入 11296 / 期望 11296"
+        },
+        {
+          "name": "u55sh.elf 经 b64 注入字节数一致",
+          "ok": true,
+          "detail": "写入 8512 / 期望 8512"
+        },
+        {
+          "name": "ls /home 含新程序且原 readme.txt 仍在",
+          "ok": true,
+          "detail": "ls /home\n\nd  .\n\nd  ..\n\nf  readme.txt  214B\n\nd  demo\n\nf  u55test  11296B\n\nf  u55sh  8512B\n\n> "
+        },
+        {
+          "name": "u55test 结束标志 + 体面退出 code=0",
+          "ok": true,
+          "detail": "5] stat_badptr_rc=-1\n[R55] chk stat_reject_badptr ok\n[R55] PASS=35\n[R55] FAIL=0\n[R55] ==== u55test done ====\n\n\n[run] 程序退出 code=0\n\n[el1] 已从 EL0 撤回内核，shell 继续\n\n> "
+        },
+        {
+          "name": "u55test 自报 PASS/FAIL 且 chk 项 >= 30 条、零 FAIL 行",
+          "ok": true,
+          "detail": "PASS=35 FAIL=0 chk=35 nfail=0"
+        },
+        {
+          "name": "getcwd=/ 且 chdir(/etc) 后=/etc、坏目录被拒",
+          "ok": true,
+          "detail": "{'getcwd_val': '/', 'getcwd_after_chdir': '/etc', 'chdir_bad_rc': '-1'}"
+        },
+        {
+          "name": "getpid=1（单进程模型）",
+          "ok": true,
+          "detail": "1"
+        },
+        {
+          "name": "stat /etc/hostname size=5 type=2 uid=0 + 坏路径/坏内核指针被拒",
+          "ok": true,
+          "detail": "{'stat_size': '5', 'stat_type': '2', 'stat_badptr_rc': '-1', 'stat_relative_rc': '0'}"
+        },
+        {
+          "name": "getdents /etc 真实列出 hostname/passwd/shadow",
+          "ok": true,
+          "detail": "rc=28"
+        },
+        {
+          "name": "mkdir/creat/rename/unlink 语义（旧名消失新名到位 + 重复/二次删被拒）",
+          "ok": true,
+          "detail": "{'rename_old_gone': '1', 'rename_new_here': '1', 'unlink_dir_rc': '0'}"
+        },
+        {
+          "name": "0~5 号老 syscall 回归：open fd=3 / read 'myos' / lseek / close / fstat",
+          "ok": true,
+          "detail": "{'open_fd': '3', 'read_val': 'myos', 'fstat_bad_rc': '-1'}"
+        },
+        {
+          "name": "pipe 往返字符串 + dup 共享 + dup2 stdout 重定向读回 REDIR",
+          "ok": true,
+          "detail": "{'pipe_rfd': '6', 'pipe_read_val': 'PIPE-ROUNDTRIP', 'dup2_read_val': 'REDIR'}"
+        },
+        {
+          "name": "kill 语义（pid!=1 拒 / pid==1 TERM 回 0 不真杀）",
+          "ok": true,
+          "detail": "{'kill_badpid_rc': '-1', 'kill_self_rc': '0'}"
+        },
+        {
+          "name": "u55sh 结束标志 + 体面退出 + 零 FAIL 行",
+          "ok": true,
+          "detail": "PASS=7 FAIL=0 chk=7"
+        },
+        {
+          "name": "stage1 ls：getdents 字节数与 u55test 对账（28B / 5 行）",
+          "ok": true,
+          "detail": "{'ls_bytes': '28', 'ls_lines': '5', 'grep_read_n': '28'}"
+        },
+        {
+          "name": "两个独立真 pipe（4 个 fd 各不相同且 >= 6）",
+          "ok": true,
+          "detail": "{'pipeA_rfd': '6', 'pipeA_wfd': '7', 'pipeB_rfd': '8', 'pipeB_wfd': '9'}"
+        },
+        {
+          "name": "stage2 grep：读回 5 行、按关键词保留 1 行 'hostname'、9 字节入 pipeB",
+          "ok": true,
+          "detail": "{'grep_src_lines': '5', 'grep_kept_lines': '1', 'grep_bytes': '9'}"
+        },
+        {
+          "name": "stage3 wc：从 pipeB 读回 9B，行/词/字节与 grep 输出自洽",
+          "ok": true,
+          "detail": "{'wc_read_n': '9', 'wc_lines': '1', 'wc_bytes': '9'}"
+        },
+        {
+          "name": "换关键词 passwd：grep 结果随之变化且不含 hostname（非恒真）",
+          "ok": true,
+          "detail": "{'grep_kept_lines': '1', 'grep_bytes': '7'}"
+        },
+        {
+          "name": "连跑 3 次全通过 + mmstat 零泄漏（audit=0 live=0 used=0 alloc==free fail=0 badfree=0）",
+          "ok": true,
+          "detail": "seq=[True, True, True] audit=0 live=0 used=0 alloc=11 free=11 fail=0 badfree=0"
+        },
+        {
+          "name": "stat /etc/hostname 仍逐字输出 mtime: 0 秒（54 轮基线不动）",
+          "ok": true,
+          "detail": "stat /etc/hostname\n\n路径: /etc/hostname\n\ninode: 5  类型: 普通文件  大小: 5 字节\n\n属主 uid: 0  私密: 否  mtime: 0 秒\n\n> "
+        },
+        {
+          "name": "ls /bin 仍 5 个老程序（用户 ELF 不内嵌镜像、不碰 /bin）",
+          "ok": true,
+          "detail": "ls /bin\n\nd  .\n\nd  ..\n\nf  hello  5624B\n\nf  cat  6072B\n\nf  args  5984B\n\nf  bad  5768B\n\nf  hang  5528B\n\n> "
+        },
+        {
+          "name": "run /bin/hello 老 syscall 0/1 逐字不变（你好 + exit 0）",
+          "ok": true,
+          "detail": "run /bin/hello\n\n[run] 装载 /bin/hello entry=0x0000000040240030 → 进 EL0（syscall: x8=0 write/2 open/3 read/4 close/5 lseek · x8=1 exit）\n\n你好！我是 /bin/hello，正跑在 EL0 用户"
+        },
+        {
+          "name": "结束后 res 健康全 0（同步异常/自愈/NISV/FIQ/熔断）",
+          "ok": true,
+          "detail": "health=[0, 0, 0, 0, 0] raw=res\n\n[res ] ==== 系统资源账 ====\n\n[res ] 软件 tick(10Hz)=108  硬件唤醒=10Hz  分频=1  桌面态=0\n\n[res ] TIMER IRQ 累计=108  桌面 wfi 命中=0  (wfi/IRQ 越高=空闲越省 CPU)\n\n"
+        }
+      ],
+      "summary": {
+        "pass": 25,
+        "fail": 0,
+        "failed": []
+      }
+    }
+  },
+  "nas_kvm": {
+    "executed": false,
+    "constitutes_dual_path": false,
+    "reason": "本地沙箱 x86_64 无 aarch64 KVM；NAS SSH 通道延续第 54 轮未恢复",
+    "last_probe": "2026-11-16 21:01，端口 56484 NoValidConnectionsError",
+    "note": "报告 KVM 列「—」= 未执行，不是 0、不是通过",
+    "pending": "通道恢复后以 root 跑 R55_ISO=<新ISO> python3 test_round55.py 补 TCG+KVM 双路"
+  },
+  "bss_headroom_bytes": 24576,
+  "kernel_upper": "0x40232000",
+  "user_base": "0x40238000",
+  "build": {
+    "rc": 0,
+    "warnings": 0,
+    "errors": 0,
+    "guards": [
+      "fw_cfg DMA 缓冲段",
+      "内核空间上界余量",
+      "USER_BASE 跟随项",
+      "[heap] 动态堆窗口"
+    ],
+    "headroom_note": "第 55 轮新增 g_dents[2048]/g_ucwd[128]/usysfd 静态对象，余量 32KB→24KB，仍在充裕档",
+    "kern_srcs_added": "usysfd.c",
+    "user_elfs": [
+      "build/u55test.elf (11296B, md5 6fd283fe02dbb0fa80c43431157751d0)",
+      "build/u55sh.elf (8512B, md5 b856945bfd0f0b4c40e31f4491d67711)"
+    ]
+  },
+  "syscalls": {
+    "history": "0~5（write/exit/open/read/close/lseek）逐字不变",
+    "new": "6~19 共 14 个：getcwd/chdir/getpid/stat/fstat/dup/dup2/pipe/mkdir/unlink/rename/kill/getdents/creat",
+    "document_named_11": [
+      "stat",
+      "fstat",
+      "dup",
+      "dup2",
+      "pipe",
+      "getpid",
+      "mkdir",
+      "unlink",
+      "rename",
+      "kill",
+      "getcwd"
+    ],
+    "extra_3": [
+      "chdir",
+      "getdents",
+      "creat"
+    ],
+    "total": 20,
+    "no_new_cmd_star": true
+  },
+  "host_unit_tests": {
+    "test_usysfd_host.c": "57/57",
+    "test_mm_rtc_host.c": "37/37",
+    "test_fs_host.c": "30/30",
+    "test_crypto.c": "16/16",
+    "test_wm_host.c": "36/36",
+    "test_net_host.c": "52/52"
+  },
+  "behavior_baseline": "test_behavior.py --compare golden_behavior.txt 逐字一致（启动日志 + 29 条命令）",
+  "full_regression": {
+    "script": "run_regression_r.sh",
+    "total": 15,
+    "pass": 15,
+    "fail": 0,
+    "note": "第 6 项 EL0 用户程序 33 用例 PASS，证明 0~5 号老 syscall 逐字不变"
+  },
+  "supplementary_checks": {
+    "test_stage4_fs.py": "28/28",
+    "test_stage5_qemu.py": "35/35",
+    "test_stage5b_elf.py": "33/33（全套回归第 6 项）",
+    "test_idle_cpu.py": "CPU 0.7% / wall 8.00s（jiffies 9→15 @100Hz）"
+  },
+  "pipeline_evidence": {
+    "u55test_self_chk": "35 项全 ok / FAIL=0",
+    "u55sh_pipeline": "ls getdents 28B/5 行 → grep 保留 hostname 1 行 9B → wc 1 行 1 词 9B",
+    "keyword_swap": "passwd → grep kept=1 bytes=7，结果随之变化（非恒真）",
+    "pipe_roundtrip": "PIPE-ROUNDTRIP 14B 写读一致；dup 共享；dup2 stdout 读回 REDIR",
+    "zero_leak": "连跑 3 次后 mmstat: live=0 used=0 alloc==free(>=3) audit=0 fail=0 badfree=0",
+    "note": "pipe ring 用第 54 轮 kmalloc(1024) 动态分配，close/ufd_reset 时 kfree —— 动态堆首次被真实子系统消费且量化零泄漏"
+  },
+  "honest_boundaries": [
+    "2.3 shell 迁出内核未做：u55sh 是管道演示程序，非交互 shell；依赖第 57 轮 fork/execve/wait 进程模型",
+    "管道为单进程分阶段装配（写满→关写端→读），非三进程并发、无阻塞调度",
+    "kill 为占位语义：pid!=1 拒、pid==1 TERM 只回 0 不真杀（真信号第 58 轮）",
+    "getdents 为 路径+缓冲 简化接口，非 fd 型 getdents64",
+    "第 54 轮 7 个 cmd_* 技术债仍挂账：本轮零新增 cmd_* 但未迁出（需第 57 轮用户态交互 shell）",
+    "真机 KVM 双路未复验：本地 x86_64 无 aarch64 KVM，NAS SSH 通道未恢复",
+    "用户态程序不随 ISO 分发：/home/u55* 由判据脚本经 b64 临时注入，不内嵌镜像、不改启动日志、不碰 ls /bin",
+    "新增能力不进 help/golden_behavior.txt，存在性由 test_round55.py 25 项判据独立证明"
+  ],
+  "artifacts": {
+    "判据脚本": "test_round55.py",
+    "串口日志": "/tmp/loong_round55_tcg.log",
+    "逐项状态副本": "docs/演进路线_逐项状态.md",
+    "轮次清单": "LOONGOS_ROUTE_TODO.md",
+    "检查记录": "docs/检查与修复记录.md 第五十五轮"
+  },
+  "iso_md5": "3a129affa03ed443bb4a5d5e01be7906",
+  "iso_bytes": 19087360,
+  "md5_crosscheck": {
+    "kernel_elf": "65e788c916e442de45d2f797b8658aa2",
+    "iso_tree_kernel_elf": "65e788c916e442de45d2f797b8658aa2",
+    "esp_img_kernel_elf": "65e788c916e442de45d2f797b8658aa2",
+    "payload_img_kernel_elf": "65e788c916e442de45d2f797b8658aa2",
+    "all_match": true,
+    "iso_md5": "3a129affa03ed443bb4a5d5e01be7906",
+    "iso_md5_file_match": true
+  },
+  "delivery": {
+    "iso_in_git": false,
+    "iso_in_git_reason": "按 .gitignore 惯例（*.iso / *.iso.*）不入 git，走 NAS 同步 + Releases 分发",
+    "nas_sync_executed": false,
+    "nas_sync_reason": "NAS SSH 通道 2026-11-16 21:01 探测仍 NoValidConnectionsError",
+    "nas_artifacts_pending": [
+      "iso/loongos.iso",
+      "iso/loongos.iso.md5",
+      "usys.h",
+      "usysfd.h/c",
+      "test_usysfd_host.c",
+      "user/u55_util.h",
+      "user/u55_systest.c",
+      "user/u55_sh.c",
+      "test_round55.py",
+      "docs/第五十五轮_syscall判据报告.json",
+      "docs/演进路线_逐项状态.md",
+      "README.md",
+      "sync_nas.py",
+      "docs/检查与修复记录.md"
+    ],
+    "pending_commands": [
+      "NAS_HOST=<主机> NAS_PORT=<端口> NAS_USER=<用户> NAS_PASS=<口令> python3 sync_nas.py",
+      "R55_ISO=<NAS 上新 ISO> python3 test_round55.py   # 补真机 TCG+KVM 双路"
+    ],
+    "honest_note": "真机 KVM 双路与 NAS 同步均未执行，如实标注，不谎报完成"
+  }
+}

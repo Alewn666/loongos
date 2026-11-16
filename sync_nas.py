@@ -136,6 +136,21 @@ FILES = [
     ('本体/docs/演进路线_逐项状态.md', '本体/docs/演进路线_逐项状态.md'),
     ('本体/docs/第五十四轮_地基能力判据报告.json', '本体/docs/第五十四轮_地基能力判据报告.json'),
     ('本体/LOONGOS_ROUTE_TODO.md', '本体/LOONGOS_ROUTE_TODO.md'),
+    # 第五十五轮：syscall 扩容 + 用户态管道（14 个新 syscall，ls|grep|wc 真 pipe）
+    # 注：kernel.c / kernel.elf / build.sh / bss_budget.txt / user/user.h /
+    #     ISO / iso.md5 / docs/检查与修复记录.md / README.md 已在上面登记，
+    #     此处只补本轮新增的 ABI 头、fd/pipe 编译单元、单测、用户态 ELF、
+    #     判据脚本、状态文档与报告。
+    ('本体/usys.h',                 '本体/usys.h'),
+    ('本体/usysfd.h',               '本体/usysfd.h'),
+    ('本体/usysfd.c',               '本体/usysfd.c'),
+    ('本体/test_usysfd_host.c',     '本体/test_usysfd_host.c'),
+    ('本体/user/u55_util.h',        '本体/user/u55_util.h'),
+    ('本体/user/u55_systest.c',     '本体/user/u55_systest.c'),
+    ('本体/user/u55_sh.c',          '本体/user/u55_sh.c'),
+    ('本体/test_round55.py',        '本体/test_round55.py'),
+    ('本体/docs/演进路线_逐项状态.md', '本体/docs/演进路线_逐项状态.md'),
+    ('本体/docs/第五十五轮_syscall判据报告.json', '本体/docs/第五十五轮_syscall判据报告.json'),
 ]
 
 def md5_local(path):

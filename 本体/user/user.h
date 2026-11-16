@@ -54,11 +54,33 @@ static inline const char *u_argv(long i)
     return (const char *)p[i];
 }
 
-/* POSIX 风格的薄封装 */
+/* POSIX 风格的薄封装（0~5 号，逐字保留） */
 static inline long u_open(const char *path)        { return sys_call(2, (long)path, 0); }
 static inline long u_read(long fd, void *b, long n) { return sys_call3(3, fd, (long)b, n); }
 static inline long u_close(long fd)                { return sys_call(4, fd, 0); }
 static inline long u_seek(long fd, long o, long w) { return sys_call3(5, fd, o, w); }
 static inline long u_write(long fd, const void *b, long n) { return sys_call3(0, fd, (long)b, n); }
+
+/* ---------------- 第五十五轮：扩容 syscall 6~18 ----------------
+ * ABI 编号与 struct ustat 由 ../usys.h 统一定义（用户态/内核/宿主单测共用）。
+ * 注意：这些封装只发 SVC，不做任何 libc 调用；内核侧按 x8 分发。 */
+#include "../usys.h"
+
+static inline long u_getcwd(char *b, long n)            { return sys_call(SYS_getcwd, (long)b, n); }
+static inline long u_chdir(const char *p)              { return sys_call(SYS_chdir, (long)p, 0); }
+static inline long u_getpid(void)                      { return sys_call(SYS_getpid, 0, 0); }
+static inline long u_stat(const char *p, void *st)     { return sys_call(SYS_stat, (long)p, (long)st); }
+static inline long u_fstat(long fd, void *st)          { return sys_call(SYS_fstat, fd, (long)st); }
+static inline long u_dup(long fd)                      { return sys_call(SYS_dup, fd, 0); }
+static inline long u_dup2(long oldfd, long newfd)      { return sys_call(SYS_dup2, oldfd, newfd); }
+static inline long u_pipe(int *fds)                    { return sys_call(SYS_pipe, (long)fds, 0); }
+static inline long u_mkdir(const char *p)              { return sys_call(SYS_mkdir, (long)p, 0); }
+static inline long u_unlink(const char *p)             { return sys_call(SYS_unlink, (long)p, 0); }
+static inline long u_rename(const char *o, const char *n) { return sys_call(SYS_rename, (long)o, (long)n); }
+static inline long u_kill(long pid, long sig)          { return sys_call(SYS_kill, pid, sig); }
+static inline long u_getdents(const char *p, char *b, long n) {
+    return sys_call3(SYS_getdents, (long)p, (long)b, n);
+}
+static inline long u_creat(const char *p)              { return sys_call(SYS_creat, (long)p, 0); }
 
 #endif

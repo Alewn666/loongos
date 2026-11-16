@@ -25,7 +25,7 @@ UCFLAGS="-nostdlib -ffreestanding -static -fno-stack-protector -fno-pie -O2 -Wal
 
 # ---- 内核编译单元：唯一事实来源（顺序即链接顺序，勿随意重排）----
 KERN_SRCS="boot.S kernel.c fs.c crypto.c usb_kbd.c \
-           mm.c rtc.c \
+           mm.c rtc.c usysfd.c \
            blkdev.c virtio_blk.c virtio_blk_legacy.c virtio_scsi.c virtio_net.c \
            net.c tcp.c smp.c nvme.c virtio_rng.c pci.c \
            nic.c e1000.c rtl8139.c \
@@ -62,6 +62,11 @@ ${CROSS}gcc $UCFLAGS -o build/bad.elf   user/bad.c
 ${CROSS}gcc $UCFLAGS -o build/hang.elf  user/hang.c
 ${CROSS}gcc $UCFLAGS -o build/cat.elf   user/cat.c
 ${CROSS}gcc $UCFLAGS -o build/args.elf  user/args.c
+# 第五十五轮：两个用户态 ELF「只编不内嵌」—— 由 test_round55.py 经 b64
+# 注入 /home 后 run。刻意不做 objcopy 进内核：不改启动日志、不碰 ls /bin、
+# 不占镜像、不动 29 条行为基线（文档 §七「不在 kernel.c 加 cmd_*」）。
+${CROSS}gcc $UCFLAGS -o build/u55test.elf user/u55_systest.c
+${CROSS}gcc $UCFLAGS -o build/u55sh.elf    user/u55_sh.c
 # ELF 文件本身转目标文件（符号 _binary_<文件名>_start/_end，文件名里的 . 和 / 会变 _）
 ( cd build && ${CROSS}objcopy -I binary -O elf64-littleaarch64 -B aarch64 hello.elf hello_blob.o )
 ( cd build && ${CROSS}objcopy -I binary -O elf64-littleaarch64 -B aarch64 bad.elf  bad_blob.o  )
@@ -254,4 +259,4 @@ BEGIN {
 }' || exit 1
 
 echo "== kernel.elf 构建完成 =="
-ls -la kernel.elf build/hello.elf build/bad.elf
+ls -la kernel.elf build/hello.elf build/bad.elf build/u55test.elf build/u55sh.elf
