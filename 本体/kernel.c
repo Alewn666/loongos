@@ -25,6 +25,7 @@
 #include "rtc.h"    /* 第五十四轮：PL031 真实墙钟（演进路线 2.2） */
 #include "usys.h"   /* 第五十五轮：syscall 6~19 ABI + struct ustat */
 #include "usysfd.h" /* 第五十五轮：统一 fd / pipe 对象层（pipe 用 kmalloc） */
+#include "vfs.h"    /* 第五十六轮：VFS 挂载层（/proc /dev，老路径不受影响） */
 
 typedef unsigned long u64;
 typedef unsigned int  u32;
@@ -2074,6 +2075,18 @@ static void svc_dispatch(struct regs *f)
         f->x[0] = (u64)n;
         return;
     }
+    /* 第五十六轮：VFS 专用 syscall 20/21。不动 0~19 号任何分支。 */
+    if (f->x[8] == SYS_vfsread) {
+        u64 p = f->x[1], len = f->x[2];
+        if (!u_range_ok(p, len)) { f->x[0] = (u64)-1; return; }
+        char pb[128], rp[128];
+        if (u_strcpy(pb, f->x[0], sizeof pb) < 0) { f->x[0] = (u64)-1; return; }
+        if (path_resolve(pb, rp, sizeof rp) < 0)   { f->x[0] = (u64)-1; return; }
+        int n = vfs_read_path(rp, (u8 *)p, (u32)len);
+        f->x[0] = (n < 0) ? (u64)-1 : (u64)n;
+        return;
+    }
+    if (f->x[8] == SYS_vfsinfo) { f->x[0] = (u64)vfs_mount_count(); return; }
     if (f->x[8] == 1) {                                    /* exit：体面结束用户程序 */
         uart_puts("\n[run] 程序退出 code="); uart_putdec((u32)f->x[0]); uart_puts("\n");
         user_running = 0;
@@ -3330,7 +3343,7 @@ static void cmd_irqstress(char *args)
  * 环境变量式的静态数据（版本号 / 开机墙钟）用文件内 static 变量，避免
  * 往 loongos.h 塞一堆新 extern。
  */
-#define LOS_VERSION  "LoongOS 54.0-foundation (aarch64 / armvirt)"
+#define LOS_VERSION  "LoongOS 56.0-vfs (aarch64 / armvirt)"
 
 static u64 g_boot_wall = 0;        /* 内核启动瞬间的墙钟 Unix 秒（rtc_init 后记录） */
 
@@ -3907,6 +3920,42 @@ static void cmd_cd(char *a)
 }
 static void cmd_pwd(char *a) { (void)a; uart_puts(cwd); uart_puts("\n"); }
 
+/* ---------------- 第五十六轮：VFS /proc /dev 数据源 ----------------
+ * 只在这里把内核真实数据接给 procfs；vfs.c 不依赖 kernel.c 全局。
+ * 所有回调宿主单测用假数据替代，内核路径用真实 tick/mm/smp 数据。 */
+static u32 pf_mem_total_kb(void)
+{
+    u32 tp, fp, ub, pb, lv, ac, fc, ec, bfc;
+    mm_stat(&tp, &fp, &ub, &pb, &lv, &ac, &fc, &ec, &bfc);
+    return tp * 4u;                       /* 页数 × 4KB = KB */
+}
+static u32 pf_mem_free_kb(void)
+{
+    u32 tp, fp, ub, pb, lv, ac, fc, ec, bfc;
+    mm_stat(&tp, &fp, &ub, &pb, &lv, &ac, &fc, &ec, &bfc);
+    return fp * 4u;
+}
+static u32 pf_uptime_sec(void) { return (u32)(tick / 10); }
+static u32 pf_ncpu(void)
+{
+    u32 n = 0;
+    for (int i = 0; i < 4; i++) if (smp_online[i]) n++;
+    return n ? n : 1;
+}
+static struct procfs_source g_pfsrc = {
+    pf_mem_total_kb, pf_mem_free_kb, pf_uptime_sec, rtc_now, LOS_VERSION, pf_ncpu
+};
+
+/* VFS 目录列表回调 → 内核串口格式（与 ls_cb 同风格，但不碰 dirent） */
+static void vfs_ls_cb(const char *name, u16 type, u32 size, void *arg)
+{
+    (void)arg;
+    uart_puts(type == 1 ? "d  " : "f  ");
+    uart_puts(name);
+    if (type != 1) { uart_puts("  "); uart_putdec(size); uart_puts("B"); }
+    uart_puts("\n");
+}
+
 static void cmd_ls(char *a)
 {
     char rp[128];
@@ -3927,7 +3976,11 @@ static void cmd_ls(char *a)
         path = cwd;                       /* 无参数 = 当前目录 */
     }
     int ino = fs_lookup(path);
-    if (ino < 0) { uart_puts("没有这个路径: "); uart_puts(path); uart_puts("\n"); return; }
+    if (ino < 0) {
+        /* 第五十六轮：VFS 挂载点目录列表；老路径不进入这里 */
+        if (vfs_list_path(path, vfs_ls_cb, 0) == 0) return;
+        uart_puts("没有这个路径: "); uart_puts(path); uart_puts("\n"); return;
+    }
     if (!fs_isdir(ino)) { uart_puts("f  "); uart_puts(path); uart_puts("  "); uart_putdec((u32)fs_filesize(ino)); uart_puts("B\n"); return; }
     fs_list(ino, long_fmt ? ls_cb_long : ls_cb, 0);
 }
@@ -3943,7 +3996,18 @@ static void cmd_cat(char *a)
     if (!a || !*a) { uart_puts("用法: cat <路径>\n"); return; }
     if (path_resolve(a, rp, sizeof rp) < 0) { uart_puts("路径太长\n"); return; }
     int ino = fs_lookup(rp);
-    if (ino < 0) { uart_puts("没有这个路径: "); uart_puts(rp); uart_puts("\n"); return; }
+    if (ino < 0) {
+        /* 第五十六轮：老路径优先；fs_lookup 失败且命中挂载点才走 VFS。
+           /etc/hostname、/nope 等既有路径不会进入这里，golden 逐字不变。 */
+        u8 vbuf[512];
+        int vn = vfs_read_path(rp, vbuf, sizeof vbuf);
+        if (vn >= 0) {
+            for (int i = 0; i < vn; i++) uart_putc((char)vbuf[i]);
+            if (vn == 0 || vbuf[vn - 1] != '\n') uart_puts("\n");
+            return;
+        }
+        uart_puts("没有这个路径: "); uart_puts(rp); uart_puts("\n"); return;
+    }
     if (fs_isdir(ino)) { uart_puts(a); uart_puts(" 是目录，不能 cat\n"); return; }
     /* 分块读：旧版一次性读 1023 字节，任何 >1KB 的文件都读不全（help 重定向到
        文件后就把后半段说明吞了）。fs_readat 按偏移取，循环到文件末尾。 */
@@ -4641,6 +4705,12 @@ void kernel_main(unsigned long bootinfo)
     uart_puts("  lookup(/home)="); uart_puthex((u64)(u32)fs_lookup("/home"));
     uart_puts(" lookup(/etc/hostname)="); uart_puthex((u64)(u32)fs_lookup("/etc/hostname"));
     uart_puts("\n");
+
+    /* 第五十六轮：VFS 挂载 /proc /dev，静默（不进启动日志基线） */
+    vfs_init();
+    procfs_set_source(&g_pfsrc);
+    vfs_mount("/proc", &g_procfs_ops, 0);
+    vfs_mount("/dev",  &g_devfs_ops,  0);
 
     /* 阶段9③：virtio-rng 真熵源（失败只是没熵，不影响启动，打印一行即可） */
     rng_init();

@@ -28,20 +28,26 @@
   第 55 轮做用户态 shell 时把这 7 个命令一并迁出 `kernel.c`。
 - ⚠️ **`vmalloc`（连续页 + 映射 + 内核栈）未做**，随第 57 轮进程模型一起。
 
-## 第 55 轮：syscall 扩容 + 用户态 shell
+## 第 55 轮：syscall 扩容 + 用户态 shell（2026-11-16 完成 syscall 这一半）
 
-- [ ] stat/fstat/dup/dup2/pipe/getpid/mkdir/unlink/rename/kill/getcwd
-- [ ] `sh` 作为 EL0 程序运行，`ctrl` 杀掉内核不崩；`test_stage5b_elf.py` 扩测 shell 自身
-- [ ] `golden_behavior.txt` 29 条命令经新 shell 执行仍逐字一致
-- [ ] 把第 54 轮的 7 个 `cmd_*` 迁出 `kernel.c`（销技术债）
-- [ ] `ls | grep | wc` 全链路真管道
+- [x] stat/fstat/dup/dup2/pipe/getpid/mkdir/unlink/rename/kill/getcwd（11 个点名全部 + chdir/getdents/creat 共 14 号 6~19）
+- [x] `usysfd.c/h` 统一 fd/pipe 对象层，ring 用第 54 轮 kmalloc，`test_usysfd_host.c` 57/57
+- [x] `user/u55_systest.c`（19 号 syscall 冒烟）、`user/u55_sh.c`（`ls|grep|wc` 真 pipe+dup2），经 b64 注入 /home
+- [x] `golden_behavior.txt` 29 条命令逐字一致（0~5 号老 syscall 零扰动，`test_stage5b_elf.py` 33/33）
+- [x] `test_round55.py` 本地 TCG 25/25；全套回归 15/15
+- [ ] **`sh` 作为 EL0 交互 shell 运行、`ctrl` 杀掉内核不崩**：未做——`u55sh` 是管道演示程序非交互 shell，依赖第 57 轮进程模型
+- [ ] 把第 54 轮的 7 个 `cmd_*` 迁出 `kernel.c`（销技术债）：未做，第 57 轮随交互 shell 一起
 
-## 第 56 轮：VFS + /dev + /proc
+## 第 56 轮：VFS + /dev + /proc（2026-11-16 完成抽象层 + 伪文件系统）
 
-- [ ] `vfs.c/h` + `vnode_ops`（lookup/create/read/write/readdir，先不加 ioctl）
-- [ ] devfs（`/dev/console`、`/dev/null`、`/dev/tty`）、procfs、mount 表
-- [ ] 跨挂载点 `cp`；`test_stage4_fs.py` 28/28 保持
-- [ ] `sysctl` / `free` / `uptime` 补成 `/proc` 伪文件，与 `res` 数字一致
+- [x] `vfs.c/h` + `vnode_ops`（lookup/read/listdir/stat）+ 8 项 mount 表 + 最长前缀；`test_vfs_host.c` 35/35
+- [x] devfs（`/dev/null`/`zero`/`console`/`tty`）、procfs（`/proc/meminfo`/`uptime`/`version`/`cpuinfo`/`mounts`），开机静默挂载
+- [x] `cat /proc/meminfo` 真实 `mm_stat` 数据，用户态与内核 shell 对账一致（8192/8188KB）
+- [x] `SYS_vfsread`/`SYS_vfsinfo`（20/21）走 syscall；老路径零扰动（29 条 golden 逐字一致）
+- [x] `test_round56.py` 本地 TCG 19/19；全套回归 15/15
+- [ ] **跨挂载点 `cp`**：只做到跨挂载点读，`cp` 写文件到 procfs 未做（procfs 只读，语义上不该可写）
+- [ ] VFS 全量替换上层（`fs.c` 降级 loongfs 后端、所有 `fs_*` 改 `vfs_*`、加 FAT32/EXT2 `/mnt` 挂载）：未做，留后续轮次
+- [ ] `sysctl`/`free`/`uptime` 从命令补成 `/proc` 伪文件并删命令：`/proc` 侧已补，命令式保留未删（保基线）
 
 ## 第 57 轮：进程模型（最硬的活，顺序不可跳）
 

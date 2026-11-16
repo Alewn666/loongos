@@ -82,5 +82,9 @@ static inline long u_getdents(const char *p, char *b, long n) {
     return sys_call3(SYS_getdents, (long)p, (long)b, n);
 }
 static inline long u_creat(const char *p)              { return sys_call(SYS_creat, (long)p, 0); }
+static inline long u_vfsread(const char *p, void *b, long n) {
+    return sys_call3(SYS_vfsread, (long)p, (long)b, n);
+}
+static inline long u_vfsinfo(void) { return sys_call(SYS_vfsinfo, 0, 0); }
 
 #endif

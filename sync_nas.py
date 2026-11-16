@@ -151,6 +151,17 @@ FILES = [
     ('本体/test_round55.py',        '本体/test_round55.py'),
     ('本体/docs/演进路线_逐项状态.md', '本体/docs/演进路线_逐项状态.md'),
     ('本体/docs/第五十五轮_syscall判据报告.json', '本体/docs/第五十五轮_syscall判据报告.json'),
+    # 第五十六轮：VFS + /dev + /proc（vfs.c/h，procfs 真实数据，老路径零扰动）
+    # 注：kernel.c / kernel.elf / build.sh / bss_budget.txt / usys.h / user/user.h /
+    #     ISO / iso.md5 / docs/检查与修复记录.md / README.md 已在上面登记，
+    #     此处只补本轮新增的 VFS 编译单元、宿主单测、用户态 ELF、判据脚本与报告。
+    ('本体/vfs.h',                  '本体/vfs.h'),
+    ('本体/vfs.c',                  '本体/vfs.c'),
+    ('本体/test_vfs_host.c',        '本体/test_vfs_host.c'),
+    ('本体/user/u56_vfs.c',         '本体/user/u56_vfs.c'),
+    ('本体/test_round56.py',        '本体/test_round56.py'),
+    ('本体/docs/第五十六轮_VFS判据报告.json', '本体/docs/第五十六轮_VFS判据报告.json'),
+    ('本体/docs/演进路线_逐项状态.md', '本体/docs/演进路线_逐项状态.md'),
 ]
 
 def md5_local(path):

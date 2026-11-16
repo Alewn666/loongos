@@ -1,0 +1,267 @@
+{
+  "title": "LoongOS 第五十六轮 · VFS + /dev + /proc 判据报告",
+  "kernel_md5": "ccd371df08f2e16df3c137420d3bc0ce",
+  "elf_vfs_md5": "540a289ba25d25567a7d20ae8af3f4d2",
+  "generated": "2026-11-16 21:14:14",
+  "modes": {
+    "TCG": {
+      "mode": "TCG",
+      "cmd": "qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a57 -m 256M -kernel /workspace/安卓/loongos/本体/kernel.elf -nographic -no-reboot",
+      "meminfo": {
+        "total_kb": 8192,
+        "free_kb": 8188
+      },
+      "u56vfs": {
+        "vfsinfo": "2",
+        "meminfo_rc": "112",
+        "meminfo_total_kb": "8192",
+        "meminfo_free_kb": "8188",
+        "version": "LoongOS 56.0-vfs (aarch64 / armvirt)",
+        "uptime_rc": "10",
+        "mounts_rc": "49",
+        "zero_rc": "32",
+        "null_rc": "0",
+        "proc_nope_rc": "-1",
+        "unmounted_rc": "-1",
+        "old_open_fd": "3",
+        "old_hostname_len": "5",
+        "old_hostname": "myos",
+        "pass": "12",
+        "fail": "0"
+      },
+      "res_after": {
+        "sync": 0,
+        "nisv": 0,
+        "fiq": 0,
+        "trip": 0
+      },
+      "checks": [
+        {
+          "name": "1 内核横幅 + shell 提示符就绪",
+          "ok": true,
+          "detail": "未见横幅/提示符"
+        },
+        {
+          "name": "2 cat /proc/meminfo 走 VFS（MemTotal/Free/kB + 真实数值）",
+          "ok": true,
+          "detail": "cat /proc/meminfo\n\nMemTotal:           8192 kB\nMemFree:            8188 kB\nMemAvailable:       8188 kB\nKernelStack:           0 kB\n> "
+        },
+        {
+          "name": "3 meminfo 数值自洽（0<=Free<=Total, Total>0）",
+          "ok": true,
+          "detail": "{'total_kb': 8192, 'free_kb': 8188}"
+        },
+        {
+          "name": "4 cat /proc/version 返回版本串",
+          "ok": true,
+          "detail": "cat /proc/version\n\nLoongOS 56.0-vfs (aarch64 / armvirt)\n> "
+        },
+        {
+          "name": "5 ls /proc 列出 5 个伪文件",
+          "ok": true,
+          "detail": "ls /proc\n\nd  .\n\nd  ..\n\nf  meminfo  0B\n\nf  uptime  0B\n\nf  version  0B\n\nf  cpuinfo  0B\n\nf  mounts  0B\n\n> "
+        },
+        {
+          "name": "6 ls /dev 列出 4 个节点",
+          "ok": true,
+          "detail": "ls /dev\n\nd  .\n\nd  ..\n\nf  null  0B\n\nf  zero  0B\n\nf  console  0B\n\nf  tty  0B\n\n> "
+        },
+        {
+          "name": "7 cat /proc/mounts 列出 /proc 与 /dev 真实挂载",
+          "ok": true,
+          "detail": "cat /proc/mounts\n\n/proc /proc procfs rw 0 0\n/dev /dev devfs rw 0 0\n> "
+        },
+        {
+          "name": "8 cat /nope 仍报「没有这个路径」（未挂载路径不受 VFS 影响）",
+          "ok": true,
+          "detail": "cat /nope\n\n没有这个路径: /nope\n\n> "
+        },
+        {
+          "name": "9 cat /etc/hostname 仍为 myos（老 fs 路径逐字不变）",
+          "ok": true,
+          "detail": "cat /etc/hostname\n\nmyos\n> "
+        },
+        {
+          "name": "10 u56vfs.elf 经 b64 注入字节数一致",
+          "ok": true,
+          "detail": "写入 8136 / 期望 8136"
+        },
+        {
+          "name": "11 ls /home 含新程序且 readme 仍在",
+          "ok": true,
+          "detail": "ls /home\n\nd  .\n\nd  ..\n\nf  readme.txt  214B\n\nd  demo\n\nf  u56vfs  8136B\n\n> "
+        },
+        {
+          "name": "12 用户程序跑完并体面退出 code=0（无 EL0 fault）",
+          "ok": true,
+          "detail": "6] proc_nope_rc=-1\n[R56] unmounted_rc=-1\n[R56] old_open_fd=3\n[R56] old_hostname_len=5\n[R56] old_hostname=myos\n\n[R56] pass=12\n[R56] fail=0\n[R56] done\n\n\n[run] 程序退出 code=0\n\n[el1] 已从 EL0 撤回内核，shell 继续\n\n> "
+        },
+        {
+          "name": "13 自报 pass>=12 且 fail=0",
+          "ok": true,
+          "detail": "pass=12 fail=0"
+        },
+        {
+          "name": "14 vfsinfo=2（开机挂载 /proc /dev）",
+          "ok": true,
+          "detail": "2"
+        },
+        {
+          "name": "15 meminfo_rc>0 且 total/free 与内核 shell 对账一致",
+          "ok": true,
+          "detail": "elf total=8192/8188 shell total={'total_kb': 8192, 'free_kb': 8188}"
+        },
+        {
+          "name": "16 devfs zero 读满 32B / null 读 0B",
+          "ok": true,
+          "detail": "zero=32 null=0"
+        },
+        {
+          "name": "17 负例 /proc/nope 与未挂载 /etc 均返回 -1",
+          "ok": true,
+          "detail": "nope=-1 etc=-1"
+        },
+        {
+          "name": "18 老路径 open/read /etc/hostname 仍为 myos",
+          "ok": true,
+          "detail": "fd=3 host=myos"
+        },
+        {
+          "name": "19 结束后 res 健康计数全 0",
+          "ok": true,
+          "detail": "健康: 同步异常=0  自愈/回shell=0  NISV=0  FIQ/SErr=0  熔断=0"
+        }
+      ],
+      "summary": {
+        "total": 19,
+        "pass": 19,
+        "fail": 0,
+        "failed": []
+      }
+    }
+  },
+  "nas_kvm": {
+    "dual_path_completed": false,
+    "skip_reason": "宿主为 x86_64，无 aarch64 KVM 能力",
+    "note": "本地沙箱 x86_64 无 aarch64 KVM；真机 KVM 双路需 NAS 通道恢复后补跑",
+    "last_probe": "2026-11-16 21:23，端口 56484 NoValidConnectionsError（延续第 54/55 轮未恢复）"
+  },
+  "bss_headroom_bytes": 20480,
+  "kernel_upper": "0x40233000",
+  "user_base": "0x40238000",
+  "build": {
+    "rc": 0,
+    "warnings_that_matter": 0,
+    "errors": 0,
+    "guards": [
+      "fw_cfg DMA 缓冲段",
+      "内核空间上界余量",
+      "USER_BASE 跟随项",
+      "[heap] 动态堆窗口"
+    ],
+    "headroom_note": "VFS 静态挂载表 +4KB，余量 24KB→20KB，仍充裕",
+    "kern_srcs_added": "vfs.c",
+    "user_elfs": [
+      "build/u56vfs.elf (8136B, md5 540a289ba25d25567a7d20ae8af3f4d2)"
+    ],
+    "note": "唯一 warning 是用户 ELF 的 _start 未定义（ucode 用 main，第 54/55 轮同款惯例）"
+  },
+  "vfs": {
+    "abstraction": "vfs.c/h：struct vnode_ops(lookup/read/listdir/stat/name) + 8 项静态 mount 表 + 最长前缀 vfs_resolve",
+    "mounts": [
+      "/proc",
+      "/dev  （开机静默挂载，不进启动日志基线）"
+    ],
+    "backends": [
+      "devfs: /dev/null /dev/zero /dev/console /dev/tty",
+      "procfs: /proc/meminfo /proc/uptime /proc/version /proc/cpuinfo /proc/mounts"
+    ],
+    "data_source": "procfs 通过 procfs_set_source 注入 mm_stat/tick/ncpu/rtc_now/version 回调——真实数据、非常量",
+    "old_path_first": "cmd_cat/cmd_ls 仅 fs_lookup<0 且命中挂载点才走 VFS；/nope 报没有这个路径、/etc/hostname 仍 myos",
+    "new_syscalls": [
+      "SYS_vfsread(20)",
+      "SYS_vfsinfo(21)"
+    ],
+    "no_new_cmd_star": true
+  },
+  "host_unit_tests": {
+    "test_vfs_host.c": "35/35",
+    "test_usysfd_host.c": "57/57",
+    "test_mm_rtc_host.c": "37/37",
+    "test_fs_host.c": "30/30",
+    "test_crypto.c": "16/16",
+    "test_wm_host.c": "36/36",
+    "test_net_host.c": "52/52"
+  },
+  "behavior_baseline": "test_behavior.py --compare golden_behavior.txt 逐字一致（启动日志 + 29 条命令）",
+  "full_regression": {
+    "script": "run_regression_r.sh",
+    "total": 15,
+    "pass": 15,
+    "fail": 0,
+    "note": "全套回归 15/15 PASS；第 6 项 EL0 用户程序 33 用例 PASS"
+  },
+  "supplementary_checks": {
+    "test_stage4_fs.py": "28/28",
+    "test_stage5_qemu.py": "35/35",
+    "test_stage5b_elf.py": "33/33（全套回归第 6 项）",
+    "test_idle_cpu.py": "CPU 0.9% / wall 8.00s（jiffies 9→16 @100Hz）"
+  },
+  "key_evidence": {
+    "内核shell cat /proc/meminfo": "MemTotal 8192KB / MemFree 8188KB 自洽",
+    "用户态与内核shell对账": "u56vfs meminfo_total_kb=8192 与内核 shell 一致",
+    "devfs": "/dev/zero 读满 32B 全零、/dev/null 读 0B",
+    "负例": "/proc/nope 与未挂载 /etc 均 -1；/proc/mounts 列出 /proc /dev procfs devfs",
+    "老路径零扰动": "cat /nope 仍报没有这个路径；cat /etc/hostname 仍 myos；行为基线逐字一致",
+    "ls": "ls /proc 5 文件、ls /dev 4 节点"
+  },
+  "honest_boundaries": [
+    "「跨挂载点 cp」未做全：只做到跨挂载点读（不同后端读出），未实现 cp 写文件到 procfs 挂载点（procfs 只读）",
+    "VFS 渐进式非全量替换：fs.c 未降级为 loongfs 后端、上层命令仍直接调 fs_*，加 FAT32/EXT2 不改上层的收益未兑现",
+    "/proc 简化版：5 个固定伪文件，uptime 空闲秒恒 0",
+    "2.3 shell 迁出内核未做（第 57 轮进程模型）",
+    "第 54 轮 7 个 cmd_* 技术债仍挂账；第 55/56 轮零新增但未迁出",
+    "真机 KVM 双路未复验：本地 x86_64 无 aarch64 KVM，NAS SSH 通道 21:08 探测端口 56484 不通",
+    "用户态程序不随 ISO 分发，经 b64 临时注入 /home",
+    "新增能力不进 help/golden，存在性由 test_round56.py 19 项判据独立证明"
+  ],
+  "artifacts": {
+    "判据脚本": "test_round56.py",
+    "串口日志": "/tmp/loong_round56_tcg.log",
+    "逐项状态副本": "docs/演进路线_逐项状态.md",
+    "检查记录": "docs/检查与修复记录.md 第五十六轮",
+    "宿主单测": "test_vfs_host.c"
+  },
+  "iso_md5": "a4e8a286fef932abf25ca71a5433b19a",
+  "iso_bytes": 19093504,
+  "md5_crosscheck": {
+    "kernel_elf": "ccd371df08f2e16df3c137420d3bc0ce",
+    "iso_tree_kernel_elf": "ccd371df08f2e16df3c137420d3bc0ce",
+    "esp_img_kernel_elf": "ccd371df08f2e16df3c137420d3bc0ce",
+    "payload_img_kernel_elf": "ccd371df08f2e16df3c137420d3bc0ce",
+    "all_match": true,
+    "iso_md5": "a4e8a286fef932abf25ca71a5433b19a",
+    "iso_md5_file_match": true
+  },
+  "delivery": {
+    "iso_in_git": false,
+    "iso_in_git_reason": "按 .gitignore 惯例（*.iso/*.iso.*）不入 git，走 NAS 同步 + Releases 分发",
+    "nas_sync_executed": false,
+    "nas_sync_reason": "NAS SSH 通道 2026-11-16 21:23 探测仍 NoValidConnectionsError",
+    "nas_artifacts_pending": [
+      "iso/loongos.iso",
+      "iso/loongos.iso.md5",
+      "vfs.h/c",
+      "test_vfs_host.c",
+      "user/u56_vfs.c",
+      "test_round56.py",
+      "docs/第五十六轮_VFS判据报告.json",
+      "docs/演进路线_逐项状态.md",
+      "README.md",
+      "sync_nas.py",
+      "docs/检查与修复记录.md"
+    ],
+    "nas_kvm_pending": "R55/56_ISO=<新ISO> python3 test_round56.py 补真机 TCG+KVM 双路",
+    "honest_note": "GitHub 已同步；NAS 未同步、真机 KVM 双路未执行，均如实标注"
+  }
+}
