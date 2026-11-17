@@ -54,6 +54,9 @@ int  gfx_text_w(const char *s);
 
 void gfx_clip_push(struct gfx_rect r);
 void gfx_clip_pop(void);
+/* 查询当前有效裁剪区（栈顶）：绘制回调可用它跳过与脏区不相交的行/列，
+   避免逐行 gfx_text 只为做一次裁剪检查的白跑开销。 */
+struct gfx_rect gfx_clip_current(void);
 
 /* 脏矩形：gfx_damage 登记重绘区，gfx_present 逐区回调 redraw。
    表满自动退化为整屏（gfx.h 里的纯函数保证不越界、不分配内存）。 */

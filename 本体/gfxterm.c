@@ -239,14 +239,17 @@ void gfxterm_draw(struct gfx_rect r, int focused)
     int avail = nrow - G_scroll;
     if (avail < 0) avail = 0;
     int n = avail < nlines ? avail : nlines;
+    struct gfx_rect vis = gfx_clip_current();
     char buf[GT_ROWBUF];
     for (int k = 0; k < n; k++) {
+        int ly = r.y + (nlines - n + k) * LH;
+        if (ly + LH <= vis.y || ly >= vis.y + vis.h) continue;  /* 整行在脏区外 */
         struct gt_row *rw = &rows[G_scroll + n - 1 - k];   /* 较老 → 最新 */
         int len = rw->e - rw->s;
         if (len > GT_ROWBUF - 1) len = GT_ROWBUF - 1;
         for (int i = 0; i < len; i++) buf[i] = G_hist[rw->s + i];
         buf[len] = 0;
-        gfx_text(r.x + 6, r.y + (nlines - n + k) * LH, buf, C_TEXT, C_TRANSP);
+        gfx_text(r.x + 6, ly, buf, C_TEXT, C_TRANSP);
     }
 
     /* 输入行：贴内容区底部。缓存矩形，闪烁相位切换时只脏这一条 22px 高区域。 */

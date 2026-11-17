@@ -118,6 +118,14 @@ static volatile u64 G_present_cyc;      /* gfx_present() 实际重绘累计 CPU 
 static volatile u32 G_present_calls;    /* 真正发生重绘的帧数 */
 static volatile u32 G_redraw_calls;     /* redraw() 累计执行次数 */
 
+/* 分项渲染计时（仅 GFX_PROFILE 诊断版启用；正式构建零开销）。
+   用于回答「一帧重绘到底贵在哪一层」，避免凭感觉优化。 */
+#ifdef GFX_PROFILE
+static volatile u64 Pf_wall, Pf_top, Pf_win, Pf_task, Pf_menu, Pf_cur;
+static volatile u64 Pf_frame, Pf_appdraw;   /* 窗口：框架 vs App draw 回调细分 */
+static volatile u32 Pf_n;
+#endif
+
 /* ---- App 框架 ---- */
 struct gapp {
     const char *name;          /* 开始菜单 / 任务栏显示名 */
@@ -1191,7 +1199,11 @@ static void draw_one_win(int k, int focused)
     struct dwin *w = &G_win[k];
     struct gfx_rect r = w->r;
     if (w->minimized) return;          /* 最小化窗口不绘制 */
-    gfx_fill((struct gfx_rect){r.x + 4, r.y + 4, r.w, r.h}, C_SHADOW);
+    /* 阴影只画窗口右/下露出的 4px L 形边：旧实现先填整块 (r.w×r.h) 再用窗口
+       背景覆盖内部，等于把窗口面积重复填两遍（380×300 窗口多写 ~11 万像素）。
+       只画外露边缘，像素结果逐点一致，省掉一整块无用填充。 */
+    gfx_fill((struct gfx_rect){r.x + r.w, r.y + 4, 4, r.h}, C_SHADOW);  /* 右缘 */
+    gfx_fill((struct gfx_rect){r.x + 4, r.y + r.h, r.w, 4}, C_SHADOW);  /* 下缘 */
     gfx_fill(r, C_WIN_BG);
     gfx_rect_draw(r, C_BORDER, 1);
     gfx_fill((struct gfx_rect){r.x, r.y, r.w, TITLE_H},
@@ -1206,7 +1218,13 @@ static void draw_one_win(int k, int focused)
     struct gfx_rect content = (struct gfx_rect){r.x + 1, r.y + TITLE_H, r.w - 2, r.h - TITLE_H - 1};
     gfx_clip_push(content);
     gfx_fill((struct gfx_rect){r.x + 1, r.y + TITLE_H, r.w - 2, 2}, G_apps[w->app_id]->accent);
+#ifdef GFX_PROFILE
+    u64 pf_a = dsk_cntpct();
+#endif
     if (G_apps[w->app_id]->draw) G_apps[w->app_id]->draw(content, focused, k);
+#ifdef GFX_PROFILE
+    Pf_appdraw += dsk_cntpct() - pf_a;
+#endif
     gfx_clip_pop();
     /* P4：右下角缩放手柄（内容之上），三个沿对角线的白点提示可拖 */
     struct gfx_rect hz = resize_rect(r);
@@ -1337,13 +1355,36 @@ static void draw_calibrate(void)
 static void redraw(struct gfx_rect r)
 {
     G_redraw_calls++;
+#ifdef GFX_PROFILE
+    u64 t0 = dsk_cntpct();
+#endif
     if (G_cal_on) { draw_calibrate(); return; }
     draw_wallpaper(r);
+#ifdef GFX_PROFILE
+    u64 t1 = dsk_cntpct();
+#endif
     draw_topbar(r);
+#ifdef GFX_PROFILE
+    u64 t2 = dsk_cntpct();
+#endif
     draw_windows(r);
+#ifdef GFX_PROFILE
+    u64 t3 = dsk_cntpct();
+#endif
     draw_taskbar(r);
+#ifdef GFX_PROFILE
+    u64 t4 = dsk_cntpct();
+#endif
     draw_menu(r);
+#ifdef GFX_PROFILE
+    u64 t5 = dsk_cntpct();
+#endif
     draw_cursor(r);
+#ifdef GFX_PROFILE
+    u64 t6 = dsk_cntpct();
+    Pf_wall += t1 - t0; Pf_top += t2 - t1; Pf_win += t3 - t2;
+    Pf_task += t4 - t3; Pf_menu += t5 - t4; Pf_cur += t6 - t5; Pf_n++;
+#endif
 }
 
 /* ---- 鼠标事件 ---- */
@@ -1668,5 +1709,29 @@ void desktop_run(void)
         n += my_itoa(st + n, (long)((G_redraw_calls * 100ULL) / G_present_calls));
         st[n++] = '\n'; st[n] = 0;
         kputs(st);
+#ifdef GFX_PROFILE
+        if (Pf_n) {
+            char ps[192]; int m = 0;
+            const char *q = "[gfxprof] n=";
+            while (*q) ps[m++] = *q++;
+            m += my_itoa(ps + m, (long)Pf_n);
+            const char *lbl[] = {" wall=", " top=", " win=", " task=", " menu=", " cur="};
+            u64 val[] = {Pf_wall / Pf_n, Pf_top / Pf_n, Pf_win / Pf_n,
+                         Pf_task / Pf_n, Pf_menu / Pf_n, Pf_cur / Pf_n};
+            for (int i = 0; i < 6; i++) {
+                q = lbl[i]; while (*q) ps[m++] = *q++;
+                m += my_itoa(ps + m, (long)val[i]);
+            }
+            /* 窗口细分：框架 = win - appdraw（框架含所有窗口，appdraw 为各窗口 draw 回调之和） */
+            const char *q2 = "[gfxprof2] win_frame=";
+            while (*q2) ps[m++] = *q2++;
+            u64 frame = Pf_win > Pf_appdraw ? Pf_win - Pf_appdraw : 0;
+            m += my_itoa(ps + m, (long)(frame / Pf_n));
+            q2 = " appdraw="; while (*q2) ps[m++] = *q2++;
+            m += my_itoa(ps + m, (long)(Pf_appdraw / Pf_n));
+            ps[m++] = '\n'; ps[m] = 0;
+            kputs(ps);
+        }
+#endif
     }
 }

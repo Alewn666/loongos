@@ -194,6 +194,9 @@ FILES = [
     #     LOONGOS_ROUTE_TODO.md 已在上面登记，此处补本轮改动的 gfxterm.c/h 与新增判据。
     ('本体/gfxterm.c',              '本体/gfxterm.c'),
     ('本体/gfxterm.h',              '本体/gfxterm.h'),
+
+    # 桌面渲染全面优化（2026-11-17）：gfx.c 新增 gfx_clip_current 接口，gfx_draw.h 补声明
+    ('本体/gfx_draw.h',             '本体/gfx_draw.h'),
     ('本体/test_install_gui_fix.py','本体/test_install_gui_fix.py'),
     ('本体/docs/安装GUI卡死修复判据报告.json', '本体/docs/安装GUI卡死修复判据报告.json'),
 ]

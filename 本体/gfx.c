@@ -83,6 +83,8 @@ void gfx_clip_pop(void)
     if (G_clip_n > 1) G_clip_n--;
 }
 
+struct gfx_rect gfx_clip_current(void) { return G_clip[G_clip_n - 1]; }
+
 /* 把矩形裁剪到「当前裁剪 ∩ 屏幕」；返回空矩形表示无需绘制 */
 static struct gfx_rect drawable(struct gfx_rect r)
 {
