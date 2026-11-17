@@ -174,6 +174,20 @@ FILES = [
     ('本体/user/u57_proc.c',        '本体/user/u57_proc.c'),
     ('本体/test_round57.py',        '本体/test_round57.py'),
     ('本体/docs/第五十七轮_进程模型判据报告.json', '本体/docs/第五十七轮_进程模型判据报告.json'),
+    # 第五十八轮 58.0-A：每进程 FD 表 + 完整 execve
+    # 注：kernel.c / kernel.elf / kernel.o / proc.h / build.sh / bss_budget.txt /
+    #     user/user.h / docs/检查与修复记录.md / README.md / ISO / iso.md5 /
+    #     演进路线_逐项状态.md / LOONGOS_ROUTE_TODO.md 已在上面登记，
+    #     此处只补本轮新增的编译单元、宿主单测、用户态 ELF、判据脚本与报告。
+    ('本体/fdtab.h',                '本体/fdtab.h'),
+    ('本体/fdtab.c',                '本体/fdtab.c'),
+    ('本体/test_fdtab_host.c',      '本体/test_fdtab_host.c'),
+    ('本体/user/u58_fdproc.c',      '本体/user/u58_fdproc.c'),
+    ('本体/user/u58_exec.c',        '本体/user/u58_exec.c'),
+    ('本体/user/u58_target.c',      '本体/user/u58_target.c'),
+    ('本体/user/u58_badexec.c',     '本体/user/u58_badexec.c'),
+    ('本体/test_round58.py',        '本体/test_round58.py'),
+    ('本体/docs/第五十八轮_FD与execve判据报告.json', '本体/docs/第五十八轮_FD与execve判据报告.json'),
 ]
 
 def md5_local(path):

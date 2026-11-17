@@ -171,5 +171,13 @@
         "failed": []
       }
     }
+  },
+  "iso_md5": "c52406fcc1b39da3b3b34f2c49ed1210",
+  "kernel_upper_md5": "e73dea147b024ea98e73c3eb5a35f261",
+  "sync": {
+    "github": "待提交 ddab723(主体)+留痕提交; push origin main",
+    "nas": "已同步 2026-11-17 08:07: sync_nas.py 新增/更新22·跳过91·失败0; 入口 114.66.28.185:56484",
+    "nas_verify": "ISO c52406fc / fdtab.c 85cf542b / fdtab.h f174198b / test_round58.py cdb108e1 / kernel.elf e73dea14 / 报告 9c5249b9 本地=远端 (VERIFY_ALL_OK)",
+    "kvm": "未执行：宿主x86_64无aarch64 KVM；本轮仅同步，未在NAS启动判据；KVM列=—"
   }
 }
