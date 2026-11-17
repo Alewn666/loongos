@@ -40,6 +40,7 @@ typedef unsigned long  u64;
 
 /* 一个进程槽位。user_pt 是 kernel.c 私有 per-proc 页表的不透明句柄
  * （宿主单测里可为 0，纯逻辑不解读它）。 */
+struct fd_table;   /* 58.0-A：前向声明，定义在 fdtab.h；本头不 include 以避免宿主耦合 */
 struct proc {
     u32 pid;
     u32 state;
@@ -54,6 +55,7 @@ struct proc {
     u64 pages[PROC_NPAGES];            /* 子进程独立用户物理页（页对齐） */
     u64 page_raw[PROC_NPAGES];         /* 对应 kmalloc 原始指针 */
     int  npages;
+    struct fd_table *files;            /* 58.0-A：每进程 FD 表（指向 g_procfiles[i]） */
 };
 
 /* ---- 纯逻辑 API（proc.c 实现，宿主可测）---- */

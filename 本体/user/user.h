@@ -93,8 +93,10 @@ static inline long u_vfsinfo(void) { return sys_call(SYS_vfsinfo, 0, 0); }
 static inline long u_fork(void)                       { return sys_call(SYS_fork, 0, 0); }
 static inline long u_wait(int *status)                { return sys_call(SYS_wait, (long)status, 0); }
 static inline long u_procexit(long code)              { return sys_call(SYS_procexit, code, 0); }
-static inline long u_execve(const char *p, char *const *argv) {
-    return sys_call(SYS_execve, (long)p, (long)argv);
+/* 58.0-A：简化 ABI —— 第二参是"打包参数行"字符串（空格分隔），与内核 load_elf_current 一致。
+   完整 argv[] 指针数组的解析列为诚实边界（见第五十八轮报告）。 */
+static inline long u_execve(const char *p, const char *argline) {
+    return sys_call(SYS_execve, (long)p, (long)argline);
 }
 
 #endif

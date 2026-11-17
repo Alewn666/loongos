@@ -27,6 +27,7 @@
 #include "usysfd.h" /* 第五十五轮：统一 fd / pipe 对象层（pipe 用 kmalloc） */
 #include "vfs.h"    /* 第五十六轮：VFS 挂载层（/proc /dev，老路径不受影响） */
 #include "proc.h"   /* 第五十七轮：进程模型地基（每进程地址空间 + fork/wait，演进路线 3.2） */
+#include "fdtab.h"  /* 第五十八轮 58.0-A：每进程 FD 表 + 打开文件描述共享语义 */
 
 typedef unsigned long u64;
 typedef unsigned int  u32;
@@ -1751,6 +1752,103 @@ static void run_userprog(const char *path, const char *argline)
     enter_el0_at(eh->entry, USER_END);                               /* 一去不复返，exit/fault 回着陆点 */
 }
 
+/* ---- 58.0-A：完整 execve —— 在当前进程用户区装载一个新 ELF 并替换镜像 ----
+ * 与 run_userprog 的区别：execve 从 EL0 的 SVC 现场进入，成功后**不返回原程序**
+ * （靠改写陷阱帧 f 的 ELR/SP 实现），保留 pid / 地址空间 / fd 表 / cwd（Unix 语义）。
+ *
+ * 失败回滚：第一阶段只读 elf_buf 做**全部校验**，任何一项失败都返回 0 且**不碰用户区**，
+ * 原程序现场完好；全部通过后才进入第二阶段写用户区（写阶段只依赖已校验数据，不会失败）。
+ * 返回新 entry（必在 USER_BASE..USER_END，非 0）；失败返回 0。 */
+/* 前向声明（定义在进程子系统）：当前生效的用户 L3 表物理址。
+   execve 必须把新镜像的权限写进"当前生效"的表——子进程有自己的 L3，写全局
+   l3_user 会导致子取指 fault（与第57轮 fork 踩过的 UXN 坑同源）。 */
+static u64 proc_active_l3(void);
+
+/* 和 fill_pt 同语义，但把用户区 PTE 写进当前生效的 L3 表（pid=1=全局，子进程=独立表）。
+   内核半仍写全局 l3_kern（所有进程共享）。 */
+static void fill_pt_active(u64 start, u64 end, u64 prot)
+{
+    start &= ~(SZ_4K - 1);
+    end = (end + SZ_4K - 1) & ~(SZ_4K - 1);
+    u64 *tbl = (u64 *)proc_active_l3();
+    for (u64 a = start; a < end; a += SZ_4K) {
+        if (a >= 0x40200000UL && a < 0x40400000UL)
+            tbl[(a & (SZ_2M - 1)) >> 12] = a | prot;
+        else
+            l3_kern[(a & (SZ_2M - 1)) >> 12] = a | prot;
+    }
+}
+
+static u64 load_elf_current(const char *path, const char *argline)
+{
+    char rp[128];
+    if (!path || !*path) return 0;
+    if (path_resolve(path, rp, sizeof rp) < 0) return 0;
+    int ino = fs_lookup(rp);
+    if (ino < 0) return 0;
+    int n = fs_readfile(ino, elf_buf, sizeof elf_buf);
+    if (n < 64) return 0;
+
+    struct elf64_ehdr *eh = (struct elf64_ehdr *)elf_buf;
+    if (eh->magic[0] != 0x7F || eh->magic[1] != 'E' ||
+        eh->magic[2] != 'L' || eh->magic[3] != 'F') return 0;
+    if (eh->phentsize < (u16)sizeof(struct elf64_phdr)) return 0;
+    if (eh->phoff > (u64)n) return 0;
+    if ((u64)eh->phnum > ((u64)n - eh->phoff) / eh->phentsize) return 0;
+    if (eh->entry < USER_BASE || eh->entry >= USER_END) return 0;
+
+    /* ---- 阶段一：校验所有 PT_LOAD 段（只读，不写用户区）---- */
+    for (int i = 0; i < eh->phnum; i++) {
+        struct elf64_phdr *ph = (struct elf64_phdr *)(elf_buf + eh->phoff + (u64)i * eh->phentsize);
+        if (ph->type != PT_LOAD) continue;
+        if (ph->vaddr < USER_BASE ||
+            ph->vaddr + ph->memsz > USER_END - EL0_STACK_RESERVE ||
+            ph->vaddr + ph->memsz < ph->vaddr) return 0;
+        if (ph->filesz > ph->memsz) return 0;
+        if (ph->offset > (u64)n || ph->filesz > (u64)n - ph->offset) return 0;
+    }
+
+    /* ---- 阶段二：全部校验通过，开始覆盖当前用户区 ---- */
+    fill_pt_active(USER_BASE, USER_END, PROT_USERRW);
+    __asm__ volatile("tlbi vmalle1; dsb ish; isb");
+    for (int i = 0; i < eh->phnum; i++) {
+        struct elf64_phdr *ph = (struct elf64_phdr *)(elf_buf + eh->phoff + (u64)i * eh->phentsize);
+        if (ph->type != PT_LOAD) continue;
+        u8 *dst = (u8 *)ph->vaddr;
+        fs_memcpy(dst, elf_buf + ph->offset, (u32)ph->filesz);
+        for (u64 k = ph->filesz; k < ph->memsz; k++) dst[k] = 0;   /* bss 清零 */
+        fill_pt_active(ph->vaddr, ph->vaddr + ph->memsz,
+                       (ph->flags & PF_X) ? PROT_USEREX : PROT_USERRW);
+        icache_flush(ph->vaddr, ph->vaddr + ph->memsz);
+    }
+    __asm__ volatile("tlbi vmalle1; dsb ish; isb");
+
+    /* 参数区：argc / argv[] / 字符串池（与 run_userprog 完全一致的布局） */
+    {
+        u64 *u = (u64 *)UARGS_ADDR;
+        char *pool = (char *)(UARGS_ADDR + 8 * (UARGS_MAX + 1));
+        int argc = 0;
+        {   int k = 0;
+            while (path[k] && k < 63) { pool[k] = path[k]; k++; }
+            pool[k] = 0;
+            u[1] = (u64)pool; argc = 1; pool += k + 1;
+        }
+        const char *q = argline;
+        while (q && *q && argc < UARGS_MAX) {
+            while (*q == ' ') q++;
+            if (!*q) break;
+            int k = 0;
+            while (*q && *q != ' ' && k < 63) pool[k++] = *q++;
+            pool[k] = 0;
+            u[1 + argc] = (u64)pool;
+            argc++;
+            pool += k + 1;
+        }
+        u[0] = (u64)argc;
+    }
+    return eh->entry;
+}
+
 /* SVC 系统调用分发（用户程序 EL0 → EL1）：x8=号，x0/x1=参数，返回值写回 x0 */
 /* ---- 阶段8：POSIX 文件接口（fd 表；open 时把整份文件读进内核缓冲，上限 512 字节）---- */
 #define NFDS   6
@@ -1779,6 +1877,33 @@ static int is_ufd_obj(u64 fd)
     if (fd >= UFD_MAX) return 0;
     int k = ufd_kind((int)fd);
     return (k == UFD_PIPE_R || k == UFD_PIPE_W);
+}
+
+/* ---- 58.0-A：每进程 FD 表 + 全局打开文件描述(OFD)池 ----
+ * pid=1 初始进程仍用 kernel.c 的全局 g_fd（老 syscall 逐字不变）；
+ * fork 出的子进程 pid>=2 用 g_procfiles[] 里自己的表，共享 g_ofds 池里的 OFD。
+ * 定义在进程子系统使用点之前，供 pf_read / svc_dispatch 引用。 */
+static struct ofd       g_ofds[FDT_NOFD];
+static struct fd_table  g_procfiles[NPROC];
+
+/* ---- 58.0-A：子进程每进程 FD 表的读写辅助 ----
+ * OFD 不存文件内容缓冲（省 BSS 且 fork 共享 off 即可）。read 时按 ino 从 fs
+ * 重新读进局部缓冲，再按共享 off 切片；OFD.off 由 fdtab 管理、父子共享。 */
+static u8 g_pfdbuf[NFDBUF];   /* 子进程 read 的临时文件缓冲 */
+static long pf_read(struct fd_table *t, u32 fd, u8 *dst, u32 n)
+{
+    int oi = fdt_get(t, fd);
+    if (oi < 0 || g_ofds[oi].kind != FDT_KIND_FILE) return -1;
+    struct ofd *o = &g_ofds[oi];
+    int sz = fs_readfile((int)o->ino, g_pfdbuf, NFDBUF);
+    if (sz < 0) return -1;
+    u32 len = (u32)sz;
+    if (o->off > len) o->off = len;
+    u32 avail = len - o->off;
+    u32 k = n < avail ? n : avail;
+    for (u32 i = 0; i < k; i++) dst[i] = g_pfdbuf[o->off + i];
+    o->off += k;                       /* 共享偏移推进：fork 后父子看到的下一个读位置一致 */
+    return (long)k;
 }
 
 /* 以 g_ucwd 为基准规范化路径（复刻 path_resolve，基准换成 g_ucwd） */
@@ -1893,6 +2018,17 @@ static u32    g_cpid = 1;          /* 当前进程 pid（EL0 里正在跑的那�
 static u64    g_cur_l3 = 0;        /* 当前生效的用户 L3 表物理；0 = 全局 l3_user */
 static int    g_proc_active = 0;   /* 是否有用户程序在使用进程模型（wait 让出需要） */
 
+/* 当前进程的文件表：pid=1 返回 0（调用方走老 g_fd 路径），否则返回该 proc 的表。
+   返回 0 是刻意的哨兵——svc_dispatch 用它决定走老路径还是每进程路径。 */
+static struct fd_table *proc_cur_files(void)
+{
+    if (g_cpid == 1) return 0;
+    for (int i = 0; i < NPROC; i++)
+        if (g_procs[i].state != P_FREE && g_procs[i].pid == g_cpid)
+            return g_procs[i].files;
+    return 0;
+}
+
 /* 页表项物理地址掩码（低 12 位 + 高位是 flags；恒等映射 VA=PA） */
 #define PTE_ADDR_MASK (~0xFFFUL)
 
@@ -1922,7 +2058,7 @@ static u64 proc_alloc_page(u64 *raw_out)
     return p;
 }
 
-/* 释放一个子进程占用的所有页（L3 表 + 用户物理页）。 */
+/* 释放一个子进程占用的所有页（L3 表 + 用户物理页）+ 58.0-A 的每进程 FD 表。 */
 static void proc_release_pages(struct proc *p)
 {
     if (!p) return;
@@ -1931,6 +2067,10 @@ static void proc_release_pages(struct proc *p)
         if (p->page_raw[i]) { kfree((void *)p->page_raw[i]); p->page_raw[i] = 0; }
     p->npages = 0;
     p->user_pt = 0;
+    if (p->files) {                       /* 58.0-A：释放本进程对 OFD 的所有引用 */
+        fdt_destroy(p->files, g_ofds, FDT_NOFD);
+        p->files = 0;
+    }
 }
 
 /* 回收全部子进程页 + 复位进程表（run_userprog 装载前调用，保证跨 run 零泄漏）。
@@ -1944,6 +2084,10 @@ static void proc_reset_all(void)
     g_cpid = 1;
     proc_switch_l3(0);
     g_proc_active = 0;
+    /* 58.0-A：复位 OFD 池 + 所有每进程 fd 表，保证跨 run 零 FD 泄漏。 */
+    fdt_pool_init(g_ofds, FDT_NOFD);
+    for (int i = 0; i < NPROC; i++)
+        for (u32 fd = 0; fd < FDT_NFD; fd++) g_procfiles[i].slot[fd] = 0;
 }
 
 /* 读/写 sp_el0（用户栈指针；异常帧里没有它，需单独保存恢复）。 */
@@ -2005,6 +2149,36 @@ static int do_fork(struct regs *f)
     fs_memcpy(c->frame, f, EXC_FRAME_SIZE);
     c->frame[0] = 0;                 /* x0 = 0：子进程视角 */
     c->user_sp  = proc_sp_el0();     /* 子继承父的用户栈指针值（内容已隔离） */
+
+    /* 58.0-A：初始化子进程 FD 表。为保零扰动，OFD 池在 run_userprog 装载时
+       复位一次（见 proc_reset_all），这里把父的 fd 状态复制进子表。
+       - 父是 pid=1（全局 g_fd）：把 g_fd 中 used 的文件 fd 逐个建成 ofd 并
+         装进子表；fd0/1/2 建 console。子拿到的是与父"等价打开文件描述"的快照，
+         之后父子各自 open/close 互不影响（Unix 语义）。
+       - 父是子进程（有自己的 fd_table）：直接 fdt_fork 复制槽位并共享 OFD ref。 */
+    {
+        int slot = (int)(c - g_procs);
+        struct fd_table *ct = &g_procfiles[slot];
+        c->files = ct;
+        for (u32 i = 0; i < FDT_NFD; i++) ct->slot[i] = 0;
+        struct fd_table *parent_files = proc_cur_files();   /* 注意：此刻 g_cpid 仍是父 */
+        if (parent_files) {
+            fdt_fork(parent_files, ct, g_ofds, FDT_NOFD);   /* 子共享父 OFD（ref++） */
+        } else {
+            /* 父 = pid=1：用 g_fd 构造子的初始 fd 表 */
+            fdt_init(ct, g_ofds, FDT_NOFD);                  /* fd0/1/2 console */
+            for (u32 fd = 3; fd < NFDS; fd++) {
+                if (g_fd[fd].used) {
+                    int oi = fdt_ofd_new_file(g_ofds, FDT_NOFD,
+                                              (u32)g_fd[fd].ino, g_fd[fd].len);
+                    if (oi >= 0) {
+                        g_ofds[oi].off = g_fd[fd].off;       /* 继承当前偏移 */
+                        fdt_install(ct, g_ofds, FDT_NOFD, (u32)oi);
+                    }
+                }
+            }
+        }
+    }
 
     g_proc_active = 1;
     return cpid;                     /* 父视角：返回子 pid */
@@ -2152,6 +2326,17 @@ static void svc_dispatch(struct regs *f)
         if (path_resolve(pbuf, rp, sizeof rp) < 0)   { f->x[0] = (u64)-1; return; }
         int ino = fs_lookup(rp);
         if (ino < 0) { f->x[0] = (u64)-1; return; }
+        struct fd_table *pft = proc_cur_files();      /* 58.0-A：子进程走自己的表 */
+        if (pft) {
+            int sz = fs_filesize(ino);
+            if (sz < 0) { f->x[0] = (u64)-1; return; }
+            int oi = fdt_ofd_new_file(g_ofds, FDT_NOFD, (u32)ino, (u32)sz);
+            if (oi < 0) { f->x[0] = (u64)-1; return; }
+            int fd = fdt_install(pft, g_ofds, FDT_NOFD, (u32)oi);
+            if (fd < 0) { fdt_ofd_unref(&g_ofds[oi]); f->x[0] = (u64)-1; return; }
+            f->x[0] = (u64)fd;
+            return;
+        }
         int fd = -1;
         for (int i = 3; i < NFDS; i++) if (!g_fd[i].used) { fd = i; break; }
         if (fd < 0) { f->x[0] = (u64)-1; return; }
@@ -2169,6 +2354,14 @@ static void svc_dispatch(struct regs *f)
             f->x[0] = (u64)ufd_read((int)fd, (u8 *)p, (u32)len);
             return;
         }
+        {
+            struct fd_table *pft = proc_cur_files();   /* 58.0-A：子进程自己的表 */
+            if (pft) {
+                if (!u_range_ok(p, len)) { f->x[0] = (u64)-1; return; }
+                f->x[0] = (u64)pf_read(pft, (u32)fd, (u8 *)p, (u32)len);
+                return;
+            }
+        }
         if (fd < 3 || fd >= NFDS || !g_fd[fd].used) { f->x[0] = (u64)-1; return; }
         if (p < USER_BASE || p + len < p || p + len > USER_END) { f->x[0] = (u64)-1; return; }
         u32 avail = g_fd[fd].len - g_fd[fd].off;
@@ -2185,6 +2378,10 @@ static void svc_dispatch(struct regs *f)
             f->x[0] = (u64)ufd_close((int)fd);
             return;
         }
+        {
+            struct fd_table *pft = proc_cur_files();   /* 58.0-A */
+            if (pft) { f->x[0] = (u64)fdt_close(pft, g_ofds, FDT_NOFD, (u32)fd); return; }
+        }
         if (fd < 3 || fd >= NFDS || !g_fd[fd].used) { f->x[0] = (u64)-1; return; }
         g_fd[fd].used = 0; g_fd[fd].ino = 0; g_fd[fd].off = g_fd[fd].len = 0;
         f->x[0] = 0;
@@ -2192,6 +2389,21 @@ static void svc_dispatch(struct regs *f)
     }
     if (f->x[8] == 5) {                       /* lseek(fd, off, whence) */
         u64 fd = f->x[0]; long off = (long)f->x[1]; u64 whence = f->x[2];
+        {
+            struct fd_table *pft = proc_cur_files();   /* 58.0-A */
+            if (pft) {
+                int oi = fdt_get(pft, (u32)fd);
+                if (oi < 0 || g_ofds[oi].kind != FDT_KIND_FILE) { f->x[0] = (u64)-1; return; }
+                struct ofd *o = &g_ofds[oi];
+                long base = whence == 0 ? 0 : (whence == 1 ? (long)o->off : (long)o->len);
+                long npos = base + off;
+                if (npos < 0) npos = 0;
+                if ((u32)npos > o->len) npos = (long)o->len;
+                o->off = (u32)npos;
+                f->x[0] = (u64)npos;
+                return;
+            }
+        }
         if (fd < 3 || fd >= NFDS || !g_fd[fd].used) { f->x[0] = (u64)-1; return; }
         long base = whence == 0 ? 0 : (whence == 1 ? (long)g_fd[fd].off : (long)g_fd[fd].len);
         long npos = base + off;
@@ -2240,6 +2452,16 @@ static void svc_dispatch(struct regs *f)
     if (f->x[8] == SYS_fstat) {
         u64 fd = f->x[0], sp = f->x[1];
         if (!u_range_ok(sp, sizeof(struct ustat))) { f->x[0] = (u64)-1; return; }
+        {
+            struct fd_table *pft = proc_cur_files();   /* 58.0-A */
+            if (pft) {
+                int oi = fdt_get(pft, (u32)fd);
+                if (oi < 0 || g_ofds[oi].kind != FDT_KIND_FILE) { f->x[0] = (u64)-1; return; }
+                fill_ustat((int)g_ofds[oi].ino, (void *)sp);
+                f->x[0] = 0;
+                return;
+            }
+        }
         if (fd < 3 || fd >= NFDS || !g_fd[fd].used) { f->x[0] = (u64)-1; return; }
         fill_ustat(g_fd[fd].ino, (void *)sp);
         f->x[0] = 0;
@@ -2247,12 +2469,20 @@ static void svc_dispatch(struct regs *f)
     }
     if (f->x[8] == SYS_dup) {
         u64 fd = f->x[0];
+        {
+            struct fd_table *pft = proc_cur_files();   /* 58.0-A */
+            if (pft) { f->x[0] = (u64)fdt_dup(pft, g_ofds, FDT_NOFD, (u32)fd); return; }
+        }
         if (fd >= UFD_MAX || !is_ufd_obj(fd)) { f->x[0] = (u64)-1; return; }
         f->x[0] = (u64)ufd_dup((int)fd);
         return;
     }
     if (f->x[8] == SYS_dup2) {
         u64 oldfd = f->x[0], newfd = f->x[1];
+        {
+            struct fd_table *pft = proc_cur_files();   /* 58.0-A */
+            if (pft) { f->x[0] = (u64)fdt_dup2(pft, g_ofds, FDT_NOFD, (u32)oldfd, (u32)newfd); return; }
+        }
         if (oldfd >= UFD_MAX || newfd >= UFD_MAX || !is_ufd_obj(oldfd)) {
             f->x[0] = (u64)-1; return;
         }
@@ -2347,13 +2577,24 @@ static void svc_dispatch(struct regs *f)
         return;
     }
     if (f->x[8] == SYS_execve) {
-        /* 简化版：execve 在当前进程用户区重新装载一个 ELF（覆盖代码/数据），
-           入口改写当前帧的 ELR；pid/地址空间/fd 保持不变。跨地址空间的 execve
-           留给 fork 之后的子进程自行 run——见 docs 诚实边界。 */
-        u64 pp = f->x[0];
-        if (!u_range_ok(pp, 1)) { f->x[0] = (u64)-1; return; }
-        f->x[0] = (u64)-1;                                  /* 暂不支持：诚实返回 -1（见边界） */
-        return;
+        /* 58.0-A 完整 execve：path(x0)、打包的参数行(x1，可为 0)。
+           校验+加载成功 → 改写陷阱帧 ELR/SP，eret 后直接进入新程序（不返回原程序）；
+           失败 → 返回 -1，用户区未动（load_elf_current 阶段一全校验保证回滚）。
+           pid / 地址空间 / fd 表 / cwd 全部保留（Unix execve 语义）。 */
+        u64 pp = f->x[0], ap = f->x[1];
+        char path[128], args[256];
+        if (u_strcpy(path, pp, sizeof path) < 0) { f->x[0] = (u64)-1; return; }
+        args[0] = 0;
+        if (ap && u_strcpy(args, ap, sizeof args) < 0) { f->x[0] = (u64)-1; return; }
+        u64 entry = load_elf_current(path, args);
+        if (!entry) { f->x[0] = (u64)-1; return; }          /* 失败回滚：原程序继续 */
+        /* 成功：改写当前 SVC 陷阱帧，eret 回 EL0 后落在新入口。
+           ELR=entry，SP=USER_END（新用户栈顶），SPSR 保持 EL0t（未改），
+           x0=argc 无需预设（新程序从 UARGS_ADDR 读参数）。 */
+        f->elr = entry;
+        f->x[0] = (u64)0;                                   /* 新进程 argc 由参数区提供，x0 归零 */
+        proc_set_sp_el0(USER_END);
+        return;                                             /* 不写回“成功值”：新程序直接开跑 */
     }
     if (f->x[8] == 1) {                                    /* exit：体面结束用户程序 */
         uart_puts("\n[run] 程序退出 code="); uart_putdec((u32)f->x[0]); uart_puts("\n");

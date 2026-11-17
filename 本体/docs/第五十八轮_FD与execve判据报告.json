@@ -1,0 +1,175 @@
+{
+  "title": "LoongOS 第五十八轮 58.0-A 每进程FD表+完整execve 判据报告",
+  "kernel_md5": "e73dea147b024ea98e73c3eb5a35f261",
+  "elf_fd_md5": "5efdd077862cefacbfd421c62199e676",
+  "elf_exec_md5": "f36c53e861f71355f789114749979d10",
+  "elf_tgt_md5": "f6270dee7fee3b6bd8bb89de1179e11f",
+  "elf_bad_md5": "42774d968c9879029b168c3f0efdd093",
+  "generated": "2026-11-17 07:49:14",
+  "modes": {
+    "TCG": {
+      "mode": "TCG",
+      "cmd": "qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a57 -m 256M -kernel /workspace/安卓/loongos/本体/kernel.elf -nographic -no-reboot",
+      "u58fd": {
+        "pid_before": "1",
+        "fork_ret": "2",
+        "child_pid": "2",
+        "child_open_fd": "3",
+        "child_read": "5",
+        "child_first": "m",
+        "child_close": "0",
+        "child_read_after_close": "-1",
+        "child_pass": "3",
+        "child_fail": "0",
+        "wait_ret": "2",
+        "status": "5",
+        "parent_open_fd": "3",
+        "parent_read": "5",
+        "parent_first": "m",
+        "pass": "5",
+        "fail": "0"
+      },
+      "u58exec": {
+        "call_pid_before": "1",
+        "call_before_exec": "1",
+        "ex_replaced": "1",
+        "ex_pid": "1",
+        "ex_argc": "2",
+        "ex_argv0": "/home/u58tgt",
+        "ex_argv1": "HELLO",
+        "ex_target_exit": "1"
+      },
+      "u58bad": {
+        "pid_before": "1",
+        "before": "1",
+        "exec_ret": "-1",
+        "rollback_ok": "1",
+        "pid_after": "1"
+      },
+      "res_after": {
+        "sync": 0,
+        "nisv": 0,
+        "fiq": 0,
+        "trip": 0
+      },
+      "checks": [
+        {
+          "name": "1 内核横幅 + shell 提示符就绪",
+          "ok": true,
+          "detail": "未见横幅/提示符"
+        },
+        {
+          "name": "2 cat /etc/hostname 仍为 myos（老 fs 逐字不变）",
+          "ok": true,
+          "detail": "cat /etc/hostname\n\nmyos\n> "
+        },
+        {
+          "name": "3 老 syscall 程序仍体面退出 code=0（fd 改动零扰动 pid=1）",
+          "ok": true,
+          "detail": "5] stat_badptr_rc=-1\n[R55] chk stat_reject_badptr ok\n[R55] PASS=35\n[R55] FAIL=0\n[R55] ==== u55test done ====\n\n\n[run] 程序退出 code=0\n\n[el1] 已从 EL0 撤回内核，shell 继续\n\n> "
+        },
+        {
+          "name": "4 u58fd.elf 注入字节一致",
+          "ok": true,
+          "detail": "写入 7080 / 期望 7080"
+        },
+        {
+          "name": "5 FD 程序跑完并体面退出 code=0（无 EL0 fault）",
+          "ok": true,
+          "detail": "[R58FD] child_fail=0\n[R58FD] child_exit\n[R58FD] wait_ret=2\n[R58FD] status=5\n[R58FD] parent_open_fd=3\n[R58FD] parent_read=5\n[R58FD] parent_first=m\n[R58FD] pass=5\n[R58FD] fail=0\n[R58FD] done\n\n\n[run] 程序退出 code=0\n\n[el1] 已从 EL0 撤回内核，shell 继续\n\n> "
+        },
+        {
+          "name": "6 自报 pass/fail 归零",
+          "ok": true,
+          "detail": "pass=5 fail=0"
+        },
+        {
+          "name": "7 fork_ret>=2（子 pid 从 2 起）",
+          "ok": true,
+          "detail": "2"
+        },
+        {
+          "name": "8 子独立表 open 得 fd=3",
+          "ok": true,
+          "detail": "3"
+        },
+        {
+          "name": "9 子 read>0 且首字节可见",
+          "ok": true,
+          "detail": "read=5 first=m"
+        },
+        {
+          "name": "10 子 close 后再读返回 -1（fd 表项已释放）",
+          "ok": true,
+          "detail": "-1"
+        },
+        {
+          "name": "11 wait/status 正确（子 procexit 退出码 5）",
+          "ok": true,
+          "detail": "wait=2 fork=2 status=5"
+        },
+        {
+          "name": "12 父 open 也得 fd=3 且 read>0（子的 close 未污染父表）",
+          "ok": true,
+          "detail": "pfd=3 pread=5"
+        },
+        {
+          "name": "13 pid_before=1 且身份未被 fork 改变",
+          "ok": true,
+          "detail": "1"
+        },
+        {
+          "name": "14 二次 run 同样 pass=5 fail=0（OFD 池跨 run 干净）",
+          "ok": true,
+          "detail": "FD] parent_open_fd=3\n[R58FD] parent_read=5\n[R58FD] parent_first=m\n[R58FD] pass=5\n[R58FD] fail=0\n[R58FD] done\n\n\n[run] 程序退出 code=0\n\n[el1] 已从 EL0 撤回内核，shell 继续\n\n> "
+        },
+        {
+          "name": "15 u58tgt/u58exec 注入字节一致",
+          "ok": true,
+          "detail": "tgt 6064/6064 exec 6008/6008"
+        },
+        {
+          "name": "16 execve 成功：目标程序接管并体面退出（无 EL0 fault）",
+          "ok": true,
+          "detail": "000040240000 → 进 EL0（syscall: x8=0 write/2 open/3 read/4 close/5 lseek · x8=1 exit）\n\n[R58CALL] pid_before=1\n[R58CALL] before_exec=1\n[R58EX] replaced=1\n[R58EX] pid=1\n[R58EX] argc=2\n[R58EX] argv0=/home/u58tgt\n[R58EX] argv1=HELLO\n[R58EX] target_exit=1\n\n\n[run] 程序退出 code=0\n\n[el1] 已从 EL0 撤回内核，shell 继续\n\n> "
+        },
+        {
+          "name": "17 成功不返回原程序：无 exec_failed、无 exec_ret 行",
+          "ok": true,
+          "detail": "exec_failed=False"
+        },
+        {
+          "name": "18 execve 前 pid_before=1",
+          "ok": true,
+          "detail": "1"
+        },
+        {
+          "name": "19 目标 pid 不变（execve 保留 pid）",
+          "ok": true,
+          "detail": "1"
+        },
+        {
+          "name": "20 参数区重建：argc=2、argv0=程序路径、argv1=HELLO（argline 正确传入）",
+          "ok": true,
+          "detail": "argc=2 lines=['[R58EX] argv0=/home/u58tgt', '[R58EX] argv1=HELLO']"
+        },
+        {
+          "name": "21 失败回滚：execve 坏路径返回 -1 且原程序继续（rollback_ok）",
+          "ok": true,
+          "detail": "ret=-1 pid_after=1 tail=e=1\n[R58BAD] exec_ret=-1\n[R58BAD] rollback_ok=1\n[R58BAD] pid_after=1\n\n\n[run] 程序退出 code=0\n\n[el1] 已从 EL0 撤回内核，shell 继续\n\n> "
+        },
+        {
+          "name": "22 结束后 res 健康计数全 0（FD/execve 切换未触发异常）",
+          "ok": true,
+          "detail": "健康: 同步异常=0  自愈/回shell=0  NISV=0  FIQ/SErr=0  熔断=0"
+        }
+      ],
+      "summary": {
+        "total": 22,
+        "pass": 22,
+        "fail": 0,
+        "failed": []
+      }
+    }
+  }
+}

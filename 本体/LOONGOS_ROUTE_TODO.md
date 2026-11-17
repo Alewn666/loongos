@@ -57,33 +57,73 @@
 - [x] `proc.c/h` 进程表状态机（分配/僵尸/回收）+ 800B 帧整体拷贝上下文切换（boot.S 零改）
 - [x] `getpid` 门控增强（单进程恒 1，老程序逐字不变）；syscall 22~25；golden 29 条逐字一致
 - [x] `test_round57.py` 本地 TCG 21/21；全套回归 15/15；BSS 余量 16KB
-- [ ] ③ 真 `execve`（当前 `SYS_execve` 返回 -1 占位，见 §零点六边界 3）—— 第 58 轮随 fd 每进程化一起
-- [ ] ④ 全局 `g_fd` 改 `proc->files`（不改则严格 POSIX fork 语义不全，见边界 4）—— 第 58 轮
-- [ ] 抢占式调度 / 时间片 / COW / 多进程并发 —— 后续大工程（本轮合作式一层 fork）
-- [ ] `vmalloc` 内核栈 / 用户 mmap（销第 54 轮遗留）—— 第 58 轮+
-- [ ] 2.3 shell 迁出内核（需 execve + fd 每进程化 + 交互 shell）—— 第 58 轮+
+- [x] ③ 真 `execve` —— **第 58.0-A 轮完成**（见下；第 57 轮时占位返回 -1）
+- [x] ④ 全局 `g_fd` 改 `proc->files` —— **第 58.0-A 轮完成**（子进程走自己的 fd_table）
+- [ ] 抢占式调度 / 时间片 / 多进程并发 —— 58.0-B（本轮合作式一层 fork）
+- [ ] COW —— 58.0-C（用户明确放 VM/页引用计数之后，不赶版本）
+- [ ] `vmalloc` 内核栈 / 用户 mmap —— 58.0-B/60.0
+- [ ] 2.3 shell 迁出内核（需独立内核栈 + 交互 shell）—— 58.0-C/59.0
 
-## 第 58 轮：TTY + 信号 + 作业控制
+> 用户新排期（2026-11-17）：重心从「功能数量」转向「补内核六大核心能力」
+> （进程/线程/内存/权限/文件系统/网络），按 58.0-A→58.0-B→58.0-C→59.0… 逐步推进。
 
-- [ ] `tty.c`、termios raw/cooked、回显、行编辑
-- [ ] SIGINT/SIGTERM/SIGKILL/SIGCHLD + `kill`
-- [ ] `Ctrl-C` 打断前台；`&` / `fg` / `bg`
+## 第 58.0-A 轮：每进程 FD 表 + 完整 execve（2026-11-17 完成）
 
-## 第 59 轮：socket + UDP + DNS
+- [x] `fdtab.c/h`：每进程 FD 表 + 全局打开文件描述(OFD)池 + 引用计数；宿主 `test_fdtab_host.c` 47/47
+- [x] fork 共享父 OFD（`ref++`，父子同 fd 号指向同一 ofd / 共享 off）；close/exit `ref--` 归零释放
+- [x] 子进程 `pid>=2` 的 open/read/close/lseek/fstat/dup/dup2 走自己的 `fd_table`；pid=1 老 g_fd 逐字不变
+- [x] 完整 execve：`load_elf_current()` 校验/PT_LOAD/bss/参数区/陷阱帧改写；失败回滚（阶段一全校验）、成功不返回、pid/fd/cwd 保留
+- [x] `user/u58_fdproc.c`（FD 独立）、`user/u58_exec.c` + `u58_target.c`（execve）、`u58_badexec.c`（回滚），经 b64 注入 /home
+- [x] `test_round58.py` 本地 TCG **22/22**（含 execve 坏路径失败回滚）；全套回归 15/15；golden 29 条逐字一致；stage5b 33/33
+- [x] BSS 余量 16KB（OFD 池仅 192B）；零新增 `cmd_*`
+- [ ] 真机 KVM 双路：本地 x86_64 无 KVM；NAS SSH 已恢复（2026-11-16）但本轮未在 NAS 上启动判据脚本
+- [ ] 子进程的 pipe 层（fd 6..23）仍全局、execve 第二参是打包参数行非 argv[]、pid=1 仍走全局 g_fd —— 诚实边界（见逐项状态 §零点七）
 
-- [ ] BSD socket 接口层（socket/bind/connect/send/recv/listen/accept）
-- [ ] UDP、DNS 解析、用户态 `wget` 取回 HTTP 页面并存盘
+## 第 58.0-B 轮：独立内核栈 + 抢占式调度（先单核）
 
-## 第 60 轮：ZFS-lite 快照
+- [ ] 每进程/线程独立内核栈 + 每线程独立上下文
+- [ ] 进程状态机（RUNNABLE/RUNNING/SLEEPING/ZOMBIE）+ 时间片 + 优先级
+- [ ] 定时器抢占 + 调度队列；两个用户进程真正交替执行
+- [ ] 先单核稳定，SMP 留到 65.0
 
-- [ ] COW 写路径 + 延迟回收队列
-- [ ] `snapshot create/list`、`rollback`
+## 第 58.0-C 轮：COW + 用户态 Shell
 
-## 61+ 轮：差异化
+- [ ] COW（在稳定 VM + 页引用计数之后；本轮 fdtab 的 ofd ref 已打样）
+- [ ] Shell 自身作为 EL0 程序运行；迁出第 54 轮 7 个 `cmd_*`（销 §六技术债）
+- [ ] `ls|grep|wc` 升级为三进程并发管道；`ps`/`kill`/`sleep`/`&`/`fg`/`bg`
 
-- [ ] Jail-lite（`jail create` / `jls` / `jexec`）
+## 第 59.0 轮：TTY + Signal + Shell 完善
+
+- [ ] `/dev/tty`、termios raw/cooked、回显、行编辑、前台进程组
+- [ ] SIGINT/SIGTERM/SIGKILL/SIGCHLD/SIGSEGV/SIGALRM
+
+## 第 60.0 轮：VM + mmap + COW 收口
+
+- [ ] `mmap`/`munmap`/`mprotect`/Page Fault/共享内存/vmalloc/Guard Page
+- [ ] Swap 最后做（先物理页生命周期与虚拟映射正确）
+
+## 第 61.0 轮：VFS 完整化 + FAT32
+
+- [ ] VFS 全量接管（`fs_*` 改 `vfs_*`）、FD 统一接入 VFS、VFS 写接口
+- [ ] FAT32（优先，可读常见 U 盘/分区）、EXT2、符号/硬链接
+
+## 第 62.0 轮：Socket + UDP + DNS
+
+- [ ] BSD socket（socket/bind/listen/accept/connect/send/recv/shutdown）、IPv4、UDP、DNS、DHCP
+
+## 第 63.0 轮：TCP 完整化 + IPv6
+
+- [ ] TCP 服务能力和 IPv6；目标 `ping`/`nslookup`/`wget`/`ssh`
+
+## 第 64.0 轮：安全体系
+
+- [ ] login/UID/GID/chmod/chown/ACL/setuid/Capabilities/MAC/ASLR/W^X
+- [ ] **公开 Git 历史中泄露的 NAS 凭据真实轮换**（仅清理历史不够，必须改口令）
+- [ ] 参考 FreeBSD Capsicum + OpenBSD 设计；KDF 改进、每用户独立 Salt
+
+## 65.0+ 轮：SMP / 生态 / 差异化
+
+- [ ] 65.0 SMP 多核真正投入调度；66.0 包管理器；67.0 Jail-lite；68.0 桌面/服务器完善
 - [ ] 可量化输入延迟 cycle 计数器（`<1ms` 硬数据）
-- [ ] virtio-vsock / virtio-serial 文件服务（替代 b64）
-- [ ] 启动时间 `<300ms` / 内核 `<1MB` CI 门槛
-- [ ] SMP GIC CPU interface 收尾
+- [ ] virtio-vsock / virtio-serial 文件服务（替代 b64）；启动 `<300ms` / 内核 `<1MB` CI 门槛
 - [ ] 自举工具链（长期方向）
