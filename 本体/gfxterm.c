@@ -35,6 +35,7 @@ typedef unsigned int u32;
 static char G_hist[GT_HIST];
 static int  G_len;
 static volatile int G_on;
+static int  G_live;                   /* 长命令实时刷新开关：安装等同步慢命令期间开，逐行 gfx_present */
 static int  G_dirty;                  /* P3.3: 0 无 / 1 仅输入行 / 2 整窗口 */
 static int  G_scroll;                 /* 向上翻了多少行（0 = 贴底） */
 static char G_line[GT_LINE];
@@ -90,7 +91,15 @@ void gfxterm_putc(char c)
     }
     G_hist[G_len++] = c;
     gt_mark_all();
+    /* 长命令(install 写盘/格式化)是同步的，主循环此时冻结，不会自动 present。
+       live 模式下每凑满一行就主动刷屏，让用户看到实时进度，不再误判为死机。 */
+    if (G_live && c == '\n') {
+        gfx_damage((struct gfx_rect){0, 0, gfx_width(), gfx_height()});
+        gfx_present();
+    }
 }
+
+void gfxterm_live(int on) { G_live = on ? 1 : 0; }
 
 void gfxterm_init(void)
 {

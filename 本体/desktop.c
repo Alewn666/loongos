@@ -463,7 +463,7 @@ static void install_draw(struct gfx_rect cr, int f, int w)
                G_install_armed ? "再点一次确认清空" : "清空并安装",
                G_install_armed ? C_RED : C_BTN);
     gfx_text(cr.x + 14, cr.y + by + 74,
-             G_install_armed ? "10 秒内再点一次才真正安装" : "安装后关机移除光盘即可",
+             G_install_armed ? "30 秒内再点一次才真正安装" : "安装后关机移除光盘即可",
              G_install_armed ? C_RED : C_WIN_DIM, C_TRANSP);
     gfx_clip_pop();
 }
@@ -502,8 +502,15 @@ static void install_press(struct gfx_rect cr, int lx, int ly, int w)
         }
         char cmd[40];
         inst_cmd(cmd, sizeof cmd);
-        gfxterm_exec(cmd);
+        /* 安装是同步长命令（写 12MB 镜像 + 格式化整盘，手机 QEMU 下几十秒）：
+           先把终端窗口切到前台并画一帧，再开实时刷新，让每一步进度立刻可见。
+           旧实现先 exec 再开窗，期间主循环冻结、屏幕毫无反馈，被误判为死机。 */
         focus_win(open_app(A_TERM));
+        gfx_damage(full_screen()); gfx_present();
+        gfxterm_live(1);
+        gfxterm_exec(cmd);
+        gfxterm_live(0);
+        gfx_damage(full_screen()); gfx_present();
     }
 }
 
@@ -1599,8 +1606,10 @@ void desktop_run(void)
             if (fm_del_armed && tick - fm_arm_tick > 100) {
                 fm_del_armed = 0; gfx_damage(full_screen());
             }
-            /* 安装二次确认 10 秒（100 tick）后自动解除，避免误装 */
-            if (G_install_armed && tick - G_arm_tick > 100) {
+            /* 安装二次确认放宽到 30 秒（300 tick）：手机触屏 + QEMU 软模拟下
+               第一次点完到第二次点常常超过 10 秒，旧值会让用户反复超时回退、
+               以为"点不动"。30 秒既防误装又照顾触屏。 */
+            if (G_install_armed && tick - G_arm_tick > 300) {
                 G_install_armed = 0; gfx_damage(full_screen()); input = 1;
             }
         }

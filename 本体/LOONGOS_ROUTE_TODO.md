@@ -79,6 +79,14 @@
 - [ ] 真机 KVM 双路：本地 x86_64 无 KVM；NAS SSH 已恢复（2026-11-16）但本轮未在 NAS 上启动判据脚本
 - [ ] 子进程的 pipe 层（fd 6..23）仍全局、execve 第二参是打包参数行非 argv[]、pid=1 仍走全局 g_fd —— 诚实边界（见逐项状态 §零点七）
 
+## 58.0-A 补丁：安装 App GUI 卡死 / 超时修复（2026-11-17）
+
+- [x] 二次确认超时 10s→30s（手机触屏 + QEMU 软模拟下 10s 太短，反复回退像"点不动"）
+- [x] 真正安装改"先切终端前台 + gfx_present 一帧 → gfxterm_live(1) → 执行 → 关 live"，长命令进度逐行实时可见，不再假死被误判崩溃
+- [x] `gfxterm.c/h` 新增 `gfxterm_live(on)`；新增 `test_install_gui_fix.py` 9/9（真实点击 armed→12s 不超时→第二次装盘 MBR→输出可见）
+- [x] `test_install_disk.py` 5 组 / `test_desktop_p2.py` 8/8 / `test_desktop_apps.py` 22/22；golden 29 条逐字一致；全套回归见修复记录
+- [ ] 真机 KVM 未执行（x86_64 无 aarch64 KVM），TCG 判据不冒充真机通过
+
 ## 第 58.0-B 轮：独立内核栈 + 抢占式调度（先单核）
 
 - [ ] 每进程/线程独立内核栈 + 每线程独立上下文

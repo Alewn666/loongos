@@ -1,0 +1,38 @@
+{
+  "轮次": "58.0-A 补丁：安装 App GUI 卡死/超时修复",
+  "日期": "2026-11-17",
+  "用户报告": "安装系统点到『选择目标硬盘 → 再点一次确认清空』就装不了；桌面用着用着崩溃、一卡一卡",
+  "复现截图": "红色 armed 按钮『再点一次确认清空』，磁盘 virtio-blk 131072 MB，进度条满",
+  "根因": [
+    "安装二次确认窗口仅 10 秒(100 tick)：手机触屏+QEMU 软模拟下第一次点到第二次常超 10 秒，自动回退成蓝色『清空并安装』，用户反复点都像没反应",
+    "真正安装是同步长命令(写 12MB 镜像+格式化整盘，手机 QEMU 下几十秒)：install_press 先 gfxterm_exec 再开终端窗口，安装期间主循环冻结、屏幕无进度、无反馈，被误判为死机/崩溃"
+  ],
+  "修复": [
+    "desktop.c: 二次确认超时 100 tick(10s) → 300 tick(30s)，文案『10 秒』→『30 秒』",
+    "desktop.c install_press: 第二次确认后先把终端窗口切到前台并 gfx_present 一帧，再开 gfxterm_live(1) 执行安装，结束 gfxterm_live(0)",
+    "gfxterm.c/h: 新增 gfxterm_live(on) 开关；live 模式下每输出一行(\\n)主动 gfx_damage+gfx_present，长命令进度实时可见，不再假死"
+  ],
+  "判据": {
+    "test_install_disk.py": "5 组全过（多盘枚举/安全确认/越界/选盘装盘/兼容旧语法）",
+    "test_desktop_p2.py": "8/8 全过（三 HID 枚举/进桌面/点开始/终端输出/拖窗口/退出/退后键盘）",
+    "test_desktop_apps.py": "22/22 全过（含二次确认 armed 机制，独立未受影响）",
+    "test_install_gui_fix.py": "9/9 全过：第一次点击 armed=1；等 12 秒仍 armed(旧版已超时)；第二次点击真装盘 MBR=55AA；安装输出进图形终端 G_len 797→960；gfxterm_live 已链接",
+    "全套回归 run_regression_r.sh": "15/15 PASS FAIL=0（真实画面/golden行为/NVMe装盘/UEFI5拓扑/桌面P2/EL0 33/鼠标跟随/鼠标校准/直启驱动/scsi装盘/P3手感/资源在线/ARM长稳/8网卡/多盘安装）"
+  },
+  "构建": {
+    "build.sh": "0 error，BSS 余量 16KB（live 开关仅 +1 个 int）",
+    "kernel.elf md5": "b2add29d1ed5469ab240343ccc53704e",
+    "ISO md5": "3b30397ebecc158d6664e2288c04a4a0",
+    "golden_behavior": "29 条逐字一致（未动任何 shell 命令输出；GUI 文案不在基线内）"
+  },
+  "新增文件": [
+    "test_install_gui_fix.py",
+    "docs/安装GUI卡死修复判据报告.json"
+  ],
+  "修改文件": [
+    "desktop.c",
+    "gfxterm.c",
+    "gfxterm.h"
+  ],
+  "真机KVM": "未执行（x86_64 沙箱无 aarch64 KVM）；以上均为 QEMU TCG 图形判据，不冒充真机 KVM 通过"
+}

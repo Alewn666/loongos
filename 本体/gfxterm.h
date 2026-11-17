@@ -24,5 +24,6 @@ int  gfxterm_dirty(void);                /* 0 无 / 1 仅输入行 / 2 整窗口
 void gfxterm_scroll(int delta);          /* delta>0 向上翻历史，<0 向下 */
 void gfxterm_blink(unsigned long long now_ms);  /* P3.3 按真实时间推进闪烁相位 */
 struct gfx_rect gfxterm_input_rect(void);      /* 输入行矩形（供精确脏区重绘） */
+void gfxterm_live(int on);                     /* 长命令(如 install)期间逐行立即刷屏，避免界面假死 */
 
 #endif /* LOONGOS_GFXTERM_H */
