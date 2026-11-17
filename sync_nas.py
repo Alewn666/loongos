@@ -188,6 +188,14 @@ FILES = [
     ('本体/user/u58_badexec.c',     '本体/user/u58_badexec.c'),
     ('本体/test_round58.py',        '本体/test_round58.py'),
     ('本体/docs/第五十八轮_FD与execve判据报告.json', '本体/docs/第五十八轮_FD与execve判据报告.json'),
+
+    # 58.0-A 补丁：安装 App GUI 卡死/超时修复（2026-11-17）
+    # 注：kernel.elf / desktop.c / ISO / iso.md5 / 检查与修复记录.md /
+    #     LOONGOS_ROUTE_TODO.md 已在上面登记，此处补本轮改动的 gfxterm.c/h 与新增判据。
+    ('本体/gfxterm.c',              '本体/gfxterm.c'),
+    ('本体/gfxterm.h',              '本体/gfxterm.h'),
+    ('本体/test_install_gui_fix.py','本体/test_install_gui_fix.py'),
+    ('本体/docs/安装GUI卡死修复判据报告.json', '本体/docs/安装GUI卡死修复判据报告.json'),
 ]
 
 def md5_local(path):
