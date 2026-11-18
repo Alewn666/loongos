@@ -186,10 +186,18 @@
     "item15_conclusion": "改动仅在调度记账(g_proc_active=0 时安装路径不触发 sched_tick)，不影响 ESP 写入；判定为偶发，连续重跑通过",
     "golden_29": "逐字一致",
     "test_round58_老判据": "22/22",
-    "bss_margin_bytes": 8192
+    "bss_margin_bytes": 8192,
+    "item15_rerun2": "PASS（42s，全部通过）",
+    "iso_md5": "9cd8704ae70f30814ff0fe30f9ef8e1f",
+    "iso_kernel_md5": "5d1e1b480d34a20bd558a36f3f2a2719"
   },
   "host_unit_test": {
     "test_sched_host.c": "72/72 (-Werror)",
     "bug_caught": "宿主单测抓到 yield 自选中 bug 并修复；TCG 判据抓到两子孤儿实体并改单子分流"
+  },
+  "sync": {
+    "github_commit": "eb22b53 已提交并推送 origin/main（本地=远端=ls-remote 一致）",
+    "nas": "未同步：本次环境无 NAS_PASS 凭据，历史上 SSH 56484 曾拒绝连接",
+    "kvm": "未执行：宿主x86_64无aarch64 KVM；KVM列=—，不冒充双路"
   }
 }
