@@ -99,4 +99,10 @@ static inline long u_execve(const char *p, const char *argline) {
     return sys_call(SYS_execve, (long)p, (long)argline);
 }
 
+/* ---------------- 第五十八轮 58.0-B：抢占式调度地基 syscall 26/27 ----------------
+ * ABI 编号与 struct uschedstat 由 ../sched.h 定义（用户态/内核/宿主单测共用）。 */
+#include "../sched.h"
+static inline long u_yield(void)                     { return sys_call(SYS_yield, 0, 0); }
+static inline long u_schedstat(struct uschedstat *s) { return sys_call(SYS_schedstat, (long)s, 0); }
+
 #endif

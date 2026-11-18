@@ -25,7 +25,7 @@ UCFLAGS="-nostdlib -ffreestanding -static -fno-stack-protector -fno-pie -O2 -Wal
 
 # ---- 内核编译单元：唯一事实来源（顺序即链接顺序，勿随意重排）----
 KERN_SRCS="boot.S kernel.c fs.c crypto.c usb_kbd.c \
-           mm.c rtc.c usysfd.c vfs.c proc.c fdtab.c \
+           mm.c rtc.c usysfd.c vfs.c proc.c fdtab.c sched.c \
            blkdev.c virtio_blk.c virtio_blk_legacy.c virtio_scsi.c virtio_net.c \
            net.c tcp.c smp.c nvme.c virtio_rng.c pci.c \
            nic.c e1000.c rtl8139.c \
@@ -76,6 +76,8 @@ ${CROSS}gcc $UCFLAGS -o build/u58fd.elf    user/u58_fdproc.c
 ${CROSS}gcc $UCFLAGS -o build/u58exec.elf  user/u58_exec.c
 ${CROSS}gcc $UCFLAGS -o build/u58tgt.elf   user/u58_target.c
 ${CROSS}gcc $UCFLAGS -o build/u58bad.elf   user/u58_badexec.c
+# 第五十八轮 58.0-B：抢占式调度地基验证程序（只编不内嵌，经 b64 注入 /home）
+${CROSS}gcc $UCFLAGS -o build/u59sched.elf  user/u59_sched.c
 # ELF 文件本身转目标文件（符号 _binary_<文件名>_start/_end，文件名里的 . 和 / 会变 _）
 ( cd build && ${CROSS}objcopy -I binary -O elf64-littleaarch64 -B aarch64 hello.elf hello_blob.o )
 ( cd build && ${CROSS}objcopy -I binary -O elf64-littleaarch64 -B aarch64 bad.elf  bad_blob.o  )
@@ -268,4 +270,4 @@ BEGIN {
 }' || exit 1
 
 echo "== kernel.elf 构建完成 =="
-ls -la kernel.elf build/hello.elf build/bad.elf build/u55test.elf build/u55sh.elf build/u56vfs.elf build/u57proc.elf build/u58fd.elf build/u58exec.elf build/u58tgt.elf build/u58bad.elf
+ls -la kernel.elf build/hello.elf build/bad.elf build/u55test.elf build/u55sh.elf build/u56vfs.elf build/u57proc.elf build/u58fd.elf build/u58exec.elf build/u58tgt.elf build/u58bad.elf build/u59sched.elf

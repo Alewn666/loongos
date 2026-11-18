@@ -208,6 +208,17 @@ FILES = [
     ('本体/test_desktop_newapps.py', '本体/test_desktop_newapps.py'),
     ('本体/test_desktop_interact.py','本体/test_desktop_interact.py'),
     ('本体/docs/桌面全面更新判据报告.json', '本体/docs/桌面全面更新判据报告.json'),
+
+    # 第五十八轮 58.0-B：抢占式调度地基（2026-11-19）
+    # 注：kernel.c / kernel.elf / kernel.o / build.sh / usys.h / proc.h / user/user.h /
+    #     docs/检查与修复记录.md / README.md / 演进路线_逐项状态.md 已在上面登记，
+    #     此处只补本轮新增的编译单元、宿主单测、用户态 ELF、判据脚本与报告。
+    ('本体/sched.h',                 '本体/sched.h'),
+    ('本体/sched.c',                 '本体/sched.c'),
+    ('本体/test_sched_host.c',       '本体/test_sched_host.c'),
+    ('本体/user/u59_sched.c',        '本体/user/u59_sched.c'),
+    ('本体/test_round59.py',         '本体/test_round59.py'),
+    ('本体/docs/第五十八轮B_抢占式调度地基判据报告.json', '本体/docs/第五十八轮B_抢占式调度地基判据报告.json'),
 ]
 
 def md5_local(path):

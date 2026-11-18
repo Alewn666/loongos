@@ -1,0 +1,195 @@
+{
+  "title": "LoongOS 第五十八轮 B 58.0-B 抢占式调度地基判据报告",
+  "kernel_md5": "5d1e1b480d34a20bd558a36f3f2a2719",
+  "elf_sched_md5": "574d3e1002b5b9345a922b145073cd12",
+  "generated": "2026-11-19 07:12:58",
+  "modes": {
+    "TCG": {
+      "mode": "TCG",
+      "cmd": "qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a57 -m 256M -kernel /workspace/安卓/loongos/本体/kernel.elf -nographic -no-reboot",
+      "u59sched": {
+        "pid_before": "1",
+        "stat0_ret": "0",
+        "stat0_current": "0",
+        "stat0_ctx": "0",
+        "stat0_yields": "0",
+        "stat0_expires": "0",
+        "stat0_live": "0",
+        "fork_ret": "2",
+        "child_pid": "2",
+        "child_state_before": "2",
+        "child_current_before": "2",
+        "child_yield_ret": "0",
+        "child_yields_global": "1",
+        "child_ctx_global": "0",
+        "child_state_after": "2",
+        "wait_ret": "2",
+        "status": "7",
+        "final_live": "0",
+        "final_yields": "1",
+        "final_ctx": "0",
+        "pid_after": "1",
+        "pass": "6",
+        "fail": "0"
+      },
+      "res_after": {
+        "sync": 0,
+        "nisv": 0,
+        "fiq": 0,
+        "trip": 0
+      },
+      "checks": [
+        {
+          "name": "1 内核横幅 + shell 提示符就绪",
+          "ok": true,
+          "detail": "未见横幅/提示符"
+        },
+        {
+          "name": "2 help 仍含 run 命令（golden 命令集未删）",
+          "ok": true,
+          "detail": "help\n\n命令清单:\n\n  ls [路径]            列目录（无路径=当前目录）\n\n  cd [路径]            切换当前目录（默认 /；支持 . .. 和相对路径）\n\n  pwd                 "
+        },
+        {
+          "name": "3 cat /etc/hostname 仍为 myos（老 fs 路径逐字不变）",
+          "ok": true,
+          "detail": "cat /etc/hostname\n\nmyos\n> "
+        },
+        {
+          "name": "4 老程序 u55test.elf 注入字节一致",
+          "ok": true,
+          "detail": "写入 11296 / 期望 11296"
+        },
+        {
+          "name": "5 老 syscall 程序仍体面退出 code=0（0~25 零扰动）",
+          "ok": true,
+          "detail": "_self_rc=0\n[R55] chk kill_self_ok ok\n[R55] stat_badptr_rc=-1\n[R55] chk stat_reject_badptr ok\n[R55] PASS=35\n[R55] FAIL=0\n[R55] ==== u55test done ====\n\n\n[run] 程序退出 code=0\n\n[el1] 已从 EL0 撤回内核，shell 继续\n\n> "
+        },
+        {
+          "name": "6 u59sched.elf 经 b64 注入字节一致",
+          "ok": true,
+          "detail": "写入 7168 / 期望 7168"
+        },
+        {
+          "name": "7 ls /home 含新程序",
+          "ok": true,
+          "detail": "ls /home\n\nd  .\n\nd  ..\n\nf  readme.txt  214B\n\nd  demo\n\nf  u55test  11296B\n\nf  u59sched  7168B\n\n> "
+        },
+        {
+          "name": "8 用户程序跑完并体面退出 code=0（无 EL0 fault）",
+          "ok": true,
+          "detail": "] child_yields_global=1\n[R59] child_ctx_global=0\n[R59] child_state_after=2\n[R59] wait_ret=2\n[R59] status=7\n[R59] final_live=0\n[R59] final_yields=1\n[R59] final_ctx=0\n[R59] pid_after=1\n[R59] pass=6\n[R59] fail=0\n\n\n[run] 程序退出 code=0\n\n[el1] 已从 EL0 撤回内核，shell 继续\n\n> "
+        },
+        {
+          "name": "9 schedstat 调用返回 0（stat0_ret=0）",
+          "ok": true,
+          "detail": "0"
+        },
+        {
+          "name": "10 初始统计全 0：ctx/yields/expires=0",
+          "ok": true,
+          "detail": "ctx=0 y=0 e=0"
+        },
+        {
+          "name": "11 初始 current=0（pid=1 初始进程表外）",
+          "ok": true,
+          "detail": "0"
+        },
+        {
+          "name": "11b 初始无活跃实体 stat0_live=0",
+          "ok": true,
+          "detail": "0"
+        },
+        {
+          "name": "12 fork 一子得 pid>=2",
+          "ok": true,
+          "detail": "2"
+        },
+        {
+          "name": "13 子见自身 state=RUNNING(2)（wait 切子同步状态）",
+          "ok": true,
+          "detail": "2"
+        },
+        {
+          "name": "14 子见 current 指向自身（wait 切子同步 current）",
+          "ok": true,
+          "detail": "cur=2 fp=2"
+        },
+        {
+          "name": "15 子 yield 返回 0（仅一活跃子，选回自己——不冒充切到别人）",
+          "ok": true,
+          "detail": "0"
+        },
+        {
+          "name": "16 yield 后全局 yields 增长到 >=1",
+          "ok": true,
+          "detail": "1"
+        },
+        {
+          "name": "17 仅一就绪实体时 yield 选回自己、保持 RUNNING(2)",
+          "ok": true,
+          "detail": "2"
+        },
+        {
+          "name": "18 父 wait 返回子 pid + 退出码 status=7",
+          "ok": true,
+          "detail": "w=2 fp=2 status=7"
+        },
+        {
+          "name": "19 final_live=0（子实体从调度表移除，无残留）",
+          "ok": true,
+          "detail": "0"
+        },
+        {
+          "name": "20 final_yields 与子观测一致（跨 yield 累计）",
+          "ok": true,
+          "detail": "final=1 child=1"
+        },
+        {
+          "name": "21 pid_after=1（父从 wait 恢复仍是初始进程）",
+          "ok": true,
+          "detail": "1"
+        },
+        {
+          "name": "22 自报 pass=6 fail=0（仅线索，与上面独立项交叉验证）",
+          "ok": true,
+          "detail": "pass=6 fail=0"
+        },
+        {
+          "name": "23 二次 run 同样 pass=6 fail=0（跨 run 调度表干净可复用）",
+          "ok": true,
+          "detail": "pass=6 fail=0 ctx0=0"
+        },
+        {
+          "name": "24 mmstat audit=0（无堆泄漏）",
+          "ok": true,
+          "detail": "mmstat\n\n[mm ] heap   = 0x0000000042000000 bytes=8388608 page=4096B\n\n[mm ] pages  = 2048 free=2040 used=8\n\n[mm ] objs   = live=2 used_bytes=16384 peak_bytes=188416\n\n[mm ] counts = alloc=45 free=43 fail"
+        },
+        {
+          "name": "25 结束后 res 健康计数全 0（调度记账未触发异常）",
+          "ok": true,
+          "detail": "健康: 同步异常=0  自愈/回shell=0  NISV=0  FIQ/SErr=0  熔断=0"
+        }
+      ],
+      "summary": {
+        "total": 26,
+        "pass": 26,
+        "fail": 0,
+        "failed": []
+      }
+    }
+  },
+  "regression": {
+    "script": "sh run_regression_r.sh（15 项）",
+    "result": "14/15 PASS；整套 shell 外层 590s 超时被杀(REG_RC=124)，非测试失败",
+    "item15_first_run": "FAIL(偶发)：install yes 报 [install] FAIL esp write off=3932160，日志夹大量 [task1] 心跳，疑似 QEMU tty 时序导致写盘交互被打断",
+    "item15_rerun1": "PASS（43s，全部通过）",
+    "item15_conclusion": "改动仅在调度记账(g_proc_active=0 时安装路径不触发 sched_tick)，不影响 ESP 写入；判定为偶发，连续重跑通过",
+    "golden_29": "逐字一致",
+    "test_round58_老判据": "22/22",
+    "bss_margin_bytes": 8192
+  },
+  "host_unit_test": {
+    "test_sched_host.c": "72/72 (-Werror)",
+    "bug_caught": "宿主单测抓到 yield 自选中 bug 并修复；TCG 判据抓到两子孤儿实体并改单子分流"
+  }
+}

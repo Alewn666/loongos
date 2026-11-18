@@ -221,8 +221,10 @@ loongos/
 │   ├── test_round57.py user/u57_proc.c  # 第五十七轮：进程模型双路判据 / EL0 用户程序
 │   ├── fdtab.h fdtab.c test_fdtab_host.c  # 第五十八轮 58.0-A：每进程FD表+OFD共享 / 宿主单测 47/47
 │   ├── test_round58.py           # 第五十八轮：FD表+execve 双路判据
+│   ├── sched.h sched.c test_sched_host.c  # 第五十八轮 58.0-B：调度地基(五态机/时间片/轮转/yield) / 宿主单测 72/72
+│   ├── test_round59.py           # 第五十八轮 58.0-B：抢占式调度地基双路判据
 │   ├── font8x16.h font_cjk.h linker.ld auth_cred.h
-│   ├── user/             # 用户态 ELF 样例（u55 管道、u56_vfs、u57_proc fork/wait、u58 FD/execve）
+│   ├── user/             # 用户态 ELF 样例（u55 管道、u56_vfs、u57_proc fork/wait、u58 FD/execve、u59 调度）
 │   ├── build.sh build_iso.sh build_image.sh build_pe.py
 │   ├── bss_budget.txt    # 内核空间预算基线（build.sh 自动维护，纳入版本库）
 │   ├── golden_behavior.txt  # 行为黄金基线：启动日志 + 29 条命令
@@ -260,14 +262,15 @@ loongos/
 - [本体/docs/桌面系统_架构与路线.md](本体/docs/桌面系统_架构与路线.md) — 早期图形化架构与分期清单（其中「只有 write/exit 两个系统调用」的现状描述已过时）
 - [本体/docs/内核空间预算与扩容指引.md](本体/docs/内核空间预算与扩容指引.md) — 内核链接布局、BSS 余量 ±4 KB 对齐碎片根因、预算守卫与扩容路径
 - [本体/docs/系统资源调配.md](本体/docs/系统资源调配.md) — R 轮：CPU/时钟/内存三类资源的调配设计、7 组 DMA 地址对照实验、`res` 资源账与量化验收
-- [本体/docs/检查与修复记录.md](本体/docs/检查与修复记录.md) — 逐轮设计取舍与排障实录（第三十一轮 = R 轮，第五十四轮 = 动态内存/RTC，第五十五轮 = syscall/管道，第五十六轮 = VFS/伪文件系统，第五十七轮 = 进程模型，第五十八轮 = 每进程 FD 表/execve）
-- [本体/docs/演进路线_逐项状态.md](本体/docs/演进路线_逐项状态.md) — 第五十四+五十五+五十六+五十七轮对《对齐 Linux/BSD 演进路线》逐项核对的诚实状态副本
+- [本体/docs/检查与修复记录.md](本体/docs/检查与修复记录.md) — 逐轮设计取舍与排障实录（第三十一轮 = R 轮，第五十四轮 = 动态内存/RTC，第五十五轮 = syscall/管道，第五十六轮 = VFS/伪文件系统，第五十七轮 = 进程模型，第五十八轮 = 每进程 FD 表/execve，第五十八轮 B = 抢占式调度地基）
+- [本体/docs/演进路线_逐项状态.md](本体/docs/演进路线_逐项状态.md) — 第五十四+五十五+五十六+五十七+五十八+58.0-B 轮对《对齐 Linux/BSD 演进路线》逐项核对的诚实状态副本
 - [本体/LOONGOS_ROUTE_TODO.md](本体/LOONGOS_ROUTE_TODO.md) — 第 55–61+ 轮架构级任务清单与技术债登记
 - [本体/docs/第五十四轮_地基能力判据报告.json](本体/docs/第五十四轮_地基能力判据报告.json) — 第五十四轮 22 项双路判据、宿主单测、全套回归与真机 KVM 未执行留痕
 - [本体/docs/第五十五轮_syscall判据报告.json](本体/docs/第五十五轮_syscall判据报告.json) — 第五十五轮 25 项双路判据、14 个新 syscall、`ls|grep|wc` 真管道零泄漏证据与真机 KVM 未执行留痕
 - [本体/docs/第五十六轮_VFS判据报告.json](本体/docs/第五十六轮_VFS判据报告.json) — 第五十六轮 19 项双路判据、VFS 挂载、`/proc` 真实数据对账、devfs 读写与老路径零扰动证据
 - [本体/docs/第五十七轮_进程模型判据报告.json](本体/docs/第五十七轮_进程模型判据报告.json) — 第五十七轮 21 项双路判据、fork/wait/procexit、父子地址隔离、僵尸回收零残留与真机 KVM 未执行留痕
 - [本体/docs/第五十八轮_FD与execve判据报告.json](本体/docs/第五十八轮_FD与execve判据报告.json) — 第五十八轮 22 项双路判据、每进程 FD 表（fork 共享 OFD / close 后 -1 / 子 close 不污染父）、完整 execve（pid 保留/参数区/成功不返回/失败回滚）与真机 KVM 未执行留痕
+- [本体/docs/第五十八轮B_抢占式调度地基判据报告.json](本体/docs/第五十八轮B_抢占式调度地基判据报告.json) — 58.0-B 26 项双路判据、五态调度状态机/时间片/轮转/yield/统计、宿主 72/72、状态迁移与 yield 记账、真抢占(IRQ 切帧)后置与真机 KVM 未执行留痕
 - `LOONGOS_*_TODO.md` 与 `docs/检查与修复记录*.md` — 各阶段任务清单
 
 ## 许可证

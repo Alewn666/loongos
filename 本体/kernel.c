@@ -28,6 +28,7 @@
 #include "vfs.h"    /* 第五十六轮：VFS 挂载层（/proc /dev，老路径不受影响） */
 #include "proc.h"   /* 第五十七轮：进程模型地基（每进程地址空间 + fork/wait，演进路线 3.2） */
 #include "fdtab.h"  /* 第五十八轮 58.0-A：每进程 FD 表 + 打开文件描述共享语义 */
+#include "sched.h"  /* 第五十八轮 58.0-B：抢占式调度地基（五态机/时间片/统计） */
 
 typedef unsigned long u64;
 typedef unsigned int  u32;
@@ -1444,6 +1445,10 @@ static struct regs *task_switch(struct regs *f)
 static int  user_running;      /* 用户程序跑在 EL0 期间 = 1（定义处带初始化） */
 static u64  el0_enter_tick;    /* 进 EL0 时的 tick 快照（看门狗计时起点） */
 static void el1_landing(void); /* eret 着陆点：exit / fault / 强杀都回这重新接管 shell */
+/* 58.0-B：调度视图与其激活标志定义在后面的进程子系统（本文件后部），此处前向声明供
+   handle_irq 的 tick 账使用；tentative definition 与后部定义合并，C 合法。 */
+static int g_proc_active;
+static struct scheduler g_sched;
 #define EL0_TIMEOUT_TICKS 300u /* tick = 10Hz → EL0 最长 30 秒不进系统调用 */
 
 /* ---------------- IRQ 处理：GIC 认路 → 串口收字节 / 定时器推进时钟 + 调度 ---------------- */
@@ -1520,6 +1525,11 @@ struct regs *handle_irq(struct regs *f)
                去掉 wfi 的深层原因之一）。桌面期间让 GUI 独占 CPU0，退出后自动恢复轮转。
                注：advanced 可能 >1（低频唤醒一次补多拍），但只在推进 tick 时轮转一次，
                保持「一个抢占点/节拍」的语义。 */
+            /* 58.0-B：每个软件 tick 推进一次调度器的时间片账（纯静态记账，不切帧、
+               不产输出）。仅当有用户进程激活且 current 指向 RUNNING 实体时有效，
+               其余场景 sched_tick 内部安全返回 -1，对 golden/桌面/压测零扰动。 */
+            if (g_proc_active)
+                sched_tick(&g_sched);
             if (!g_desktop_active && !g_irqstress)
                 f = task_switch(f);    /* 抢占：换到下一个任务的帧
                                           （压测期抑制：否则 RESTORE_CTX 会从 task1 帧恢复 q） */
@@ -2014,6 +2024,9 @@ static int u_strcpy(char *dst, u64 uptr, int max)
  *     mmstat 量化。BSS 只多一张 4×~1.2KB 的 proc 表，余量仍充裕。
  * ==========================================================================*/
 static struct proc g_procs[NPROC];
+/* 58.0-B：调度器平行视图。与 g_procs 按 pid 对齐，只做「谁该跑」的记账/统计，
+   不参与异常帧切换（真抢占待独立内核栈后接，见诚实边界）。proc_reset_all 会重置它。 */
+static struct scheduler g_sched;
 static u32    g_cpid = 1;          /* 当前进程 pid（EL0 里正在跑的那个） */
 static u64    g_cur_l3 = 0;        /* 当前生效的用户 L3 表物理；0 = 全局 l3_user */
 static int    g_proc_active = 0;   /* 是否有用户程序在使用进程模型（wait 让出需要） */
@@ -2081,6 +2094,7 @@ static void proc_reset_all(void)
         if (g_procs[i].state != P_FREE) proc_release_pages(&g_procs[i]);
     }
     proc_init(g_procs, NPROC);
+    sched_init(&g_sched);              /* 58.0-B：跨 run 重置调度视图，零残留 */
     g_cpid = 1;
     proc_switch_l3(0);
     g_proc_active = 0;
@@ -2181,6 +2195,8 @@ static int do_fork(struct regs *f)
     }
 
     g_proc_active = 1;
+    /* 58.0-B：把新子登记进调度视图（RUNNABLE），父仍在跑不入表（pid=1 表外）。 */
+    sched_add(&g_sched, (u32)cpid);
     return cpid;                     /* 父视角：返回子 pid */
 }
 
@@ -2204,6 +2220,7 @@ static int do_wait(struct regs *f, u64 status_ptr)
     if (proc_reap(g_procs, NPROC, g_cpid, &code, &dead) == 0) {
         struct proc *dp = proc_find(g_procs, NPROC, dead);
         if (dp) proc_release_pages(dp);
+        sched_remove(&g_sched, dead);              /* 58.0-B：回收即从调度表移除 */
         if (status_ptr && u_range_ok(status_ptr, 4)) *(u32 *)status_ptr = (u32)code;
         return (int)dead;
     }
@@ -2228,6 +2245,9 @@ static int do_wait(struct regs *f, u64 status_ptr)
     g_wait_ptr = status_ptr;
 
     /* 4) 切到子：L3 表 + 帧 + 用户栈；子恢复后 fork() 视角 x0=0。 */
+    /* 58.0-B：同步调度视图——子由 RUNNABLE→RUNNING，current 指向子。 */
+    sched_set_state(&g_sched, child->pid, S_RUNNING);
+    g_sched.current = child->pid;
     g_cpid = child->pid;
     proc_switch_l3(child->user_pt);
     fs_memcpy(f, child->frame, EXC_FRAME_SIZE);
@@ -2256,11 +2276,14 @@ static void do_procexit(struct regs *f, int code)
     /* 先释放页（reap 会把槽置 P_FREE 后再也取不到 self），再标记僵尸并回收槽位。 */
     if (self) proc_release_pages(self);
     proc_zombie(g_procs, NPROC, me, code);
+    sched_remove(&g_sched, me);                    /* 58.0-B：退出即从调度表移除 */
     { int ccode = 0; u32 dead = 0;
       proc_reap(g_procs, NPROC, ppid, &ccode, &dead);   /* 槽位释放，进程表无残留 */
     }
 
     /* 切回父：L3 + 帧 + 用户栈；父 wait() 返回子 pid。 */
+    /* 58.0-B：current 还原为父 pid（pid=1 表外，记为 1）。 */
+    g_sched.current = ppid;
     g_cpid = ppid;
     if (ppid == 1) {
         proc_switch_l3(0);
@@ -2595,6 +2618,33 @@ static void svc_dispatch(struct regs *f)
         f->x[0] = (u64)0;                                   /* 新进程 argc 由参数区提供，x0 归零 */
         proc_set_sp_el0(USER_END);
         return;                                             /* 不写回“成功值”：新程序直接开跑 */
+    }
+    /* ---- 第五十八轮 58.0-B：调度器 syscall 26/27（不动 0~25 任何分支）---- */
+    if (f->x[8] == SYS_yield) {
+        /* yield：调度层主动让出记账（pod 逻辑见 sched.c）。当前是合作式模型，
+           这里只更新调度视图统计与就绪态，不做异常帧切换（真切换待独立内核栈）。 */
+        f->x[0] = sched_yield(&g_sched);                   /* 返回新 pid / 0 */
+        return;
+    }
+    if (f->x[8] == SYS_schedstat) {
+        u64 p = f->x[0];
+        if (!u_range_ok(p, sizeof(struct uschedstat))) { f->x[0] = (u64)-1; return; }
+        /* 逐字段写用户缓冲（纯定长结构，96B）；sched_* 是静态视图，不触碰真实帧。 */
+        u32 *out = (u32 *)(unsigned long)p;
+        for (u32 i = 0; i < SCHED_NPROC; i++) {
+            u32 b = i * 5;
+            out[b + 0] = g_sched.ent[i].pid;
+            out[b + 1] = g_sched.ent[i].state;
+            out[b + 2] = g_sched.ent[i].slice;
+            out[b + 3] = g_sched.ent[i].ticks_run;
+            out[b + 4] = g_sched.ent[i].switches;
+        }
+        out[20] = g_sched.current;
+        out[21] = g_sched.ctx_switches;
+        out[22] = g_sched.slice_expires;
+        out[23] = g_sched.yields;
+        f->x[0] = 0;
+        return;
     }
     if (f->x[8] == 1) {                                    /* exit：体面结束用户程序 */
         uart_puts("\n[run] 程序退出 code="); uart_putdec((u32)f->x[0]); uart_puts("\n");
@@ -3852,7 +3902,7 @@ static void cmd_irqstress(char *args)
  * 环境变量式的静态数据（版本号 / 开机墙钟）用文件内 static 变量，避免
  * 往 loongos.h 塞一堆新 extern。
  */
-#define LOS_VERSION  "LoongOS 56.0-vfs (aarch64 / armvirt)"
+#define LOS_VERSION  "LoongOS 58.0-B-sched (aarch64 / armvirt)"
 
 static u64 g_boot_wall = 0;        /* 内核启动瞬间的墙钟 Unix 秒（rtc_init 后记录） */
 
@@ -5098,6 +5148,7 @@ void kernel_main(unsigned long bootinfo)
     fs_set_wallclock(rtc_now);
     g_boot_wall = rtc_now();          /* uptime 的开机墙钟基准 */
     ufd_init();                        /* 第五十五轮：fd/pipe 对象层开机态（静默） */
+    sched_init(&g_sched);              /* 58.0-B：调度器开机态（静默，不进 golden） */
 
     /* 阶段9：拉起从核（默认启用——用户要求「把核心都用起来」）。
        从核平时 wfi 真睡（宿主 CPU ≈0%），只在收到 SGI 时被唤醒认领工作；

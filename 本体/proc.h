@@ -90,7 +90,7 @@ int proc_copy_userspace(u64 base, u32 bytes, u32 chunk,
 #define SYS_execve    23   /* execve(path, argv_packed) -> 成功不返回(覆盖当前进程)，失败 -1 */
 #define SYS_wait      24   /* wait(int *status) -> 回收到子 pid / -1（无子进程或全RUN） */
 #define SYS_procexit  25   /* procexit(code) -> 当前子进程僵尸化并切回父（父从 wait 返回） */
-#define SYS_max       26
+#define SYS_max       28   /* 号上限（不含）；26/27 = sched.h 的 yield/schedstat */
 
 /* wait 写回的 status：高 8 位退出码，低 8 位标志 */
 #define WST_CODE(st)  (((u32)(st) >> 8) & 0xFF)
