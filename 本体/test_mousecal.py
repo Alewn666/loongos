@@ -14,11 +14,20 @@ import sys
 import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-KERNEL = os.path.join(BASE, "kernel.elf")
+KERNEL = os.environ.get("KERNEL", os.path.join(BASE, "kernel.elf"))
 W, H = 800, 600
 OFF_X, OFF_Y = 40, 30          # 模拟客户端固定偏移
 CENTER = (W // 2, H // 2)      # 靶心 (400,300)
 RECEIVED = (CENTER[0] + OFF_X, CENTER[1] + OFF_Y)   # 内核实际收到 (440,330)
+A_SET = 6                      # 设置 App 编号（固定，不打乱）
+
+
+def sym_addrs(elf):
+    out = subprocess.check_output(["aarch64-linux-gnu-nm", "-n", elf], text=True)
+    return {p[2]: int(p[0], 16) for p in (l.split() for l in out.splitlines()) if len(p) == 3}
+
+
+A = sym_addrs(KERNEL)
 
 
 # ---------------------------------------------------------------- A
@@ -126,6 +135,14 @@ class Qmp:
                 if "error" in r:
                     print("  [QMP error] %s -> %s" % (execute, r["error"]))
                 return r
+
+    def words(self, addr, n):
+        txt = self.cmd("human-monitor-command", {"command-line": "xp /%dwx 0x%x" % (n, addr)}).get("return", "") or ""
+        return [int(t, 16) & 0xFFFFFFFF for t in txt.replace(":", " ").split() if t.startswith("0x")]
+
+    def r32(self, name, off=0):
+        v = self.words(A[name] + off, 1)
+        return v[0] if v else None
 
     def shot(self, name):
         ppm = os.path.join(SHOTS, name + ".ppm")
@@ -236,7 +253,20 @@ def test_gfx():
         #      按钮 app_button(cr,14,60,162,26) → 绝对中心 (145+14+81, 168+60+13)
         q.click(49, 579)
         menu = q.shot("01_menu")
-        q.click(110, 405)                 # 「设置」App
+        # 动态定位「设置」App：App 数量会增加（如桌面拓展新增日历/画板/贪吃蛇），
+        # 菜单高度随 G_menu_n 变化，硬编码 y 会点错项。读 G_menu[] 找 app_id=A_SET。
+        menu_n = q.r32("G_menu_n") or 0
+        set_idx = None
+        for i in range(menu_n):
+            base = A["G_menu"] + i * 24   # struct menuitem = 24B
+            if q.words(base + 8, 1)[0] == 0 and q.words(base + 12, 1)[0] == A_SET:
+                set_idx = i; break
+        assert set_idx is not None, "菜单里找不到设置 App(idx=%s)" % set_idx
+        mh = 8 + menu_n * 26 + 8
+        my = H - 42 - mh
+        set_y = my + 8 + set_idx * 26 + 11
+        print("  菜单 %d 项，设置 idx=%d → 点击 y=%d" % (menu_n, set_idx, set_y))
+        q.click(110, set_y)               # 「设置」App（动态定位）
         q.shot("01b_settings")
         q.click(240, 241)                 # 设置窗口里的「鼠标校准」按钮
         cal = q.shot("02_cal_screen")

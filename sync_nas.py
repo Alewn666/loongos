@@ -201,6 +201,13 @@ FILES = [
     ('本体/test_install_gui_fix.py','本体/test_install_gui_fix.py'),
     ('本体/docs/安装GUI卡死修复判据报告.json', '本体/docs/安装GUI卡死修复判据报告.json'),
     ('本体/docs/桌面渲染优化判据报告.json',   '本体/docs/桌面渲染优化判据报告.json'),
+
+    # P4 桌面全面更新（2026-11-18）：三个新 App + 字库 + 交互 + 判据报告
+    ('本体/font_cjk.h',              '本体/font_cjk.h'),
+    ('本体/tools/gen_font.py',       '本体/tools/gen_font.py'),
+    ('本体/test_desktop_newapps.py', '本体/test_desktop_newapps.py'),
+    ('本体/test_desktop_interact.py','本体/test_desktop_interact.py'),
+    ('本体/docs/桌面全面更新判据报告.json', '本体/docs/桌面全面更新判据报告.json'),
 ]
 
 def md5_local(path):

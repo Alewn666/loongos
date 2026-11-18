@@ -27,6 +27,9 @@
 #include "desktop.h"
 #include "gfxterm.h"
 #include "path.h"      /* 纯函数路径层：修 H1，所有拼接带 cap，见 path.h 注释 */
+/* P4 桌面拓展：日历 App 读 PL031 墙钟。先立守卫，避免 rtc.h 的 typedef 与本文件重复定义。 */
+#define LOONGOS_RTC_TYPES
+#include "rtc.h"
 
 typedef unsigned long u64;
 typedef unsigned int  u32;
@@ -69,6 +72,11 @@ static inline u64 dsk_cntfrq(void)
 #define C_BTN       GFX_RGB(52, 96, 158)
 #define C_BTN_HI    GFX_RGB(74, 132, 208)
 #define C_MENU_BG   GFX_RGB(18, 30, 50)
+/* P4 视觉焕新：层次感配色（不动任何布局坐标，判据依赖的坐标全部保持原值） */
+#define C_WIN_HL    GFX_RGB(255, 255, 255)   /* 窗口/控件顶高光 */
+#define C_WIN_SH    GFX_RGB(126, 146, 174)   /* 窗口右下暗边 */
+#define C_GLOW      GFX_RGB(58, 108, 160)    /* 壁纸光晕斜纹 */
+#define C_TITLE_LO  GFX_RGB(150, 168, 192)   /* 非聚焦标题栏下段 */
 #define C_TRANSP    0xFFFFFFFFu
 
 #define TOPBAR_H   38
@@ -94,6 +102,10 @@ struct dwin {
 };
 
 static struct dwin G_win[NWIN];
+/* 交互增强：窗口最大化状态与还原矩形。独立数组，绝不扩 struct dwin
+   （test_desktop_apps.py 硬编码 G_win 步长=40B，改结构体会全判据错位）。 */
+static int  G_maximized[NWIN];
+static struct gfx_rect G_max_saved[NWIN];
 static int G_focus = -1;
 static int G_inited;
 static u64 G_last_sec;
@@ -143,7 +155,12 @@ struct gapp {
 enum {
     A_TERM = 0, A_INFO, A_DEMO, A_HELP,
     A_CALC, A_MON, A_SET, A_ABOUT, A_FILES, A_EDIT,
-    A_INSTALL, NAPP
+    A_INSTALL,               /* 10：既有编号，判据/行为基线依赖，绝不改动 */
+    /* P4 桌面拓展：新 App 一律追加在末尾，不打乱上面任何编号 */
+    A_CALENDAR,              /* 11 日历：PL031 墙钟月历，可翻月 */
+    A_PAINT,                 /* 12 画板：网格画布，触屏/鼠标涂鸦 */
+    A_SNAKE,                 /* 13 贪吃蛇：WASD / 方向键，自动推进 */
+    NAPP
 };
 static const struct gapp *G_apps[NAPP];
 /* 安装系统 App 状态（仅安装盘可见/可用） */
@@ -259,6 +276,11 @@ static struct gfx_rect min_rect(struct gfx_rect r)
 {
     return (struct gfx_rect){r.x + r.w - 48, r.y + 4, 20, 22};
 }
+/* 交互增强：最大化按钮，位于最小化左侧，不与关闭/最小化重叠 */
+static struct gfx_rect max_rect(struct gfx_rect r)
+{
+    return (struct gfx_rect){r.x + r.w - 76, r.y + 4, 20, 22};
+}
 /* P4 缩放手柄：右下角 14x14，画在内容之上但要避开窗口边框线 */
 static struct gfx_rect resize_rect(struct gfx_rect r)
 {
@@ -351,6 +373,7 @@ static int open_app(int app_id)
     G_win[slot].visible = 1;
     G_win[slot].minimized = 0;
     G_win[slot].data = 0;
+    G_maximized[slot] = 0;          /* 复用槽位不继承旧 App 的最大化状态 */
     G_win[slot].seq = G_open_seq++;
     G_focus = slot;
     raise_focus_shim();
@@ -556,10 +579,10 @@ static void help_draw(struct gfx_rect cr, int f, int w)
     (void)f;(void)w;
     const char *lines[] = {
         "鼠标左键  点击 / 拖动窗口",
-        "开始菜单  全部功能入口",
+        "标题栏方框  一键放大 / 还原",
+        "开始菜单  日历/画板/贪吃蛇",
         "终端窗口  直接敲命令",
-        "终端里 W/A/S/D/数字 正常打字",
-        "信息类窗口 WASD 移动 / Tab 切换",
+        "信息窗口 WASD 移动 / Tab 切换",
         "Ctrl+Shift+F1 返回终端",
     };
     for (int i = 0; i < 6; i++)
@@ -737,6 +760,268 @@ static void about_draw(struct gfx_rect cr, int f, int w)
     for (int i = 0; i < 6; i++)
         gfx_text(cr.x + 16, cr.y + 14 + i * 22,
                  i==0 ? lines[0] : lines[i], i==0 ? C_BLUE : C_WIN_TEXT, C_TRANSP);
+}
+
+/* ======================= P4 桌面拓展：三个新 App =======================
+ * 日历 / 画板 / 贪吃蛇。全部追加在 A_INSTALL(10) 之后，不打乱既有编号。
+ * 只用静态小缓冲，不引 kmalloc；绘制全部走 gfx 裁剪栈 + 脏矩形。
+ */
+
+/* —— 日历（读 PL031 真实墙钟） —— */
+static int cal_view_y, cal_view_m;      /* 当前显示的年/月 */
+static int cal_inited;
+static int cal_days_in_month(int y, int m)
+{
+    static const int dm[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    if (m < 1) { m = 1; }
+    if (m > 12) { m = 12; }
+    if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) return 29;
+    return dm[m - 1];
+}
+static void cal_init(int w)
+{
+    (void)w;
+    if (cal_inited) return;
+    int y, m, d, hh, mm, ss, wd;
+    u64 ep = rtc_now();
+    if (ep && rtc_valid()) { rtc_breakdown(ep, &y, &m, &d, &hh, &mm, &ss, &wd); }
+    else { y = 2026; m = 1; d = 1; }       /* RTC 不可用时的稳定回退 */
+    cal_view_y = y; cal_view_m = m;
+    cal_inited = 1;
+}
+static void cal_draw(struct gfx_rect cr, int f, int w)
+{
+    (void)f;(void)w;
+    gfx_clip_push(cr);
+    /* 月份标题 */
+    char head[32]; int n = 0;
+    const char *p = "  ";
+    while (*p) head[n++] = *p++;
+    n += my_itoa(head + n, cal_view_y);
+    head[n++] = '-';
+    if (cal_view_m < 10) head[n++] = '0';
+    n += my_itoa(head + n, cal_view_m);
+    head[n] = 0;
+    gfx_text(cr.x + 12, cr.y + 8, head + 2, C_BLUE, C_TRANSP);
+
+    /* 今天（用于高亮，仅当显示的正是当月） */
+    int ty = 0, tm = 0, td = 0, twd = 0;
+    u64 ep = rtc_now();
+    if (ep && rtc_valid()) {
+        int hh, mm, ss;
+        rtc_breakdown(ep, &ty, &tm, &td, &hh, &mm, &ss, &twd);
+    }
+
+    /* 表头 日 一 二 三 四 五 六（中文星期用单字，字库含常用汉字） */
+    const char *wdcn[7] = {"日", "一", "二", "三", "四", "五", "六"};
+    int cw = (cr.w - 24) / 7;
+    for (int i = 0; i < 7; i++)
+        gfx_text(cr.x + 12 + i * cw + cw / 2 - 8, cr.y + 32, wdcn[i], C_WIN_DIM, C_TRANSP);
+
+    /* 当月 1 号星期几 */
+    u64 first = rtc_epoch_of(cal_view_y, cal_view_m, 1, 12, 0, 0);
+    int fy, fm2, fd, fhh, fmm, fss, first_wd = 0;
+    rtc_breakdown(first, &fy, &fm2, &fd, &fhh, &fmm, &fss, &first_wd);
+
+    int ndays = cal_days_in_month(cal_view_y, cal_view_m);
+    int cellh = 22, gy = cr.y + 54;
+    for (int d = 1; d <= ndays; d++) {
+        int idx = first_wd + d - 1;
+        int row = idx / 7, col = idx % 7;
+        int cx = cr.x + 12 + col * cw, cy = gy + row * cellh;
+        int is_today = (cal_view_y == ty && cal_view_m == tm && d == td);
+        char ds[3];
+        if (d >= 10) { ds[0] = '0' + d / 10; ds[1] = '0' + d % 10; ds[2] = 0; }
+        else         { ds[0] = '0' + d % 10; ds[1] = 0; }
+        if (is_today) {
+            gfx_fill((struct gfx_rect){cx, cy, cw - 2, cellh - 2}, C_BLUE);
+            gfx_text(cx + cw / 2 - (d >= 10 ? 8 : 4), cy + 3, ds, C_WHITE, C_TRANSP);
+        } else {
+            gfx_text(cx + cw / 2 - (d >= 10 ? 8 : 4), cy + 3, ds, C_WIN_TEXT, C_TRANSP);
+        }
+    }
+    gfx_text(cr.x + 12, cr.y + cr.h - 24, "A 上月  D 下月  T 回今天", C_WIN_DIM, C_TRANSP);
+    gfx_clip_pop();
+}
+static void cal_key(char c, int win)
+{
+    (void)win;
+    if (c == 'a' || c == 'A') {           /* 上一月 */
+        if (--cal_view_m < 1) { cal_view_m = 12; cal_view_y--; }
+        gfx_damage(full_screen());
+    } else if (c == 'd' || c == 'D') {    /* 下一月 */
+        if (++cal_view_m > 12) { cal_view_m = 1; cal_view_y++; }
+        gfx_damage(full_screen());
+    } else if (c == 't' || c == 'T') {    /* 回今天 */
+        cal_inited = 0; cal_init(0);
+        gfx_damage(full_screen());
+    }
+}
+
+/* —— 画板：24x14 网格涂鸦 —— */
+#define PAINT_W 24
+#define PAINT_H 14
+static u8  g_paint[PAINT_W * PAINT_H];    /* 0 = 空白，1..5 = 调色板索引 */
+static int g_paint_color = 1;
+static void paint_clear(void)
+{
+    for (int i = 0; i < PAINT_W * PAINT_H; i++) g_paint[i] = 0;
+}
+static void paint_draw(struct gfx_rect cr, int f, int w)
+{
+    (void)f;(void)w;
+    gfx_clip_push(cr);
+    int pad = 8, pal_h = 30;
+    int cw = (cr.w - 2 * pad) / PAINT_W;
+    int ch = (cr.h - 2 * pad - pal_h - 8) / PAINT_H;
+    if (cw < 2) { cw = 2; }
+    if (ch < 2) { ch = 2; }
+    static const u32 pal[6] = {C_WIN_BG, C_RED, C_ORANGE, C_TEAL, C_BLUE, C_VIOLET};
+    for (int yy = 0; yy < PAINT_H; yy++)
+        for (int xx = 0; xx < PAINT_W; xx++) {
+            struct gfx_rect cell = {cr.x + pad + xx * cw, cr.y + pad + yy * ch, cw - 1, ch - 1};
+            gfx_fill(cell, pal[g_paint[yy * PAINT_W + xx] % 6]);
+        }
+    /* 调色板 */
+    int py = cr.y + cr.h - pal_h - 2;
+    for (int i = 0; i < 6; i++) {
+        struct gfx_rect sw = {cr.x + pad + i * 24, py, 20, 20};
+        gfx_fill(sw, pal[i]);
+        gfx_rect_draw(sw, (i == g_paint_color) ? C_WIN_TEXT : C_BORDER,
+                      (i == g_paint_color) ? 2 : 1);
+    }
+    gfx_text(cr.x + pad + 6 * 24 + 6, py + 3, "C 清屏", C_WIN_DIM, C_TRANSP);
+    gfx_clip_pop();
+}
+static void paint_press(struct gfx_rect cr, int lx, int ly, int win)
+{
+    (void)win;
+    gfx_clip_push(cr);
+    int pad = 8, pal_h = 30;
+    int cw = (cr.w - 2 * pad) / PAINT_W;
+    int ch = (cr.h - 2 * pad - pal_h - 8) / PAINT_H;
+    if (cw < 2) { cw = 2; }
+    if (ch < 2) { ch = 2; }
+    int py = cr.y + cr.h - pal_h - 2;
+    /* 调色板命中（局部坐标需加 cr 原点） */
+    for (int i = 0; i < 6; i++)
+        if (app_hit(lx, ly, pad + i * 24, py - cr.y, 20, 20)) {
+            g_paint_color = i; gfx_clip_pop(); gfx_damage(full_screen()); return;
+        }
+    if (app_hit(lx, ly, pad + 6 * 24 + 6, py - cr.y, 64, 20)) {
+        paint_clear(); gfx_clip_pop(); gfx_damage(full_screen()); return;
+    }
+    int xx = (lx - pad) / cw, yy = (ly - pad) / ch;
+    if (xx >= 0 && xx < PAINT_W && yy >= 0 && yy < PAINT_H) {
+        g_paint[yy * PAINT_W + xx] = (u8)g_paint_color;
+        gfx_damage(full_screen());
+    }
+    gfx_clip_pop();
+}
+static void paint_key(char c, int win)
+{
+    (void)win;
+    if (c == 'c' || c == 'C') { paint_clear(); gfx_damage(full_screen()); }
+}
+
+/* —— 贪吃蛇：16x12 网格，键盘转向，随 tick 自动推进 —— */
+#define SNK_W 16
+#define SNK_H 12
+#define SNK_MAX 40
+static u8  snk_x[SNK_MAX], snk_y[SNK_MAX];  /* 蛇身，[0] 为头 */
+static int snk_len, snk_dir, snk_foodx, snk_foody, snk_score, snk_over;
+static int snk_inited;
+static void snake_reset(void)
+{
+    snk_len = 3; snk_dir = 1;              /* 1 右 2 左 3 上 4 下 */
+    snk_x[0] = 4; snk_y[0] = SNK_H / 2;
+    snk_x[1] = 3; snk_y[1] = SNK_H / 2;
+    snk_x[2] = 2; snk_y[2] = SNK_H / 2;
+    snk_foodx = 10; snk_foody = SNK_H / 2;
+    snk_score = 0; snk_over = 0; snk_inited = 1;
+}
+static void snake_init(int w)
+{
+    (void)w;
+    if (!snk_inited) snake_reset();
+}
+/* 由主循环 tick 驱动；返回 1 表示棋盘状态变化需要重绘 */
+static int snake_tick(void)
+{
+    int slot = -1;
+    for (int i = 0; i < NWIN; i++)
+        if (G_win[i].visible && !G_win[i].minimized && G_win[i].app_id == A_SNAKE) { slot = i; break; }
+    if (slot < 0 || snk_over) return 0;
+    int nx = snk_x[0], ny = snk_y[0];
+    if (snk_dir == 1) nx++; else if (snk_dir == 2) nx--;
+    else if (snk_dir == 3) ny--; else ny++;
+    /* 撞墙 */
+    if (nx < 0 || nx >= SNK_W || ny < 0 || ny >= SNK_H) { snk_over = 1; return 1; }
+    /* 撞自己 */
+    for (int i = 0; i < snk_len; i++)
+        if (snk_x[i] == nx && snk_y[i] == ny) { snk_over = 1; return 1; }
+    int ate = (nx == snk_foodx && ny == snk_foody);
+    /* 身体后移 */
+    for (int i = snk_len; i > 0; i--) { snk_x[i] = snk_x[i - 1]; snk_y[i] = snk_y[i - 1]; }
+    snk_x[0] = nx; snk_y[0] = ny;
+    if (ate) {
+        if (snk_len < SNK_MAX) snk_len++;
+        snk_score += 10;
+        /* 简单找空位放食物 */
+        int placed = 0;
+        for (int t = 0; t < SNK_W * SNK_H && !placed; t++) {
+            int fx = (snk_foodx * 7 + 3 + t) % SNK_W;
+            int fy = (snk_foody * 5 + 1 + t / SNK_W) % SNK_H;
+            int hit = 0;
+            for (int i = 0; i < snk_len; i++) if (snk_x[i] == fx && snk_y[i] == fy) { hit = 1; break; }
+            if (!hit) { snk_foodx = fx; snk_foody = fy; placed = 1; }
+        }
+    }
+    return 1;
+}
+static void snake_draw(struct gfx_rect cr, int f, int w)
+{
+    (void)f;(void)w;
+    gfx_clip_push(cr);
+    int pad = 8;
+    int cw = (cr.w - 2 * pad) / SNK_W;
+    int ch = (cr.h - 2 * pad - 26) / SNK_H;
+    if (cw < 2) { cw = 2; }
+    if (ch < 2) { ch = 2; }
+    /* 棋盘底 */
+    gfx_fill((struct gfx_rect){cr.x + pad, cr.y + pad, cw * SNK_W, ch * SNK_H},
+             GFX_RGB(28, 42, 64));
+    /* 食物 */
+    gfx_fill((struct gfx_rect){cr.x + pad + snk_foodx * cw, cr.y + pad + snk_foody * ch,
+                               cw - 1, ch - 1}, C_RED);
+    /* 蛇身 */
+    for (int i = 0; i < snk_len; i++)
+        gfx_fill((struct gfx_rect){cr.x + pad + snk_x[i] * cw, cr.y + pad + snk_y[i] * ch,
+                                   cw - 1, ch - 1},
+                 i == 0 ? C_ACCENT : (i & 1 ? C_TEAL : GFX_RGB(46, 150, 120)));
+    /* 状态行 */
+    char st[40]; int n = 0;
+    const char *p = "分数 "; while (*p) st[n++] = *p++;
+    n += my_itoa(st + n, snk_score);
+    if (snk_over) { p = "  [游戏结束] R 重开"; while (*p) st[n++] = *p++; }
+    else          { p = "  WASD 转向"; while (*p) st[n++] = *p++; }
+    st[n] = 0;
+    gfx_text(cr.x + pad, cr.y + cr.h - 20, st, C_WIN_TEXT, C_TRANSP);
+    gfx_clip_pop();
+}
+static void snake_key(char c, int win)
+{
+    (void)win;
+    if (c == 'r' || c == 'R') { snake_reset(); gfx_damage(full_screen()); return; }
+    int nd = snk_dir;
+    if      (c == 'w' || c == 'W') nd = 3;
+    else if (c == 's' || c == 'S') nd = 4;
+    else if (c == 'a' || c == 'A') nd = 2;
+    else if (c == 'd' || c == 'D') nd = 1;
+    /* 禁止 180 度掉头 */
+    if ((nd == 1 && snk_dir != 2) || (nd == 2 && snk_dir != 1) ||
+        (nd == 3 && snk_dir != 4) || (nd == 4 && snk_dir != 3))
+        snk_dir = nd;
 }
 
 /* —— 文件管理器 ——
@@ -1144,6 +1429,10 @@ static const struct gapp G_app_defs[NAPP] = {
     [A_FILES]   = {"文件管理器", C_ORANGE, 1, 0, fm_draw,     fm_press, 0, fm_scroll_h},
     [A_EDIT]    = {"文本编辑器", C_BLUE,   1, ed_init, ed_draw, ed_press, ed_key, ed_scroll_h},
     [A_INSTALL] = {"安装系统",   C_ORANGE, 1, 0, install_draw, install_press, 0, 0},
+    /* P4 桌面拓展：追加在末尾，不打乱 0..10 既有编号 */
+    [A_CALENDAR]= {"日历",       C_VIOLET, 1, cal_init, cal_draw, 0, cal_key, 0},
+    [A_PAINT]   = {"画板",       C_RED,    1, 0, paint_draw, paint_press, paint_key, 0},
+    [A_SNAKE]   = {"贪吃蛇",     C_TEAL,   1, snake_init, snake_draw, 0, snake_key, 0},
 };
 static void apps_register(void)
 {
@@ -1164,11 +1453,13 @@ static void draw_wallpaper(struct gfx_rect r)
     for (int y = y0; y < y1; y++)
         gfx_fill((struct gfx_rect){0, y, w, 1},
                  mix(C_WALL_A, C_WALL_B, h > 1 ? (y * 255) / (h - 1) : 0));
+    /* 斜纹：主色线 + 右邻 1px 高光，形成有层次的双色光带；脏区不相交整组跳过 */
     for (int i = 0; i < 7; i++) {
         int xa = w - 260 + i * 22, ya = h - TASKBAR_H;
         int xb = w - 90  + i * 22, yb = TOPBAR_H + 56;
-        if (!gfx_overlap(r, line_bbox(xa, ya, xb, yb))) continue;  /* 不相交：跳过整条线 */
+        if (!gfx_overlap(r, line_bbox(xa, ya, xb + 2, yb))) continue;
         gfx_line(xa, ya, xb, yb, C_DECO);
+        gfx_line(xa + 2, ya, xb + 2, yb, C_GLOW);   /* 高光伴线 */
     }
 }
 /* 脏矩形感知：脏区与顶栏不相交则整层跳过 */
@@ -1179,6 +1470,7 @@ static void draw_topbar(struct gfx_rect r)
     int w = gfx_width();
     gfx_fill((struct gfx_rect){0, 0, w, TOPBAR_H}, C_TOPBAR);
     gfx_fill((struct gfx_rect){0, TOPBAR_H - 2, w, 2}, C_BLUE);
+    gfx_fill((struct gfx_rect){0, TOPBAR_H - 3, w, 1}, C_GLOW);   /* 分隔高光 */
     gfx_text(16, 11, "灵珑系统  LoongOS", C_WHITE, C_TRANSP);
     const char *hint = "图形桌面 P4 · GUI 应用生态   |   Ctrl+Shift+F1 返回终端";
     int hw = gfx_text_w(hint);
@@ -1189,6 +1481,9 @@ static void draw_topbar(struct gfx_rect r)
 static void draw_button_rect(struct gfx_rect r, const char *label, u32 bg, u32 fg)
 {
     gfx_fill(r, bg);
+    /* 顶 1px 高光 + 底 1px 暗边：按钮立体感（矩形/文字位置不变） */
+    gfx_fill((struct gfx_rect){r.x + 1, r.y + 1, r.w - 2, 1}, mix(bg, C_WIN_HL, 55));
+    gfx_fill((struct gfx_rect){r.x + 1, r.y + r.h - 2, r.w - 2, 1}, mix(bg, GFX_RGB(0,0,0), 25));
     gfx_rect_draw(r, GFX_RGB(90, 120, 160), 1);
     int tw = gfx_text_w(label);
     gfx_text(r.x + (r.w - tw) / 2, r.y + (r.h - 16) / 2, label, fg, C_TRANSP);
@@ -1206,14 +1501,32 @@ static void draw_one_win(int k, int focused)
     gfx_fill((struct gfx_rect){r.x + 4, r.y + r.h, r.w, 4}, C_SHADOW);  /* 下缘 */
     gfx_fill(r, C_WIN_BG);
     gfx_rect_draw(r, C_BORDER, 1);
-    gfx_fill((struct gfx_rect){r.x, r.y, r.w, TITLE_H},
-             focused ? G_apps[w->app_id]->accent : C_TITLE_DIM);
+    /* 标题栏：上段主色 + 下段略深（双段层次），顶部 1px 高光。仅换配色，矩形不变 */
+    u32 tcol = focused ? G_apps[w->app_id]->accent : C_TITLE_DIM;
+    u32 tlo  = focused ? mix(tcol, GFX_RGB(0, 0, 0), 42) : C_TITLE_LO;
+    gfx_fill((struct gfx_rect){r.x + 1, r.y + 1, r.w - 2, TITLE_H / 2}, tcol);
+    gfx_fill((struct gfx_rect){r.x + 1, r.y + 1 + TITLE_H / 2, r.w - 2, TITLE_H / 2 - 1}, tlo);
+    gfx_fill((struct gfx_rect){r.x + 1, r.y + 1, r.w - 2, 1},
+             focused ? C_WIN_HL : C_BORDER);              /* 顶高光 */
+    /* 应用小图标：标题文字左侧一个 accent 方块 + 内嵌亮心 */
+    gfx_fill((struct gfx_rect){r.x + 4, r.y + 8, 13, 13}, mix(tcol, GFX_RGB(0,0,0), 25));
+    gfx_fill((struct gfx_rect){r.x + 7, r.y + 11, 7, 7}, focused ? C_WIN_HL : C_WIN_BG);
     struct gfx_rect cr = close_rect(r);
     gfx_fill((struct gfx_rect){cr.x + 3, cr.y + 6, 14, 12}, focused ? C_WHITE : C_WIN_BG);
     gfx_text(cr.x + 5, cr.y + 4, "X", focused ? G_apps[w->app_id]->accent : C_TITLE_DIM, C_TRANSP);
     struct gfx_rect mr = min_rect(r);
     gfx_fill((struct gfx_rect){mr.x + 3, mr.y + 14, 14, 4}, focused ? C_WHITE : C_WIN_BG);
-    gfx_text(r.x + 12, r.y + 6, G_apps[w->app_id]->name, C_WHITE, C_TRANSP);
+    /* 最大化按钮：普通=单方框，已最大化=双框(还原)。位置在最小化左侧 */
+    struct gfx_rect xr = max_rect(r);
+    u32 bcol = focused ? C_WHITE : C_WIN_BG;
+    if (G_maximized[k]) {
+        gfx_rect_draw((struct gfx_rect){xr.x + 5, xr.y + 4, 9, 9}, bcol, 1);
+        gfx_rect_draw((struct gfx_rect){xr.x + 8, xr.y + 8, 9, 9}, bcol, 1);
+    } else {
+        gfx_rect_draw((struct gfx_rect){xr.x + 5, xr.y + 6, 11, 10}, bcol, 1);
+        gfx_fill((struct gfx_rect){xr.x + 5, xr.y + 6, 11, 1}, bcol);
+    }
+    gfx_text(r.x + 22, r.y + 6, G_apps[w->app_id]->name, C_WHITE, C_TRANSP);
 
     struct gfx_rect content = (struct gfx_rect){r.x + 1, r.y + TITLE_H, r.w - 2, r.h - TITLE_H - 1};
     gfx_clip_push(content);
@@ -1462,19 +1775,44 @@ static void handle_press(void)
     }
     if (gfx_hit(close_rect(r), x, y) && y < r.y + TITLE_H) {
         G_win[wi].visible = 0;
+        G_maximized[wi] = 0;
         if (G_focus == wi) refocus();
+        gfx_damage(full_screen());
+        return;
+    }
+    /* 交互增强：最大化 / 还原按钮 */
+    if (gfx_hit(max_rect(r), x, y) && y < r.y + TITLE_H) {
+        if (G_maximized[wi]) {
+            G_win[wi].r = G_max_saved[wi];
+            G_maximized[wi] = 0;
+        } else {
+            G_max_saved[wi] = r;
+            G_win[wi].r = (struct gfx_rect){4, TOPBAR_H + 4,
+                                            gfx_width() - 8,
+                                            gfx_height() - TOPBAR_H - TASKBAR_H - 8};
+            G_maximized[wi] = 1;
+        }
+        focus_win(wi);
         gfx_damage(full_screen());
         return;
     }
     focus_win(wi);
     /* P4：缩放手柄优先于内容区，避免被 App 的 press 当成普通点击吃掉 */
     if (gfx_hit(resize_rect(r), x, y)) {
+        /* 从最大化状态缩放：先还原到原尺寸再按还原后的尺寸缩放 */
+        if (G_maximized[wi]) {
+            G_win[wi].r = G_max_saved[wi]; G_maximized[wi] = 0; r = G_win[wi].r;
+        }
         G_resize = wi;
         G_rz_w0 = r.w; G_rz_h0 = r.h;
         G_rz_mx0 = x; G_rz_my0 = y;
         return;
     }
     if (y < r.y + TITLE_H) {
+        /* 拖动最大化窗口：先还原，拖动基准用还原后的矩形 */
+        if (G_maximized[wi]) {
+            G_win[wi].r = G_max_saved[wi]; G_maximized[wi] = 0; r = G_win[wi].r;
+        }
         G_drag = wi; G_drag_dx = x - r.x; G_drag_dy = y - r.y;
         return;
     }
@@ -1635,6 +1973,9 @@ void desktop_run(void)
             last_tick = tick;
             smp_tick_inc();
             net_poll();
+            /* 贪吃蛇自动推进：每 3 tick（0.3s）走一步，仅在蛇窗口可见时生效 */
+            if (tick % 3 == 0 && snake_tick())
+                gfx_damage(full_screen());
             u64 sec = tick / 10;
             if (sec != G_last_sec) { G_last_sec = sec; gfx_damage(clock_rect()); input = 1; }
             if (ed_msg_ttl > 0 && --ed_msg_ttl == 0) {
