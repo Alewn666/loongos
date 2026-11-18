@@ -78,7 +78,8 @@ FILES = [
     ('本体/test_stress_arm.py',   '本体/test_stress_arm.py'),
     ('本体/run_regression_r.sh',  '本体/run_regression_r.sh'),
     ('本体/test_mousecal.py',     '本体/test_mousecal.py'),
-    ('本体/iso/loongos.iso.md5',  'iso/自研内核ISO/loongos.iso.md5'),
+    # md5 清单以交付目录那份为唯一源（本体/iso/下的旧副本内容含 iso/ 前缀、路径已过时，勿用）
+    ('iso/自研内核ISO/loongos.iso.md5', 'iso/自研内核ISO/loongos.iso.md5'),
     # 第四十七轮：渲染 / 内存 / 文件系统 / ARM SHA-256 提速
     # 注：kernel.c / kernel.elf / gfx.c / build.sh / boot.S / bss_budget.txt /
     #     golden_behavior.txt / docs 已在上面登记，此处只补历史漏登的编译单元。
@@ -199,6 +200,7 @@ FILES = [
     ('本体/gfx_draw.h',             '本体/gfx_draw.h'),
     ('本体/test_install_gui_fix.py','本体/test_install_gui_fix.py'),
     ('本体/docs/安装GUI卡死修复判据报告.json', '本体/docs/安装GUI卡死修复判据报告.json'),
+    ('本体/docs/桌面渲染优化判据报告.json',   '本体/docs/桌面渲染优化判据报告.json'),
 ]
 
 def md5_local(path):
