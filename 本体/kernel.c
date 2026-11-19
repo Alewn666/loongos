@@ -29,6 +29,7 @@
 #include "proc.h"   /* 第五十七轮：进程模型地基（每进程地址空间 + fork/wait，演进路线 3.2） */
 #include "fdtab.h"  /* 第五十八轮 58.0-A：每进程 FD 表 + 打开文件描述共享语义 */
 #include "sched.h"  /* 第五十八轮 58.0-B：抢占式调度地基（五态机/时间片/统计） */
+#include "loong.h"  /* LOONG 包管理器：纯逻辑层（版本比较/索引解析/记账/状态机） */
 
 typedef unsigned long u64;
 typedef unsigned int  u32;
@@ -1066,7 +1067,13 @@ static void gic_init(void)
      - fill_pt(USER_BASE, USER_END, ...) 与 cmd_run 的 vaddr 校验都用宏自动跟随；
      - l3_user 管 0x40200000-0x403FFFFF，USER_BASE 仍在其中，页索引不回绕；
      - golden_behavior.txt 的 mmu/tasks 地址输出全部被规范化成 0xADDR，逐字不受影响。 */
-#define USER_BASE 0x40238000UL       /* 用户区 0x40238000-0x403FFFFF，独立 L3（l3_user）。
+/* 第五十八轮 C（LOONG 包管理器）：cmd_loong/HTTP 客户端约 12KB .text/.rodata +
+   2KB 接收缓冲把 __nvmedma_end 顶到 0x4023a000，越过旧 USER_BASE=0x40238000。
+   上移 16KB 到 0x4023c000，恢复 8KB「充裕」档余量。连锁面同样逐项核对：
+     - -Ttext=0x40240000 仍落在 [0x4023c000, 0x40400000) 内（间隙 32KB→16KB）；
+     - USER_END/UARGS_ADDR/EL0 栈/内嵌 ELF blob 全不动；
+     - fill_pt 与 cmd_run vaddr 校验用宏自动跟随；golden 地址规范化逐字不变。 */
+#define USER_BASE 0x4023c000UL       /* 用户区 0x4023c000-0x403FFFFF，独立 L3（l3_user）。
                                         内核 .bss 可延伸到 0x40200000 起的那几页（PROT_RAM，EL1 专用），
                                         用户区权限只从 USER_BASE 起覆盖，互不干扰。 */
 #define USER_END  0x40400000UL
@@ -2030,6 +2037,17 @@ static struct scheduler g_sched;
 static u32    g_cpid = 1;          /* 当前进程 pid（EL0 里正在跑的那个） */
 static u64    g_cur_l3 = 0;        /* 当前生效的用户 L3 表物理；0 = 全局 l3_user */
 static int    g_proc_active = 0;   /* 是否有用户程序在使用进程模型（wait 让出需要） */
+
+/* ---- LOONG 包管理器内核态状态（纯逻辑见 loong.c）----
+   index/db 从 kmalloc 堆分配（各 ~4KB/2KB），不占 .bss —— BSS 余量仅 8KB 是硬约束。
+   只在 loong update/install 时用，不参与任何既有路径；开机静默、不进 golden。 */
+static struct loong_index *g_loong_idx;      /* 最近一次 update 的包索引（堆） */
+static struct loong_db    *g_loong_db;       /* 已安装包记账（堆） */
+static struct loong_stats  g_loong_stats;    /* 统计 */
+static int                 g_loong_ready;    /* 是否成功 update 过 */
+static char                g_loong_host[64] = "127.0.0.1";  /* 源 IP */
+static u16                 g_loong_port = 8080;             /* 源端口 */
+static enum loong_state    g_loong_state = LST_IDLE;
 
 /* 当前进程的文件表：pid=1 返回 0（调用方走老 g_fd 路径），否则返回该 proc 的表。
    返回 0 是刻意的哨兵——svc_dispatch 用它决定走老路径还是每进程路径。 */
@@ -3742,6 +3760,367 @@ static void cmd_tcp(char *args)
     tcp_close();
 }
 
+/* LOONG 开机初始化：从堆分配索引/记账结构，避免占用紧张的 .bss。
+   静默，不打印任何行（golden 逐字不变）。幂等。 */
+static void loong_init(void)
+{
+    if (!g_loong_idx) g_loong_idx = kzalloc(sizeof(struct loong_index));
+    if (!g_loong_db)  g_loong_db  = kzalloc(sizeof(struct loong_db));
+}
+
+/* 局部缓冲清零：volatile 逐字节，避免 -O2 把 {0} 初始化折叠成 memset 调用（内核无 libc） */
+static void loong_zero(void *p, int n) { volatile u8 *b = (volatile u8 *)p; while (n--) *b++ = 0; }
+
+/* 子串查找（大小写敏感）；找到返回非0 */
+static int loong_strstr(const char *s, const char *sub)
+{
+    if (!s || !sub || !*sub) return 1;
+    for (const char *p = s; *p; p++) {
+        const char *q = sub; const char *r = p;
+        while (*q && *r && *q == *r) { q++; r++; }
+        if (!*q) return 1;
+    }
+    return 0;
+}
+
+/* ==========================================================================
+ * LOONG 包管理器（内核接线）—— 纯逻辑在 loong.c，这里只做网络/落盘/命令
+ * 源：NAS 上 Docker 托管的静态 HTTP 服务（见 loong-repo/）。
+ * 命令不进 help / golden：刻意保持 29 条行为基线逐字不变。
+ * ==========================================================================*/
+
+/* 点分十进制 IP → u32（cmd_tcp 同款，本地静态避免动 net.c） */
+static int loong_parse_ip(const char *s, u32 *out)
+{
+    int part = 0, val = 0, dig = 0; u32 v[4] = {0,0,0,0};
+    if (!s) return -1;
+    for (const char *p = s;; p++) {
+        if (*p >= '0' && *p <= '9') { val = val * 10 + (*p - '0'); dig++; }
+        else if (*p == '.' || *p == 0) {
+            if (!dig || part >= 4 || val > 255) return -1;
+            v[part++] = (u32)val; val = 0; dig = 0;
+            if (!*p) break;
+        } else return -1;
+    }
+    if (part != 4) return -1;
+    *out = (v[0] << 24) | (v[1] << 16) | (v[2] << 8) | v[3];
+    return 0;
+}
+
+/* HTTP GET：连到源，GET path，读完整响应到 kmalloc 缓冲。
+   返回 body 字节数（已去掉 HTTP 头）；失败 -1/-2。out_len 回写长度。
+   用 kmalloc 分配，避免涨 BSS；调用方负责 kfree。 */
+static void loong_udelay(volatile u32 n) { while (n--) { __asm__ volatile("nop"); } }
+
+static int loong_http_get(const char *path, char **out, int *out_len)
+{
+    u32 ip;
+    if (loong_parse_ip(g_loong_host, &ip) != 0) {
+        uart_puts("[loong] 源 IP 非法: "); uart_puts(g_loong_host); uart_puts("\n");
+        return -1;
+    }
+    /* 教学 TCP 是单连接状态机，对 SLIRP 下连续 GET 偶发不稳（send 超时被 reset）。
+       最多重试 3 次，每次清空状态 + 短延时，实测可稳定完成 update + install。 */
+    for (int attempt = 0; attempt < 3; attempt++) {
+        tcp_close();
+        if (attempt) loong_udelay(200000);   /* 让对端 TIME_WAIT 松开 */
+        int r = tcp_connect(ip, g_loong_port, 5000);
+        if (r != 0) continue;
+
+        char req[256];
+        int n = 0;
+        const char pre[] = "GET ";
+        for (const char *p = pre; *p; p++) req[n++] = *p;
+        for (const char *p = path; *p; p++) req[n++] = *p;
+        /* HTTP/1.0 不强制 Host 头；极简请求把 TCP 段压到 64B 内——
+           QEMU SLIRP 对更长的首段偶发丢 ACK（实测 77B 必失败 / 60B 正常）。 */
+        const char mid[] = " HTTP/1.0\r\n\r\n";
+        for (const char *p = mid; *p; p++) req[n++] = *p;
+        req[n] = 0;
+        /* 教学 TCP 栈在 send 等 ACK 时若收到服务端 FIN（HTTP/1.0 + close 常见），
+           状态转 CLOSE_WAIT 使 tcp_send 返回 -1，但请求已发出——忽略返回值继续收。 */
+        (void)tcp_send(req, n);
+
+        int cap = 4096;
+        char *buf = (char *)kmalloc((u32)cap);
+        if (!buf) { tcp_close(); continue; }
+        int total = 0;
+        static char chunk[1024];
+        for (int tries = 0; tries < 200; tries++) {
+            int got = tcp_recv(chunk, sizeof chunk, 1500);
+            if (got <= 0) break;               /* 0=超时无数据, <0=连接已关 */
+            if (total + got > cap) {            /* 扩容：kmalloc 新块 + 拷贝 */
+                int ncap = cap * 2;
+                if (ncap > 65536) break;
+                char *nb = (char *)kmalloc((u32)ncap);
+                if (!nb) break;
+                for (int i = 0; i < total; i++) nb[i] = buf[i];
+                kfree(buf); buf = nb; cap = ncap;
+            }
+            for (int i = 0; i < got; i++) buf[total + i] = chunk[i];
+            total += got;
+        }
+        tcp_close();
+        if (total <= 0) { kfree(buf); continue; }   /* 本次无响应，重试 */
+
+        /* 找 \r\n\r\n 分离头体 */
+        int body = -1;
+        for (int i = 0; i + 3 < total; i++) {
+            if (buf[i]=='\r' && buf[i+1]=='\n' && buf[i+2]=='\r' && buf[i+3]=='\n') { body = i + 4; break; }
+        }
+        if (body < 0) { kfree(buf); continue; }
+        /* 状态行含 " 200 " */
+        int ok = 0;
+        for (int i = 0; i + 6 < body; i++) {
+            if (buf[i]==' ' && buf[i+1]=='2' && buf[i+2]=='0' && buf[i+3]=='0' && buf[i+4]==' ') { ok = 1; break; }
+        }
+        if (!ok) { kfree(buf); continue; }
+        int blen = total - body;
+        for (int i = 0; i < blen; i++) buf[i] = buf[body + i];   /* body 前移 */
+        buf[blen] = 0;   /* NUL 终止：b64_decode 靠 NUL 判结束，防止读到 kmalloc 残留 */
+        *out = buf; *out_len = blen;
+        return blen;
+    }
+    uart_puts("[loong] 源无响应（已重试 3 次）\n");
+    return -1;
+}
+
+/* 确保绝对路径的各级父目录存在（如 /home/xxx → /home） */
+static void loong_ensure_parent(const char *path)
+{
+    char d[128]; int n = 0;
+    /* 从根开始，遇到 '/'（非首位）就尝试建这一级 */
+    for (const char *p = path; *p && n < (int)sizeof(d) - 1; p++) {
+        d[n++] = *p;
+        if (*p == '/' && n > 1) {
+            d[n] = 0;
+            if (fs_lookup(d) < 0) fs_mkdir(d);
+        }
+    }
+}
+
+/* 从 hex 串计算 SHA256 并比对（payload 二进制）。返回 1=通过 */
+static int loong_verify_sha(const u8 *data, u32 len, const char *hex)
+{
+    u8 digest[32]; char h[65];
+    sha256(data, len, digest);
+    to_hex(digest, 32, h);
+    for (int i = 0; i < 64; i++) {
+        char a = h[i], b = hex[i];
+        if (a >= 'A' && a <= 'F') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'F') b = (char)(b - 'A' + 'a');
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+/* 在索引里按名字找最高版本的条目下标；无 -1 */
+static int loong_best_pkg(const struct loong_index *ix, const char *name)
+{
+    int best = -1;
+    for (u32 i = 0; i < ix->n; i++) {
+        if (!ix->pkg[i].used || fs_strcmp(ix->pkg[i].name, name) != 0) continue;
+        if (best < 0 || loong_vercmp(ix->pkg[i].ver, ix->pkg[best].ver) > 0) best = (int)i;
+    }
+    return best;
+}
+
+static void cmd_loong(char *args)
+{
+    if (!g_loong_idx || !g_loong_db) { uart_puts("[loong] 未初始化\n"); return; }
+    char *a = args;
+    char *sub = next_word(&a);
+    if (!sub) {
+        uart_puts("LOONG 包管理器. 用法:\n");
+        uart_puts("  loong sources <ip> <端口>  设置软件源\n");
+        uart_puts("  loong update               拉取包索引\n");
+        uart_puts("  loong list                 列出可用包\n");
+        uart_puts("  loong search <关键词>      搜索包\n");
+        uart_puts("  loong show <包名>          查看包详情\n");
+        uart_puts("  loong install <包名>       安装(校验后落盘)\n");
+        uart_puts("  loong status               源/索引/记账/统计\n");
+        return;
+    }
+
+    /* ---- sources <ip> <端口> ---- */
+    if (fs_strcmp(sub, "sources") == 0) {
+        char *ip = next_word(&a), *pt = next_word(&a);
+        if (!ip) {
+            uart_puts("当前源: "); uart_puts(g_loong_host); uart_puts(":");
+            uart_putdec(g_loong_port); uart_puts("\n"); return;
+        }
+        u32 v;
+        if (loong_parse_ip(ip, &v) != 0) { uart_puts("IP 非法\n"); return; }
+        int port = 0;
+        if (pt) { for (const char *p = pt; *p; p++) { if (*p<'0'||*p>'9') { port=0; break; } port = port*10 + (*p-'0'); } }
+        if (port <= 0 || port > 65535) port = 8080;
+        int k = 0; for (const char *p = ip; *p && k < 63; p++) g_loong_host[k++] = *p;
+        g_loong_host[k] = 0; g_loong_port = (u16)port;
+        uart_puts("[loong] 源已设为 "); uart_puts(g_loong_host); uart_puts(":");
+        uart_putdec(g_loong_port); uart_puts("\n");
+        return;
+    }
+
+    /* ---- update：拉 /Packages 索引 ---- */
+    if (fs_strcmp(sub, "update") == 0) {
+        g_loong_state = loong_state_next(g_loong_state, LEV_UPDATE, &g_loong_stats);
+        uart_puts("[loong] 更新索引 from "); uart_puts(g_loong_host); uart_puts("...\n");
+        char *body = 0; int blen = 0;
+        if (loong_http_get("/Packages", &body, &blen) < 0) {
+            g_loong_state = loong_state_next(g_loong_state, LEV_PARSE_FAIL, &g_loong_stats);
+            uart_puts("[loong] 索引拉取失败\n"); return;
+        }
+        int n = loong_parse_index(body, (u32)blen, g_loong_idx);
+        kfree(body);
+        if (n <= 0) {
+            g_loong_state = loong_state_next(g_loong_state, LEV_PARSE_FAIL, &g_loong_stats);
+            uart_puts("[loong] 索引解析失败\n"); return;
+        }
+        g_loong_state = loong_state_next(g_loong_state, LEV_PARSE_OK, &g_loong_stats);
+        g_loong_ready = 1;
+        uart_puts("[loong] OK 已读 "); uart_putdec((u32)n); uart_puts(" 个包版本\n");
+        return;
+    }
+
+    /* ---- list / search / show ---- */
+    if (fs_strcmp(sub, "list") == 0 || fs_strcmp(sub, "search") == 0 || fs_strcmp(sub, "show") == 0) {
+        if (!g_loong_ready) { uart_puts("[loong] 请先 loong update\n"); return; }
+        char *kw = next_word(&a);
+        if (fs_strcmp(sub, "show") == 0) {
+            if (!kw) { uart_puts("用法: loong show <包名>\n"); return; }
+            int at = loong_best_pkg(g_loong_idx, kw);
+            if (at < 0) { uart_puts("[loong] 无此包: "); uart_puts(kw); uart_puts("\n"); return; }
+            struct loong_pkg *p = &g_loong_idx->pkg[at];
+            uart_puts("Package: "); uart_puts(p->name); uart_puts("\n");
+            uart_puts("Version: "); uart_puts(p->ver); uart_puts("\n");
+            uart_puts("File: "); uart_puts(p->file); uart_puts("\n");
+            uart_puts("Sha256: "); uart_puts(p->sha); uart_puts("\n");
+            uart_puts("Desc: "); uart_puts(p->desc); uart_puts("\n");
+            int ins = loong_db_find(g_loong_db, kw);
+            uart_puts("Installed: ");
+            if (ins >= 0) { uart_puts(g_loong_db->ent[ins].ver); }
+            else uart_puts("no");
+            uart_puts("\n");
+            return;
+        }
+        /* list / search：每个包只显示最高版本 */
+        int shown = 0;
+        for (u32 i = 0; i < g_loong_idx->n; i++) {
+            struct loong_pkg *p = &g_loong_idx->pkg[i];
+            if (loong_best_pkg(g_loong_idx, p->name) != (int)i) continue;  /* 只列最高版本 */
+            if (fs_strcmp(sub, "search") == 0 && kw && !loong_strstr(p->name, kw)) continue;
+            int ins = loong_db_find(g_loong_db, p->name);
+            uart_puts(ins >= 0 ? "[i] " : "    ");
+            uart_puts(p->name); uart_puts("  "); uart_puts(p->ver);
+            uart_puts("  "); uart_puts(p->desc); uart_puts("\n");
+            shown++;
+        }
+        uart_puts("[loong] "); uart_putdec((u32)shown); uart_puts(" 个包\n");
+        return;
+    }
+
+    /* ---- install <包名> ---- */
+    if (fs_strcmp(sub, "install") == 0) {
+        char *name = next_word(&a);
+        if (!name) { uart_puts("用法: loong install <包名>\n"); return; }
+        if (!g_loong_ready) { uart_puts("[loong] 请先 loong update\n"); return; }
+        if (g_loong_state == LST_IDLE) g_loong_state = LST_READY;
+        g_loong_state = loong_state_next(g_loong_state, LEV_INSTALL, &g_loong_stats);
+        int at = loong_best_pkg(g_loong_idx, name);
+        if (at < 0) {
+            g_loong_state = loong_state_next(g_loong_state, LEV_FETCH_FAIL, &g_loong_stats);
+            uart_puts("[loong] 源中无此包: "); uart_puts(name); uart_puts("\n"); return;
+        }
+        struct loong_pkg *p = &g_loong_idx->pkg[at];
+        uart_puts("[loong] 下载 "); uart_puts(p->file); uart_puts(" ...\n");
+        char *body = 0; int blen = 0;
+        char url[160]; int u = 0;
+        const char u0[] = "/";
+        for (const char *q = u0; *q; q++) url[u++] = *q;
+        for (const char *q = p->file; *q && u < 158; q++) url[u++] = *q;
+        url[u] = 0;
+        if (loong_http_get(url, &body, &blen) < 0) {
+            g_loong_state = loong_state_next(g_loong_state, LEV_FETCH_FAIL, &g_loong_stats);
+            uart_puts("[loong] 下载失败\n"); return;
+        }
+        g_loong_stats.fetch_bytes += (u32)blen;
+        g_loong_state = loong_state_next(g_loong_state, LEV_FETCH_OK, &g_loong_stats);
+
+        /* 解析 .lpkg 头 */
+        char nm[32], vr[24], path[72], sha[65];
+        loong_zero(nm, sizeof nm); loong_zero(vr, sizeof vr);
+        loong_zero(path, sizeof path); loong_zero(sha, sizeof sha);
+        u32 poff = 0;
+        if (loong_parse_pkghead(body, (u32)blen, nm, sizeof nm, vr, sizeof vr,
+                                path, sizeof path, sha, sizeof sha, &poff) != 0) {
+            kfree(body);
+            g_loong_state = loong_state_next(g_loong_state, LEV_VERIFY_FAIL, &g_loong_stats);
+            uart_puts("[loong] 包格式错误\n"); return;
+        }
+        /* base64 解码 payload 到临时堆缓冲 */
+        int paylen = blen - (int)poff;
+        u8 *dec = (u8 *)kmalloc((u32)(paylen + 16));
+        if (!dec) { kfree(body); uart_puts("[loong] 内存不足\n"); return; }
+        int dlen = b64_decode(body + poff, dec, paylen + 16);
+        kfree(body);
+        if (dlen < 0 || (u32)dlen != p->size) {
+            kfree(dec);
+            g_loong_state = loong_state_next(g_loong_state, LEV_VERIFY_FAIL, &g_loong_stats);
+            uart_puts(" poff="); uart_putdec(poff); uart_puts("\n"); return;
+        }
+        /* SHA256 校验：用索引里的 Sha256（与包内 sha 一致才可信） */
+        if (!loong_verify_sha(dec, (u32)dlen, p->sha) || fs_strcmp(sha, p->sha) != 0) {
+            kfree(dec);
+            g_loong_state = loong_state_next(g_loong_state, LEV_VERIFY_FAIL, &g_loong_stats);
+            uart_puts("[loong] SHA256 校验失败，拒绝安装\n"); return;
+        }
+        g_loong_state = loong_state_next(g_loong_state, LEV_VERIFY_OK, &g_loong_stats);
+
+        /* 落盘 */
+        loong_ensure_parent(path);
+        int ino = fs_lookup(path);
+        if (ino < 0) ino = fs_createfile(path);
+        if (ino < 0 || fs_setfile(ino, dec, (u32)dlen) != 0) {
+            kfree(dec);
+            g_loong_state = loong_state_next(g_loong_state, LEV_INSTALL_FAIL, &g_loong_stats);
+            uart_puts("[loong] 落盘失败\n"); return;
+        }
+        kfree(dec);
+        if (loong_db_install(g_loong_db, nm, vr, path) < 0) {
+            uart_puts("[loong] 记账表满\n");
+        }
+        g_loong_state = loong_state_next(g_loong_state, LEV_INSTALL_OK, &g_loong_stats);
+        uart_puts("[loong] 已安装 "); uart_puts(nm); uart_puts(" "); uart_puts(vr);
+        uart_puts(" -> "); uart_puts(path); uart_puts(" ("); uart_putdec((u32)dlen); uart_puts(" B)\n");
+        g_loong_state = loong_state_next(g_loong_state, LEV_RESET, &g_loong_stats);
+        return;
+    }
+
+    /* ---- status ---- */
+    if (fs_strcmp(sub, "status") == 0) {
+        uart_puts("== LOONG status ==\n");
+        uart_puts("源: "); uart_puts(g_loong_host); uart_puts(":"); uart_putdec(g_loong_port); uart_puts("\n");
+        uart_puts("索引: "); uart_puts(g_loong_ready ? "已加载" : "未加载");
+        uart_puts("  条目="); uart_putdec(g_loong_idx->n); uart_puts("\n");
+        uart_puts("状态机: "); uart_puts((const char *)loong_state_name(g_loong_state)); uart_puts("\n");
+        uart_puts("统计: update="); uart_putdec(g_loong_stats.updates);
+        uart_puts(" ok="); uart_putdec(g_loong_stats.install_ok);
+        uart_puts(" fail="); uart_putdec(g_loong_stats.install_fail);
+        uart_puts(" verify_fail="); uart_putdec(g_loong_stats.verify_fail);
+        uart_puts(" bytes="); uart_putdec(g_loong_stats.fetch_bytes);
+        uart_puts(" state_err="); uart_putdec(g_loong_stats.state_errors); uart_puts("\n");
+        uart_puts("已装 "); uart_putdec(g_loong_db->n); uart_puts(" 个:\n");
+        for (u32 i = 0; i < g_loong_db->n; i++) {
+            if (!g_loong_db->ent[i].used) continue;
+            uart_puts("  "); uart_puts(g_loong_db->ent[i].name); uart_puts(" ");
+            uart_puts(g_loong_db->ent[i].ver); uart_puts("\n");
+        }
+        return;
+    }
+
+    uart_puts("[loong] 未知子命令: "); uart_puts(sub); uart_puts("\n");
+}
+
 /* ping <ip> [次数] */
 static void cmd_ping(char *args)
 {
@@ -3902,7 +4281,7 @@ static void cmd_irqstress(char *args)
  * 环境变量式的静态数据（版本号 / 开机墙钟）用文件内 static 变量，避免
  * 往 loongos.h 塞一堆新 extern。
  */
-#define LOS_VERSION  "LoongOS 58.0-B-sched (aarch64 / armvirt)"
+#define LOS_VERSION  "LoongOS 58.0-C-loong (aarch64 / armvirt)"
 
 static u64 g_boot_wall = 0;        /* 内核启动瞬间的墙钟 Unix 秒（rtc_init 后记录） */
 
@@ -4151,6 +4530,7 @@ static const struct cmdent CMDS[] = {
     { "wc", cmd_wc }, { "grep", cmd_grep }, { "head", cmd_head },
     { "desktop", cmd_desktop }, { "mousecal", cmd_mousecal },
     { "b64out", cmd_b64out }, { "b64in", cmd_b64in },   /* 批次2：文件进出通道 */
+    { "loong", cmd_loong },    /* LOONG 包管理器：update/list/install（刻意不写进 help / golden） */
     { "res", cmd_res },        /* R 轮资源账诊断（刻意不写进 help，保行为基线逐字一致） */
     { "smpwork", cmd_smpwork },/* 阶段9 多核工作分派演示（刻意不写进 help / 行为基线） */
     { "irqstress", cmd_irqstress }, /* 第五十三轮 高频中断压测（刻意不写进 help / 行为基线） */
@@ -5149,6 +5529,7 @@ void kernel_main(unsigned long bootinfo)
     g_boot_wall = rtc_now();          /* uptime 的开机墙钟基准 */
     ufd_init();                        /* 第五十五轮：fd/pipe 对象层开机态（静默） */
     sched_init(&g_sched);              /* 58.0-B：调度器开机态（静默，不进 golden） */
+    loong_init();                      /* LOONG 包管理器：堆分配索引/记账（静默） */
 
     /* 阶段9：拉起从核（默认启用——用户要求「把核心都用起来」）。
        从核平时 wfi 真睡（宿主 CPU ≈0%），只在收到 SGI 时被唤醒认领工作；

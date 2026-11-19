@@ -222,6 +222,8 @@ loongos/
 │   ├── fdtab.h fdtab.c test_fdtab_host.c  # 第五十八轮 58.0-A：每进程FD表+OFD共享 / 宿主单测 47/47
 │   ├── test_round58.py           # 第五十八轮：FD表+execve 双路判据
 │   ├── sched.h sched.c test_sched_host.c  # 第五十八轮 58.0-B：调度地基(五态机/时间片/轮转/yield) / 宿主单测 72/72
+│   ├── loong.h loong.c test_loong_host.c # LOONG 包管理器纯逻辑(版本比较/索引解析/记账/状态机) / 宿主 89/89
+│   ├── test_loong.py             # LOONG 端到端判据(Docker 源→QEMU TCG→update/install/校验/落盘/运行)
 │   ├── test_round59.py           # 第五十八轮 58.0-B：抢占式调度地基双路判据
 │   ├── font8x16.h font_cjk.h linker.ld auth_cred.h
 │   ├── user/             # 用户态 ELF 样例（u55 管道、u56_vfs、u57_proc fork/wait、u58 FD/execve、u59 调度）
@@ -235,6 +237,7 @@ loongos/
 │   ├── test_uefi.sh test_drivers.sh test_wm_host.c test_net_host.c
 │   ├── LOONGOS_*_TODO.md  # 各阶段任务清单（内核演进档案）
 │   └── docs/             # 桌面架构、检查与修复记录、内核空间预算与扩容指引、实测截图
+├── loong-repo/           # LOONG 软件源：Docker 静态 HTTP 源 + 打包/索引工具 + NAS 部署说明
 └── 手机版/               # Termux + QEMU 运行说明与修复记录
 ```
 
@@ -271,6 +274,8 @@ loongos/
 - [本体/docs/第五十七轮_进程模型判据报告.json](本体/docs/第五十七轮_进程模型判据报告.json) — 第五十七轮 21 项双路判据、fork/wait/procexit、父子地址隔离、僵尸回收零残留与真机 KVM 未执行留痕
 - [本体/docs/第五十八轮_FD与execve判据报告.json](本体/docs/第五十八轮_FD与execve判据报告.json) — 第五十八轮 22 项双路判据、每进程 FD 表（fork 共享 OFD / close 后 -1 / 子 close 不污染父）、完整 execve（pid 保留/参数区/成功不返回/失败回滚）与真机 KVM 未执行留痕
 - [本体/docs/第五十八轮B_抢占式调度地基判据报告.json](本体/docs/第五十八轮B_抢占式调度地基判据报告.json) — 58.0-B 26 项双路判据、五态调度状态机/时间片/轮转/yield/统计、宿主 72/72、状态迁移与 yield 记账、真抢占(IRQ 切帧)后置与真机 KVM 未执行留痕
+- [本体/docs/LOONG包管理器判据报告.json](本体/docs/LOONG包管理器判据报告.json) — LOONG 包管理器（58.0-C）16 项端到端判据：Docker 源→QEMU TCG→update/install/校验/落盘/真实 ELF 运行；宿主 89/89；实测抓修 7 个真 bug；明文 HTTP/真机 KVM 未执行留痕
+- [loong-repo/README.md](loong-repo/README.md) — LOONG 软件源 Docker 部署说明（NAS 一键部署、包格式、发布新包、安全边界）
 - `LOONGOS_*_TODO.md` 与 `docs/检查与修复记录*.md` — 各阶段任务清单
 
 ## 许可证

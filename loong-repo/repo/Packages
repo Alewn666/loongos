@@ -1,0 +1,20 @@
+Package: hello
+Version: 1.0.0
+Size: 5624
+File: packages/hello_1.0.0.lpkg
+Sha256: 20db92b88e1b65cff5430849fdb5aee4e796abba661028df896806953ce656e9
+Description: Hello World demo
+
+Package: hello
+Version: 2.0.0
+Size: 5624
+File: packages/hello_2.0.0.lpkg
+Sha256: 20db92b88e1b65cff5430849fdb5aee4e796abba661028df896806953ce656e9
+Description: Hello World demo v2
+
+Package: sched
+Version: 1.0.0
+Size: 7168
+File: packages/sched_1.0.0.lpkg
+Sha256: 00aa912f120bc68ea0d7ed21e0567997fb034b2111c7fa707a217f4c4992c13d
+Description: Scheduler demo

@@ -1,0 +1,138 @@
+{
+  "checks": [
+    {
+      "name": "0 源包独立重算：payload 5624 B / sha 20db92b88e1b",
+      "ok": true,
+      "detail": "5624"
+    },
+    {
+      "name": "1 Docker 源启动 + HTTP 200",
+      "ok": true,
+      "detail": "loong-e2e-src"
+    },
+    {
+      "name": "2 help 仍含 run（golden 命令集未删）",
+      "ok": true,
+      "detail": "help\n\n命令清单:\n\n  ls [路径]            列目录（无路径=当前目录）\n\n  cd [路径]            切换当前目录（默认 /；支持 . .. 和相对路径）\n\n  "
+    },
+    {
+      "name": "3 cat /etc/hostname 仍 myos（老 fs 逐字不变）",
+      "ok": true,
+      "detail": "cat /etc/hostname\n\nmyos\n> "
+    },
+    {
+      "name": "4 loong sources 设置源成功",
+      "ok": true,
+      "detail": "loong sources 10.0.2.2 18080\n\n[loong] 源已设为 10.0.2.2:18080\n\n> "
+    },
+    {
+      "name": "5 loong update 读到 3 个包版本",
+      "ok": true,
+      "detail": "loong update\n\n[loong] 更新索引 from 10.0.2.2...\n\n[loong] OK 已读 3 个包版本\n\n> "
+    },
+    {
+      "name": "6 list 显示 hello 最高版本 2.0.0",
+      "ok": true,
+      "detail": "loong list\n\n    hello  2.0.0  Hello World demo v2\n\n    sched  1.0.0  Scheduler demo\n\n[loong] 2 个包\n\n> "
+    },
+    {
+      "name": "7 list 不显示被取代的 hello 旧版本 1.0.0",
+      "ok": true,
+      "detail": "loong list\n\n    hello  2.0.0  Hello World demo v2\n\n    sched  1.0.0  Scheduler demo\n\n[loong] 2 个包\n\n> "
+    },
+    {
+      "name": "8 list 含 sched 包",
+      "ok": true,
+      "detail": "loong list\n\n    hello  2.0.0  Hello World demo v2\n\n    sched  1.0.0  Scheduler demo\n\n[loong] 2 个包\n\n> "
+    },
+    {
+      "name": "9 show hello 显示 2.0.0 与包文件",
+      "ok": true,
+      "detail": "loong show hello\n\nPackage: hello\n\nVersion: 2.0.0\n\nFile: packages/hello_2.0.0.lpkg\n\nSha256: 20db92b88e1b65cff5430849fdb5aee4e796abba661028df896806953ce656e9\n\nDesc: Hello World demo v2\n\nInstalled: no\n\n>"
+    },
+    {
+      "name": "10 search sched 命中 sched、不含 hello",
+      "ok": true,
+      "detail": "loong search sched\n\n    sched  1.0.0  Scheduler demo\n\n[loong] 1 个包\n\n> "
+    },
+    {
+      "name": "11 install 报告成功且为最高版本 2.0.0",
+      "ok": true,
+      "detail": "loong install hello\n\n[loong] 下载 packages/hello_2.0.0.lpkg ...\n\n[loong] 已安装 hello 2.0.0 -> /home/hello.elf (5624 B)\n\n> "
+    },
+    {
+      "name": "12 落盘字节数 = 源包 payload 5624 B（独立读 ls）",
+      "ok": true,
+      "detail": "landed=5624 exp=5624"
+    },
+    {
+      "name": "13 安装的程序可在 EL0 真实运行（输出含 /bin/hello）",
+      "ok": true,
+      "detail": " x8=0 write/2 open/3 read/4 close/5 lseek · x8=1 exit）\n\n你好！我是 /bin/hello，正跑在 EL0 用户态\n我住在 0x401C0000 起的用户区，摸不到内核的内存\n跟内核说话只能走 syscall。下面调 exit(0) 体面退出\n\n\n[run] 程序退出 code=0\n\n[el1] 已从 EL0 撤回内核，shell 继续\n\n> "
+    },
+    {
+      "name": "14 status 记账含 hello 2.0.0 / install_ok>=1",
+      "ok": true,
+      "detail": "loong status\n\n== LOONG status ==\n\n源: 10.0.2.2:18080\n\n索引: 已加载  条目=3\n\n状态机: IDLE\n\n统计: update=1 ok=1 fail=0 verify_fail=0 bytes=7759 state_err=0\n\n已装 1 个:\n\n  hello 2.0.0\n\n> "
+    },
+    {
+      "name": "15 重复 install 幂等（记账表仅 1 条 hello）",
+      "ok": true,
+      "detail": "count=1"
+    }
+  ],
+  "exp_payload_len": 5624,
+  "exp_payload_sha": "20db92b88e1b65cff5430849fdb5aee4e796abba661028df896806953ce656e9",
+  "landed": 5624,
+  "n_pkg": 3,
+  "log": "/tmp/loong_e2e.log",
+  "title": "LOONG 包管理器（LoongOS 58.0-C）端到端判据报告",
+  "design": {
+    "name": "LOONG = LoongOS Online Network Gateway（包管理器，类比 apt/ATP）",
+    "client": "内核 cmd_loong：sources/update/list/search/show/install/status；纯逻辑在 loong.c/h",
+    "source": "NAS Docker 静态 HTTP 源（loong-repo/），托管 Packages 索引 + .lpkg 包",
+    "protocol": "HTTP/1.0 GET over 教学 TCP 栈；.lpkg 纯文本容器 + base64 payload + SHA256",
+    "money": "完全可读可改的包管理链路； installations 走 SHA256 校验、最高版本选择、幂等记账",
+    "memory": "idx/db 走 kmalloc 堆不占 BSS；USER_BASE 0x40238000→0x4023c000 扩容 16KB，余量 8KB 充裕"
+  },
+  "host_unit_test": {
+    "test_loong_host.c": "89/89 (-Werror)",
+    "test_net_host.c": "52/52",
+    "test_sched_host.c": "72/72"
+  },
+  "bugs_caught_and_fixed": [
+    "loong_parse_index 文本以\\n结尾时死循环（while i<=len）",
+    "索引/pkghead 字段值前导空格未 trim（l_trim 起点传错）",
+    "magic 比较用整行 strcmp 导致恒失败（改按长度 l_keyeq）",
+    "g_loong_idx/db 已是指针却传 & 变二级指针 → 堆/栈损坏崩溃",
+    "教学 TCP tcp_send 收到 CLOSE_WAIT 误判失败（请求已送达应继续收）",
+    "教学 TCP 零窗口死锁：大响应卡在 ~3.9KB（tcp_recv 读后补发窗口更新 ACK）",
+    "b64_decode 靠 NUL 判结束，HTTP body 尾部无 NUL 导致多解垃圾（body 显式 NUL 终止）"
+  ],
+  "honest_boundaries": [
+    "明文 HTTP，无 TLS：仅可信内网使用，不暴露公网",
+    "真机 KVM 未执行（宿主无 aarch64 KVM）；判据为 QEMU TCG，网卡 virtio + user/SLIRP",
+    "教学 TCP 无乱序重组/拥塞控制；已针对 SLIRP 常见场景修复并端到端验证，未覆盖所有网络拓扑",
+    "软件源部署需用户在自有 NAS 上执行 deploy.sh；本次判据用等价的本地 Docker 源",
+    "NAS 实际同步未执行：当前环境无 NAS 凭据，部署工程已备齐交付"
+  ],
+  "regression": {
+    "script": "sh run_regression_r.sh（15 项）",
+    "result": "14/15 PASS；第15项 install_disk 首跑偶发失败（install yes 报 esp write off=1507328，日志夹 task1 心跳，QEMU tty 时序打断写盘交互），单独重跑全过(42s)",
+    "item15_rerun": "PASS（42s，全部通过）",
+    "judgement": "LOONG 改动只在 EL1 shell 命令 + TCP 栈，安装路径 g_proc_active=0 不触及；与 58.0-B 轮同款偶发，判定非回归",
+    "golden_29": "逐字一致",
+    "bss_margin_bytes": 8192,
+    "user_base": "0x4023c000（为 LOONG 上移 16KB）"
+  },
+  "iso": {
+    "path": "iso/自研内核ISO/loongos.iso",
+    "md5": "3a5fe9abbf9517f34e910d89c1622f29",
+    "kernel_md5": "7889eb45f9adec90e615f3670302be2b",
+    "verified": "ISO 内 kernel.elf md5 与本地新内核一致"
+  },
+  "sync": {
+    "github": "待提交",
+    "nas": "未同步：当前环境无 NAS 凭据；部署工程 loong-repo/ 已备齐，需在用户 NAS 执行 deploy.sh"
+  }
+}

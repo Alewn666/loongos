@@ -219,6 +219,25 @@ FILES = [
     ('本体/user/u59_sched.c',        '本体/user/u59_sched.c'),
     ('本体/test_round59.py',         '本体/test_round59.py'),
     ('本体/docs/第五十八轮B_抢占式调度地基判据报告.json', '本体/docs/第五十八轮B_抢占式调度地基判据报告.json'),
+    # LOONG 包管理器（58.0-C，2026-11-19）：新编译单元 + 纯逻辑 + 判据 + Docker 源工程
+    # 注：kernel.c / kernel.elf / kernel.o / build.sh / bss_budget.txt / README.md /
+    #     docs/检查与修复记录.md / docs/演进路线_逐项状态.md 已在上面登记。
+    ('本体/loong.h',                 '本体/loong.h'),
+    ('本体/loong.c',                 '本体/loong.c'),
+    ('本体/test_loong_host.c',       '本体/test_loong_host.c'),
+    ('本体/test_loong.py',           '本体/test_loong.py'),
+    ('本体/docs/LOONG包管理器判据报告.json', '本体/docs/LOONG包管理器判据报告.json'),
+    ('loong-repo/Dockerfile',        'loong-repo/Dockerfile'),
+    ('loong-repo/docker-compose.yml','loong-repo/docker-compose.yml'),
+    ('loong-repo/deploy.sh',         'loong-repo/deploy.sh'),
+    ('loong-repo/README.md',         'loong-repo/README.md'),
+    ('loong-repo/tools/make_pkg.py', 'loong-repo/tools/make_pkg.py'),
+    ('loong-repo/tools/gen_packages.py', 'loong-repo/tools/gen_packages.py'),
+    ('loong-repo/repo/Packages',     'loong-repo/repo/Packages'),
+    ('loong-repo/repo/Release',      'loong-repo/repo/Release'),
+    ('loong-repo/repo/packages/hello_1.0.0.lpkg', 'loong-repo/repo/packages/hello_1.0.0.lpkg'),
+    ('loong-repo/repo/packages/hello_2.0.0.lpkg', 'loong-repo/repo/packages/hello_2.0.0.lpkg'),
+    ('loong-repo/repo/packages/sched_1.0.0.lpkg', 'loong-repo/repo/packages/sched_1.0.0.lpkg'),
 ]
 
 def md5_local(path):

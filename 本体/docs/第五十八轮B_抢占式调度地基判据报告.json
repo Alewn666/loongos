@@ -1,8 +1,8 @@
 {
   "title": "LoongOS 第五十八轮 B 58.0-B 抢占式调度地基判据报告",
-  "kernel_md5": "5d1e1b480d34a20bd558a36f3f2a2719",
+  "kernel_md5": "88f6100de7825494a38f110a1b67d5cd",
   "elf_sched_md5": "574d3e1002b5b9345a922b145073cd12",
-  "generated": "2026-11-19 07:12:58",
+  "generated": "2026-11-19 21:32:53",
   "modes": {
     "TCG": {
       "mode": "TCG",

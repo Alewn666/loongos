@@ -186,7 +186,8 @@ int tcp_send(const void *buf, int len)
         while (tcp_cnt() < dl) {
             extern void net_poll(void);
             net_poll();
-            if (t_snd_una == base + (u32)t_txlen) { t_txlen = 0; return len; }   /* 全确认 */
+            /* 全确认，或已收到响应数据（说明对端收到请求，ACK 可能捎带/丢失） */
+            if (t_snd_una == base + (u32)t_txlen || t_rx_len > 0) { t_txlen = 0; return len; }
             if (t_state != TS_ESTAB) { return -1; }
         }
         if (++t_retries > TCP_RETRIES) { t_txlen = 0; tcp_reset_state(); return -2; }
@@ -209,6 +210,11 @@ int tcp_recv(void *buf, int max, int timeout_ms)
     t_rx_head += n;
     t_rx_len -= n;
     if (t_rx_len == 0) t_rx_head = 0;
+    /* 零窗口恢复：应用读走数据后接收窗口变大，主动 ACK 通告新窗口。
+       否则对端在大文件传输中看到窗口=0 会一直停发（实测 LOONG 下载
+       7.7KB 包卡在 ~3.9KB）。这是 RFC 的窗口更新，教学栈此前缺失。 */
+    if (n > 0 && t_state == TS_ESTAB)
+        send_seg(t_snd_nxt, t_rcv_nxt, TCP_F_ACK, 0, 0, t_rip, t_rport, t_lport, t_myip);
     return n;
 }
 
