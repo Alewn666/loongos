@@ -132,7 +132,7 @@
     "verified": "ISO 内 kernel.elf md5 与本地新内核一致"
   },
   "sync": {
-    "github": "待提交",
+    "github": "8584548 已提交并推送 origin/main（本地=远端一致）",
     "nas": "未同步：当前环境无 NAS 凭据；部署工程 loong-repo/ 已备齐，需在用户 NAS 执行 deploy.sh"
   }
 }
