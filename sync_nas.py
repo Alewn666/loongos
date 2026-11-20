@@ -249,6 +249,7 @@ FILES = [
     ('本体/test_round60.py',          '本体/test_round60.py'),
     ('本体/docs/LoongOS开发者指南.md', '本体/docs/LoongOS开发者指南.md'),
     ('本体/docs/第五十九轮A_开发者API判据报告.json', '本体/docs/第五十九轮A_开发者API判据报告.json'),
+    ('本体/docs/第五十九轮A_交付报告.md', '本体/docs/第五十九轮A_交付报告.md'),
 ]
 
 def md5_local(path):
