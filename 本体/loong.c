@@ -204,8 +204,9 @@ int loong_db_install(struct loong_db *db, const char *name,
 
 int loong_db_remove(struct loong_db *db, const char *name)
 {
+    if (!db || !name) return -1;              /* 判空须在解引用之前 */
     int at = loong_db_find(db, name);
-    if (at < 0 || !db) return -1;
+    if (at < 0) return -1;
     l_zero(&db->ent[at], sizeof db->ent[at]);
     return 0;
 }

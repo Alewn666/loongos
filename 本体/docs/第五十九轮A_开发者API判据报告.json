@@ -1,0 +1,87 @@
+{
+  "mode": "TCG",
+  "cmd": "qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a57 -m 256M -kernel /workspace/安卓/loongos/本体/kernel.elf -nographic -no-reboot",
+  "output": "run /home/u60api\n\n[run] 装载 /home/u60api entry=0x0000000040240000 → 进 EL0（syscall: x8=0 write/2 open/3 read/4 close/5 lseek · x8=1 exit）\n\n== LoongOS Developer API demo (59.0-A) ==\n\n  uname: LoongOS 59.0-A aarch64\n\n  wall  = 1795170183 s\n\n  mono  = 7.458239824 s\n\n  uptime= 7 s\n\n  rng   = unavailable\n\n  fs    = used 30 / total 256 B\n\n  heap  = used 6664 peak 7688 B\n\n  pid   = 1 ppid  = 0\n\n  nanosleep(10ms) ok\n\n== API demo done ==\n\n\n\n[run] 程序退出 code=0\n\n[el1] 已从 EL0 撤回内核，shell 继续\n\n> ",
+  "checks": [
+    {
+      "name": "1 内核横幅 + shell 提示符就绪",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "2 help 仍含 run（命令集未删）",
+      "ok": true,
+      "detail": "help\n\n命令清单:\n\n  ls [路径]            列目录（无路径=当前目录）\n\n  cd [路径]            切换当前目录（默认 /；支持 . .. 和相对路径）\n\n  "
+    },
+    {
+      "name": "3 cat /etc/hostname 仍 myos",
+      "ok": true,
+      "detail": "cat /etc/hostname\n\nmyos\n> "
+    },
+    {
+      "name": "4 老程序 u55test.elf 注入字节一致",
+      "ok": true,
+      "detail": "写入 11296/期望 11296"
+    },
+    {
+      "name": "5 老 syscall 程序仍 code=0 退出（0~27 零扰动）",
+      "ok": true,
+      "detail": "_self_rc=0\n[R55] chk kill_self_ok ok\n[R55] stat_badptr_rc=-1\n[R55] chk stat_reject_badptr ok\n[R55] PASS=35\n[R55] FAIL=0\n[R55] ==== u55test done ====\n\n\n[run] 程序退出 code=0\n\n[el1] 已从 EL0 撤回内核，shell 继续\n\n> "
+    },
+    {
+      "name": "6 u60api.elf 注入字节一致",
+      "ok": true,
+      "detail": "写入 6984/期望 6984"
+    },
+    {
+      "name": "7 API 演示程序跑完并体面退出 code=0（无 EL0 fault）",
+      "ok": true,
+      "detail": "name: LoongOS 59.0-A aarch64\n\n  wall  = 1795170183 s\n\n  mono  = 7.458239824 s\n\n  uptime= 7 s\n\n  rng   = unavailable\n\n  fs    = used 30 / total 256 B\n\n  heap  = used 6664 peak 7688 B\n\n  pid   = 1 ppid "
+    },
+    {
+      "name": "8 uname 返回 LoongOS / 59.0-A / aarch64",
+      "ok": true,
+      "detail": "run /home/u60api\n\n[run] 装载 /home/u60api entry=0x0000000040240000 → 进 EL0（syscall: x8=0 write/2 open/3 read/4 close/5 lseek · x8=1 exit）\n\n== LoongOS Developer API demo (59.0-A) ==\n\n  uname: LoongOS 59."
+    },
+    {
+      "name": "9 clock_gettime(墙钟) 返回合理 Unix 秒（>1577836800=2020）",
+      "ok": true,
+      "detail": "1795170183"
+    },
+    {
+      "name": "10 clock_gettime(单调钟) 返回非 0 秒",
+      "ok": true,
+      "detail": "7"
+    },
+    {
+      "name": "11 uptime 返回非负秒",
+      "ok": true,
+      "detail": "7"
+    },
+    {
+      "name": "12 getrandom 返回真随机字节或明确 unavailable",
+      "ok": true,
+      "detail": "unavailable"
+    },
+    {
+      "name": "13 fsstat 返回 used<=total 且 total>0",
+      "ok": true,
+      "detail": "('30', '256')"
+    },
+    {
+      "name": "14 meminfo 返回 used<=peak 且 used>0",
+      "ok": true,
+      "detail": "('6664', '7688')"
+    },
+    {
+      "name": "15 getpid/getppid 返回合理 pid/ppid",
+      "ok": true,
+      "detail": "('1', '0')"
+    },
+    {
+      "name": "16 nanosleep(10ms) 未卡死且返回 ok",
+      "ok": true,
+      "detail": "  = unavailable\n\n  fs    = used 30 / total 256 B\n\n  heap  = used 6664 peak 7688 B\n\n  pid   = 1 ppid  = 0\n\n  nanosleep(10ms) ok\n\n== API demo done ==\n\n\n\n[run] 程序退出 code=0\n\n[el1] 已从 EL0 撤回内核，shell 继续\n\n> "
+    }
+  ]
+}

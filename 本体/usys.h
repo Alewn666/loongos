@@ -48,7 +48,49 @@ typedef unsigned long  u64;
 #define SYS_vfsread   20    /* vfsread(path,buf,len) -> 字节数 / -1（读 /proc /dev 伪文件） */
 #define SYS_vfsinfo   21    /* vfsinfo() -> 挂载点数量 */
 /* 22~25 定义在 proc.h（第五十七轮进程模型），26/27 定义在 sched.h（58.0-B 调度器） */
-#define SYS_max       28    /* 号上限（不含） */
+
+/* ---- 第五十九轮 59.0-A：开发者 API 扩展层（syscall 28~35）----
+ * 全部是「转发内核已有能力」的薄 syscall，不含新内核算法：
+ *   - 不改 0~27 任何分支、不动 golden_behavior.txt；
+ *   - 新号只追加在 svc_dispatch 末尾；用户态封装见 user/loslib.h。
+ * 编号与结构同样是用户态/内核共享 ABI，改这里须两侧重新编译。 */
+#define SYS_clock_gettime 28   /* clock_gettime(clk, struct utime*) -> 0 / -1；clk:0=墙钟 1=单调 */
+#define SYS_getrandom     29   /* getrandom(buf,len) -> 实得字节数 / -1（virtio-rng，无设备则 -1） */
+#define SYS_uname         30   /* uname(struct utsname*) -> 0 / -1 */
+#define SYS_getppid       31   /* getppid() -> 父 pid（pid=1 的父返回 0） */
+#define SYS_nanosleep     32   /* nanosleep(const struct utime*) -> 0 / -1（忙等，教学实现） */
+#define SYS_fsstat        33   /* fsstat(struct ufsstat*) -> 0 / -1（内存盘块位图统计） */
+#define SYS_meminfo       34   /* meminfo(struct umeminfo*) -> 0 / -1（kmalloc 堆统计） */
+#define SYS_uptime        35   /* uptime(struct utime*) -> 0 / -1（单调递增时间） */
+
+#define SYS_max       36    /* 号上限（不含） */
+
+/* 时间结构（16B，秒+纳秒，定长无指针） */
+struct utime {
+    u64 sec;                    /* clk=0 墙钟 Unix 秒 / clk=1 单调秒 */
+    u64 nsec;                   /* 纳秒部分 */
+};
+/* 系统信息（定长字符串，无指针，便于用户态按偏移解析） */
+struct utsname {
+    char sysname[16];           /* "LoongOS" */
+    char release[16];           /* 版本串，如 "59.0-A" */
+    char version[16];           /* 内核构建标识 */
+    char machine[16];           /* "aarch64" */
+};
+/* 文件系统统计（内存盘） */
+struct ufsstat {
+    u32 used_bytes;
+    u32 total_bytes;
+    u32 blocks;
+    u32 reserved;
+};
+/* 堆内存统计 */
+struct umeminfo {
+    u32 used_bytes;
+    u32 peak_bytes;
+    u32 live_objs;
+    u32 fail_cnt;
+};
 
 /* ---- stat 的用户可见结构（32B，纯定长，无指针，方便用户态解析）----
  * 偏移：size@0 ino@4 type@8 mode@10 uid@12 nlink@14 mtime@16 _pad@20 wall@24。

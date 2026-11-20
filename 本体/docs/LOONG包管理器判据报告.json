@@ -13,7 +13,7 @@
     {
       "name": "2 help 仍含 run（golden 命令集未删）",
       "ok": true,
-      "detail": "help\n\n命令清单:\n\n  ls [路径]            列目录（无路径=当前目录）\n\n  cd [路径]            切换当前目录（默认 /；支持 . .. 和相对路径）\n\n  "
+      "detail": " 10.0.2.15  服务器 10.0.2.2\n\n[net ] 发 REQUEST …\n\n[net ] IP   10.0.2.15\n\n[net ] 掩码 255.255.255.0\n\n[net ]"
     },
     {
       "name": "3 cat /etc/hostname 仍 myos（老 fs 逐字不变）",
@@ -85,54 +85,5 @@
   "exp_payload_sha": "20db92b88e1b65cff5430849fdb5aee4e796abba661028df896806953ce656e9",
   "landed": 5624,
   "n_pkg": 3,
-  "log": "/tmp/loong_e2e.log",
-  "title": "LOONG 包管理器（LoongOS 58.0-C）端到端判据报告",
-  "design": {
-    "name": "LOONG = LoongOS Online Network Gateway（包管理器，类比 apt/ATP）",
-    "client": "内核 cmd_loong：sources/update/list/search/show/install/status；纯逻辑在 loong.c/h",
-    "source": "NAS Docker 静态 HTTP 源（loong-repo/），托管 Packages 索引 + .lpkg 包",
-    "protocol": "HTTP/1.0 GET over 教学 TCP 栈；.lpkg 纯文本容器 + base64 payload + SHA256",
-    "money": "完全可读可改的包管理链路； installations 走 SHA256 校验、最高版本选择、幂等记账",
-    "memory": "idx/db 走 kmalloc 堆不占 BSS；USER_BASE 0x40238000→0x4023c000 扩容 16KB，余量 8KB 充裕"
-  },
-  "host_unit_test": {
-    "test_loong_host.c": "89/89 (-Werror)",
-    "test_net_host.c": "52/52",
-    "test_sched_host.c": "72/72"
-  },
-  "bugs_caught_and_fixed": [
-    "loong_parse_index 文本以\\n结尾时死循环（while i<=len）",
-    "索引/pkghead 字段值前导空格未 trim（l_trim 起点传错）",
-    "magic 比较用整行 strcmp 导致恒失败（改按长度 l_keyeq）",
-    "g_loong_idx/db 已是指针却传 & 变二级指针 → 堆/栈损坏崩溃",
-    "教学 TCP tcp_send 收到 CLOSE_WAIT 误判失败（请求已送达应继续收）",
-    "教学 TCP 零窗口死锁：大响应卡在 ~3.9KB（tcp_recv 读后补发窗口更新 ACK）",
-    "b64_decode 靠 NUL 判结束，HTTP body 尾部无 NUL 导致多解垃圾（body 显式 NUL 终止）"
-  ],
-  "honest_boundaries": [
-    "明文 HTTP，无 TLS：仅可信内网使用，不暴露公网",
-    "真机 KVM 未执行（宿主无 aarch64 KVM）；判据为 QEMU TCG，网卡 virtio + user/SLIRP",
-    "教学 TCP 无乱序重组/拥塞控制；已针对 SLIRP 常见场景修复并端到端验证，未覆盖所有网络拓扑",
-    "软件源部署需用户在自有 NAS 上执行 deploy.sh；本次判据用等价的本地 Docker 源",
-    "NAS 实际同步未执行：当前环境无 NAS 凭据，部署工程已备齐交付"
-  ],
-  "regression": {
-    "script": "sh run_regression_r.sh（15 项）",
-    "result": "14/15 PASS；第15项 install_disk 首跑偶发失败（install yes 报 esp write off=1507328，日志夹 task1 心跳，QEMU tty 时序打断写盘交互），单独重跑全过(42s)",
-    "item15_rerun": "PASS（42s，全部通过）",
-    "judgement": "LOONG 改动只在 EL1 shell 命令 + TCP 栈，安装路径 g_proc_active=0 不触及；与 58.0-B 轮同款偶发，判定非回归",
-    "golden_29": "逐字一致",
-    "bss_margin_bytes": 8192,
-    "user_base": "0x4023c000（为 LOONG 上移 16KB）"
-  },
-  "iso": {
-    "path": "iso/自研内核ISO/loongos.iso",
-    "md5": "3a5fe9abbf9517f34e910d89c1622f29",
-    "kernel_md5": "7889eb45f9adec90e615f3670302be2b",
-    "verified": "ISO 内 kernel.elf md5 与本地新内核一致"
-  },
-  "sync": {
-    "github": "8584548 已提交并推送 origin/main（本地=远端一致）",
-    "nas": "未同步：当前环境无 NAS 凭据；部署工程 loong-repo/ 已备齐，需在用户 NAS 执行 deploy.sh"
-  }
+  "log": "/tmp/loong_e2e.log"
 }

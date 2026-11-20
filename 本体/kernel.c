@@ -2664,6 +2664,91 @@ static void svc_dispatch(struct regs *f)
         f->x[0] = 0;
         return;
     }
+
+    /* ===== 第五十九轮 59.0-A：开发者 API（syscall 28~35，纯转发已有能力）=====
+       全部追加在 0~27 之后，golden_behavior.txt 与老 ELF 零扰动。
+       用户缓冲一律经 u_range_ok 校验，逐字段写避免 padding 差异。 */
+    if (f->x[8] == SYS_clock_gettime) {
+        u64 p = f->x[0];                /* struct utime*（16B：sec@0 nsec@8） */
+        if (!u_range_ok(p, 16)) { f->x[0] = (u64)-1; return; }
+        u64 *out = (u64 *)(unsigned long)p;
+        if (f->x[1] == 0) {             /* 墙钟：PL031 真实 Unix 秒 */
+            out[0] = rtc_now(); out[1] = 0;
+        } else {                        /* 单调：cntpct / freq */
+            u64 cyc, fr;
+            __asm__ volatile("mrs %0, cntpct_el0" : "=r"(cyc));
+            __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(fr));
+            if (!fr) { f->x[0] = (u64)-1; return; }
+            out[0] = cyc / fr; out[1] = (cyc % fr) * 1000000000ull / fr;
+        }
+        f->x[0] = 0; return;
+    }
+    if (f->x[8] == SYS_getrandom) {
+        u64 p = f->x[0], n = f->x[1];
+        if (!rng_present() || !u_range_ok(p, n) || n == 0) { f->x[0] = (u64)-1; return; }
+        f->x[0] = (u64)rng_get((void *)(unsigned long)p, (u32)n); return;
+    }
+    if (f->x[8] == SYS_uname) {
+        u64 p = f->x[0];                /* struct utsname*（64B，4×16） */
+        if (!u_range_ok(p, 64)) { f->x[0] = (u64)-1; return; }
+        static const char u_sys[16] = "LoongOS";
+        static const char u_rel[16] = "59.0-A";
+        static const char u_ver[16] = "loong-dev-api";
+        static const char u_mach[16] = "aarch64";
+        char *o = (char *)(unsigned long)p;
+        for (int i = 0; i < 16; i++) { o[i]=u_sys[i]; o[16+i]=u_rel[i]; o[32+i]=u_ver[i]; o[48+i]=u_mach[i]; }
+        f->x[0] = 0; return;
+    }
+    if (f->x[8] == SYS_getppid) {
+        u32 me = (u32)g_cpid;
+        if (me == 1) { f->x[0] = 0; return; }           /* 根进程的父记为 0 */
+        struct proc *cur = proc_find(g_procs, NPROC, me);
+        f->x[0] = cur ? (u64)cur->ppid : (u64)-1; return;
+    }
+    if (f->x[8] == SYS_nanosleep) {
+        u64 p = f->x[0];                /* const struct utime* */
+        if (!u_range_ok(p, 16)) { f->x[0] = (u64)-1; return; }
+        u64 *in = (u64 *)(unsigned long)p;
+        u64 sec = in[0], nsec = in[1];
+        u64 cyc, fr;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(fr));
+        if (!fr) { f->x[0] = (u64)-1; return; }
+        /* 教学忙等：秒 + 纳秒换算成 cycle；上限 2 秒防恶意长睡卡死 shell */
+        if (sec > 2) sec = 2;
+        u64 wait = sec * fr + (nsec * fr) / 1000000000ull;
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(cyc));
+        u64 until = cyc + wait;
+        for (;;) { __asm__ volatile("mrs %0, cntpct_el0" : "=r"(cyc)); if (cyc >= until) break; __asm__ volatile("nop"); }
+        f->x[0] = 0; return;
+    }
+    if (f->x[8] == SYS_fsstat) {
+        u64 p = f->x[0];                /* struct ufsstat*（16B，4×u32） */
+        if (!u_range_ok(p, 16)) { f->x[0] = (u64)-1; return; }
+        u32 used = 0, total = 0; fs_statfs(&used, &total);
+        u32 *o = (u32 *)(unsigned long)p;
+        o[0] = used; o[1] = total; o[2] = fs_blocks(); o[3] = 0;
+        f->x[0] = 0; return;
+    }
+    if (f->x[8] == SYS_meminfo) {
+        u64 p = f->x[0];                /* struct umeminfo*（16B，4×u32） */
+        if (!u_range_ok(p, 16)) { f->x[0] = (u64)-1; return; }
+        u32 tp=0, fp=0, ub=0, pb=0, lo=0, ac=0, fc=0, ff=0, bf=0;
+        mm_stat(&tp, &fp, &ub, &pb, &lo, &ac, &fc, &ff, &bf);
+        u32 *o = (u32 *)(unsigned long)p;
+        o[0] = ub; o[1] = pb; o[2] = lo; o[3] = ff;
+        f->x[0] = 0; return;
+    }
+    if (f->x[8] == SYS_uptime) {
+        u64 p = f->x[0];                /* struct utime*（16B） */
+        if (!u_range_ok(p, 16)) { f->x[0] = (u64)-1; return; }
+        u64 cyc, fr;
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(cyc));
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(fr));
+        u64 *out = (u64 *)(unsigned long)p;
+        if (!fr) { f->x[0] = (u64)-1; return; }
+        out[0] = cyc / fr; out[1] = (cyc % fr) * 1000000000ull / fr;
+        f->x[0] = 0; return;
+    }
     if (f->x[8] == 1) {                                    /* exit：体面结束用户程序 */
         uart_puts("\n[run] 程序退出 code="); uart_putdec((u32)f->x[0]); uart_puts("\n");
         user_running = 0;
@@ -3851,9 +3936,11 @@ static int loong_http_get(const char *path, char **out, int *out_len)
             if (got <= 0) break;               /* 0=超时无数据, <0=连接已关 */
             if (total + got > cap) {            /* 扩容：kmalloc 新块 + 拷贝 */
                 int ncap = cap * 2;
-                if (ncap > 65536) break;
+                if (ncap > 65536) {              /* 超大响应：放弃本次，重试而非静默截断 */
+                    kfree(buf); buf = 0; total = 0; break;
+                }
                 char *nb = (char *)kmalloc((u32)ncap);
-                if (!nb) break;
+                if (!nb) { kfree(buf); buf = 0; total = 0; break; }
                 for (int i = 0; i < total; i++) nb[i] = buf[i];
                 kfree(buf); buf = nb; cap = ncap;
             }
@@ -3902,6 +3989,9 @@ static void loong_ensure_parent(const char *path)
 /* 从 hex 串计算 SHA256 并比对（payload 二进制）。返回 1=通过 */
 static int loong_verify_sha(const u8 *data, u32 len, const char *hex)
 {
+    if (!hex) return 0;
+    /* 防御：hex 必须是完整 64 字符，否则下面 h[i]/hex[i] 会越界读。 */
+    for (int i = 0; i < 64; i++) if (!hex[i]) return 0;
     u8 digest[32]; char h[65];
     sha256(data, len, digest);
     to_hex(digest, 32, h);
@@ -4281,7 +4371,7 @@ static void cmd_irqstress(char *args)
  * 环境变量式的静态数据（版本号 / 开机墙钟）用文件内 static 变量，避免
  * 往 loongos.h 塞一堆新 extern。
  */
-#define LOS_VERSION  "LoongOS 58.0-C-loong (aarch64 / armvirt)"
+#define LOS_VERSION  "LoongOS 59.0-A-devapi (aarch64 / armvirt)"
 
 static u64 g_boot_wall = 0;        /* 内核启动瞬间的墙钟 Unix 秒（rtc_init 后记录） */
 

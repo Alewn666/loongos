@@ -4,9 +4,9 @@ services:
     container_name: loong-repo
     image: loong-repo:latest
     ports:
-      # 宿主机 8080 -> 容器 8080。NAS 上若 8080 被占用，改左边端口即可，
-      # 客户端用 `loong sources <NAS_IP> <端口>` 对应设置。
-      - "8080:8080"
+      # 宿主机 1100 -> 容器 8080（已在 NAS 部署为 1100 端口）。
+      # 客户端用 `loong sources <NAS_IP> 1100` 对应设置。
+      - "1100:8080"
     restart: unless-stopped
     read_only: true
     tmpfs:

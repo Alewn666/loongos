@@ -110,7 +110,10 @@ static int send_seg(u32 seq, u32 ack, u8 flags, const u8 *data, int dlen, u32 ds
     put32(seg + 8, ack);
     seg[12] = 5 << 4;                  /* 数据偏移 20 字节，无选项 */
     seg[13] = flags;
-    put16(seg + 14, TCP_RXBUF > 65535 ? 65535 : (u16)(TCP_RXBUF - t_rx_len));  /* 通告窗口 */
+    /* 通告窗口钳位：t_rx_len 异常超缓冲时不能下溢成巨值（防御） */
+    u16 adv = (t_rx_len >= TCP_RXBUF) ? 0 :
+              (u16)(TCP_RXBUF - t_rx_len);
+    put16(seg + 14, TCP_RXBUF > 65535 ? 65535 : adv);  /* 通告窗口 */
     put16(seg + 16, 0);                /* 校验和 */
     put16(seg + 18, 0);                /* 紧急指针 */
     if (dlen) mcpy(seg + 20, data, (u32)dlen);
@@ -209,7 +212,13 @@ int tcp_recv(void *buf, int max, int timeout_ms)
     mcpy(buf, t_rx + t_rx_head, (u32)n);
     t_rx_head += n;
     t_rx_len -= n;
+    /* 同样归一化：读走后把剩余未读数据搬到缓冲头，head 归 0，
+       保证 tcp_rx 写入点 t_rx+len 始终紧邻未读区尾，杜绝覆盖。 */
     if (t_rx_len == 0) t_rx_head = 0;
+    else if (t_rx_head > 0) {
+        mcpy(t_rx, t_rx + t_rx_head, (u32)t_rx_len);
+        t_rx_head = 0;
+    }
     /* 零窗口恢复：应用读走数据后接收窗口变大，主动 ACK 通告新窗口。
        否则对端在大文件传输中看到窗口=0 会一直停发（实测 LOONG 下载
        7.7KB 包卡在 ~3.9KB）。这是 RFC 的窗口更新，教学栈此前缺失。 */
@@ -315,10 +324,23 @@ void tcp_rx(const u8 *ip, int iplen)
     /* 数据：严格按序收（乱序丢弃，靠对端重传） */
     if (dlen > 0) {
         if (seq == t_rcv_nxt) {
+            /* 【游标归一化】未读数据必须紧靠缓冲头，head 必须为 0。
+               历史 bug：写入用 t_rx+t_rx_len、读取用 t_rx+t_rx_head，
+               当应用读走一部分(head>0)后，新段写回 t_rx+len 会落进
+               合法未读区 [head, head+len) 内部，覆盖尚未读走的字节。
+               SLIRP 小段每次被读空(head=0)掩盖了它；真机满 MSS 段令
+               head 持续>0 时必现（HTTP body 被改写 -> b64 长度错）。
+               修法：写入前把 [head, head+len) 搬到 [0, len) 并令 head=0，
+               使 t_rx+len 永远紧邻未读区尾部。mcpy 从低地址往高拷，
+               目标低于源，搬移是安全的。 */
+            if (t_rx_head > 0 && t_rx_len > 0) {
+                mcpy(t_rx, t_rx + t_rx_head, (u32)t_rx_len);
+                t_rx_head = 0;
+            }
             int space = TCP_RXBUF - t_rx_len;
             int n = dlen < space ? dlen : space;
             if (n > 0) {
-                mcpy(t_rx + t_rx_len, data, (u32)n);
+                mcpy(t_rx + t_rx_len, data, (u32)n);   /* 此时 head==0，写入点即未读区尾部 */
                 t_rx_len += n;
                 t_rcv_nxt += (u32)n;
             }

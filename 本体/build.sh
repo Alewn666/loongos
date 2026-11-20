@@ -78,6 +78,8 @@ ${CROSS}gcc $UCFLAGS -o build/u58tgt.elf   user/u58_target.c
 ${CROSS}gcc $UCFLAGS -o build/u58bad.elf   user/u58_badexec.c
 # 第五十八轮 58.0-B：抢占式调度地基验证程序（只编不内嵌，经 b64 注入 /home）
 ${CROSS}gcc $UCFLAGS -o build/u59sched.elf  user/u59_sched.c
+# 第五十九轮 59.0-A：开发者 API 演示程序（只编不内嵌，经 b64 注入 /home 后 run u60api.elf）
+${CROSS}gcc $UCFLAGS -o build/u60api.elf   user/u60_api.c
 # ELF 文件本身转目标文件（符号 _binary_<文件名>_start/_end，文件名里的 . 和 / 会变 _）
 ( cd build && ${CROSS}objcopy -I binary -O elf64-littleaarch64 -B aarch64 hello.elf hello_blob.o )
 ( cd build && ${CROSS}objcopy -I binary -O elf64-littleaarch64 -B aarch64 bad.elf  bad_blob.o  )
@@ -270,4 +272,4 @@ BEGIN {
 }' || exit 1
 
 echo "== kernel.elf 构建完成 =="
-ls -la kernel.elf build/hello.elf build/bad.elf build/u55test.elf build/u55sh.elf build/u56vfs.elf build/u57proc.elf build/u58fd.elf build/u58exec.elf build/u58tgt.elf build/u58bad.elf build/u59sched.elf
+ls -la kernel.elf build/hello.elf build/bad.elf build/u55test.elf build/u55sh.elf build/u56vfs.elf build/u57proc.elf build/u58fd.elf build/u58exec.elf build/u58tgt.elf build/u58bad.elf build/u59sched.elf build/u60api.elf

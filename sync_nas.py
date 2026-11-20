@@ -238,6 +238,17 @@ FILES = [
     ('loong-repo/repo/packages/hello_1.0.0.lpkg', 'loong-repo/repo/packages/hello_1.0.0.lpkg'),
     ('loong-repo/repo/packages/hello_2.0.0.lpkg', 'loong-repo/repo/packages/hello_2.0.0.lpkg'),
     ('loong-repo/repo/packages/sched_1.0.0.lpkg', 'loong-repo/repo/packages/sched_1.0.0.lpkg'),
+
+    # 第五十九轮 59.0-A：开发者 API + TCP 接收缓冲根因修复 + 开发者文档（2026-11-20）
+    # 注：kernel.c / kernel.elf / build.sh / usys.h / proc.h / README.md /
+    #     docs/检查与修复记录.md / ISO / iso.md5 已在上面登记，此处只补新增项。
+    ('本体/tcp.c',                    '本体/tcp.c'),
+    ('本体/test_tcpbuf_host.c',       '本体/test_tcpbuf_host.c'),
+    ('本体/user/loslib.h',            '本体/user/loslib.h'),
+    ('本体/user/u60_api.c',           '本体/user/u60_api.c'),
+    ('本体/test_round60.py',          '本体/test_round60.py'),
+    ('本体/docs/LoongOS开发者指南.md', '本体/docs/LoongOS开发者指南.md'),
+    ('本体/docs/第五十九轮A_开发者API判据报告.json', '本体/docs/第五十九轮A_开发者API判据报告.json'),
 ]
 
 def md5_local(path):
