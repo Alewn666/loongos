@@ -3,6 +3,6 @@ margin_bytes=12288
 kernel_upper=0x40241000
 user_base=0x40244000
 bss_bytes=1462272
-data_bytes=33600
+data_bytes=33672
 nvmedma_bytes=24576
 align_gap_bytes=0

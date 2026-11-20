@@ -69,6 +69,7 @@ def main():
         "-cpu", "cortex-a57", "-m", "256", "-smp", "1",
         "-kernel", KERNEL, "-display", "none", "-serial", "file:" + LOG,
         "-device", "ramfb", "-device", "qemu-xhci,id=xhci",
+        "-fw_cfg", "name=opt/loongos.boot,string=classic",
         "-device", "usb-tablet,bus=xhci.0,port=1",
         "-device", "usb-mouse,bus=xhci.0,port=2",
         "-device", "usb-kbd,bus=xhci.0,port=3",

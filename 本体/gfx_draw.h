@@ -41,6 +41,8 @@ void gfx_filled_circle(int cx, int cy, int rad, uint32_t rgb);
 void gfx_vgrad(struct gfx_rect r, uint32_t top, uint32_t bottom);
 void gfx_blend(struct gfx_rect r, uint32_t rgb, int alpha);
 void gfx_blend_roundrect(struct gfx_rect r, uint32_t rgb, int rad, int alpha);
+/* 柔和径向光晕：alpha 从中心 max_a 平滑衰减到边缘 0（壁纸光晕用，无硬边） */
+void gfx_soft_circle(int cx, int cy, int rad, uint32_t rgb, int max_a);
 
 /* P3.3 文本插入光标（caret）：架构中立的绘制 helper，ARM 图形终端与 x86
    键盘回显窗口共用。闪烁「相位」由各自架构的时钟驱动（ARM 用 cntpct_el0，

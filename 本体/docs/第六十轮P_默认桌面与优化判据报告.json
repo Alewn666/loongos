@@ -1,0 +1,23 @@
+{
+  "轮次": "60.0-P",
+  "主题": "开机默认macOS桌面 + 桌面互换 + 流畅度与视觉优化",
+  "日期": "2026-11-20",
+  "改动": {
+    "启动模式": "kernel.c 新增 fwc_boot_classic() 读 fw_cfg opt/loongos.boot; 缺省进macOS, =classic进原桌面。默认进mac。golden环境无fb, mac降级日志与原desktop逐字相同->零扰动",
+    "桌面互换": "苹果菜单加第9项 Classic Desktop, 点击后 macdesktop_run 退出并置 g_goto_classic; kernel run_mac_desktop() 据此进原桌面。串口 macdesktop/desktop 命令仍双向可用",
+    "性能": "damage_ui() 局部脏区(菜单栏+Dock+可见窗口)替代点击整屏重绘; 拖动沿用旧/新窗口脏区; 菜单开合单独登记 menu_rect()",
+    "视觉": "gfx.c 新增 gfx_soft_circle() 径向二次衰减光晕, 去掉壁纸实心圆硬边; 菜单栏时间读 PL031 RTC 真实时分(rtc_now/rtc_breakdown)",
+    "判据适配": "13+2 个依赖原桌面的判据 QEMU 加 -fw_cfg classic 参数(断言不动); test_macdesktop 改为验证开机默认进mac"
+  },
+  "验证": {
+    "test_macdesktop": "10/10(QEMU端到端,含拖动b.x70->150)",
+    "test_boot_desktop": "3/3(开机默认mac + 苹果菜单Classic切原桌面)",
+    "run_regression_r": "15/15(golden逐字/桌面P2/P3/鼠标跟随校准/EL0 33用例/网络/安装 全零扰动)",
+    "golden": "逐字一致 启动日志+29命令",
+    "guard": "四项全过, 上界余量12KB"
+  },
+  "布局": "USER_BASE=0x40244000, -Ttext=0x40248000 (沿用)",
+  "iso_md5": "e87b4090ee2054fc2b3dd4295f0a2054",
+  "进入方式": "开机默认进macOS桌面; 苹果菜单→Classic Desktop切原桌面; 串口 macdesktop/desktop 互换",
+  "边界": "内核原生非Web; Ctrl代Command; QEMU TCG; 窗口内容为几何近似"
+}

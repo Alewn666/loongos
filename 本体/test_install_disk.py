@@ -75,7 +75,8 @@ class VM:
                     "-drive", "if=none,id=d1,format=raw,file=" + D1,
                     "-device", "nvme,drive=d1,serial=loongos-d1,bus=rp0"]
         if with_desktop:
-            cmd += ["-device", "ramfb"]
+            cmd += ["-device", "ramfb",
+                    "-fw_cfg", "name=opt/loongos.boot,string=classic"]
         if from_iso:
             cmd += ["-cdrom", ISO]
         self.err = open(os.path.join(BASE, "build", "inst_disk_qemu.err"), "wb")

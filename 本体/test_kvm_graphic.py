@@ -256,6 +256,7 @@ class Session:
         cmd += ["-nographic", "-no-reboot",
                 "-qmp", "unix:%s,server=on,wait=off" % self.qmp_path,
                 "-device", "ramfb",
+                "-fw_cfg", "name=opt/loongos.boot,string=classic",
                 "-device", "qemu-xhci,id=xhci",
                 "-device", "usb-tablet,bus=xhci.0,port=1",
                 "-device", "usb-mouse,bus=xhci.0,port=2",

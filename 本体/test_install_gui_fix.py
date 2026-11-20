@@ -109,6 +109,7 @@ def main():
            "-serial", "unix:%s,server,nowait" % SER,
            "-qmp", "unix:%s,server=on,wait=off" % QMP,
            "-device", "ramfb",
+           "-fw_cfg", "name=opt/loongos.boot,string=classic",
            "-device", "qemu-xhci,id=xhci",
            "-device", "usb-tablet,bus=xhci.0,port=1",
            "-drive", "if=none,id=d0,format=raw,file=" + D0,

@@ -215,6 +215,41 @@ void gfx_filled_circle(int cx, int cy, int rad, u32 rgb)
     }
 }
 
+/* 柔和径向光晕：alpha 从中心 max_a 平滑（二次衰减）到边缘 0。
+   仅遍历裁剪区与圆的交集，逐像素读改写；用于壁纸光晕，避免实心圆硬边。 */
+void gfx_soft_circle(int cx, int cy, int rad, u32 rgb, int max_a)
+{
+    if (!G_fb || rad <= 0 || max_a <= 0) return;
+    struct gfx_rect clip = gfx_clip(G_clip[G_clip_n - 1], G_w, G_h);
+    int x0 = cx - rad, x1 = cx + rad, y0 = cy - rad, y1 = cy + rad;
+    if (x0 < clip.x) x0 = clip.x;
+    if (y0 < clip.y) y0 = clip.y;
+    if (x1 >= clip.x + clip.w) x1 = clip.x + clip.w - 1;
+    if (y1 >= clip.y + clip.h) y1 = clip.y + clip.h - 1;
+    if (x0 > x1 || y0 > y1) return;
+    int sr=(int)((rgb>>16)&255), sg=(int)((rgb>>8)&255), sb=(int)(rgb&255);
+    int rr = rad*rad;
+    uint32_t *base = (uint32_t *)(uintptr_t)G_fb;
+    for (int y=y0; y<=y1; y++) {
+        int dy = y - cy;
+        uint32_t *row = base + (u64)(u32)y * (u32)G_stride;
+        for (int x=x0; x<=x1; x++) {
+            int dx = x - cx;
+            int d2 = dx*dx + dy*dy;
+            if (d2 >= rr) continue;
+            /* t=0 中心..1 边缘；alpha=max_a*(1-t^2)，边缘平滑归零 */
+            int t2 = (d2 * 256) / rr;             /* 0..255 */
+            int a = max_a - (max_a * t2) / 256;   /* max_a..0 */
+            if (a <= 0) continue;
+            u32 d = row[x];
+            int dr=(int)((d>>16)&255), dg=(int)((d>>8)&255), db=(int)(d&255);
+            row[x] = GFX_RGB((sr*a + dr*(255-a))/255,
+                             (sg*a + dg*(255-a))/255,
+                             (sb*a + db*(255-a))/255);
+        }
+    }
+}
+
 /* 垂直线性渐变：逐行插值后整行批量填充（壁纸/标题栏/按钮立体感） */
 void gfx_vgrad(struct gfx_rect r, u32 top, u32 bottom)
 {

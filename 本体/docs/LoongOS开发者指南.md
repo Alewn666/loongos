@@ -199,9 +199,11 @@ u60_api.c
 
 LoongOS 在 `desktop.c`（类 Windows 桌面）之外，新增第二套**内核原生**的 macOS 风格桌面，逻辑与 UI 分离，交互规则严格对齐 macOS 原生行为。
 
-### 10.1 进入
+### 10.1 进入与启动模式（60.0-P 更新）
 
-在串口 shell 敲 `macdesktop`（`q` 或 Ctrl+Shift+F1 退出）。它是一条**新增可选命令**，不进 help、不改 golden。
+- **开机默认进 macOS 桌面**（60.0-P 起）。`kernel.c` 读 fw_cfg 项 `opt/loongos.boot`：值为 `classic` 才进原自研桌面(P系列)，缺省一律进 macOS。回归判据靠 QEMU 传 `-fw_cfg name=opt/loongos.boot,string=classic` 继续测原桌面，**断言逻辑一行不改，golden 逐字零扰动**（golden 环境无帧缓冲，mac 桌面降级日志与原 desktop 完全相同）。
+- **桌面互换**：在 macOS 桌面点左上角苹果菜单 → `Classic Desktop` 进入原自研桌面；串口 shell 敲 `macdesktop` 进 macOS、`desktop` 进原桌面。`q` 或 Ctrl+Shift+F1 退出桌面回串口。
+- `macdesktop` 是**新增可选命令**，不进 help、不改 golden。
 
 ### 10.2 模块划分
 
@@ -210,7 +212,8 @@ LoongOS 在 `desktop.c`（类 Windows 桌面）之外，新增第二套**内核�
 | `macwm.h` / `macwm.c` | **交互内核**：纯逻辑、无硬件依赖、宿主可单测。`struct mac_state`（430B）承载 App/窗口/焦点/Dock 全部状态；`mac_dispatch(evt,a,b)` 是唯一状态变更入口 |
 | `macdesktop.c` | **渲染 + 输入适配**：把 `mac_state` 画成三段菜单栏/Dock/窗口（复用 `gfx.c` 原语），把键鼠翻译成 `mac_dispatch` 事件 |
 | `test_macwm_host.c` | 宿主逻辑单测（57 条） |
-| `test_macdesktop.py` | QEMU 端到端（9 项，QMP 读 `g_ms.active_app` 验证焦点联动 + screendump） |
+| `test_macdesktop.py` | QEMU 端到端（10 项，QMP 读 `g_ms.active_app` 验证焦点联动 + screendump + 拖动） |
+| `test_boot_desktop.py` | 开机默认进 macOS + 苹果菜单 Classic Desktop 切回原桌面（3 项） |
 
 ### 10.3 核心交互语义（与 Web 版 wm_core.js 逐条一致）
 
@@ -227,3 +230,10 @@ LoongOS 在 `desktop.c`（类 Windows 桌面）之外，新增第二套**内核�
 ### 10.5 内存与地址
 
 新增模块使内核 `.text` 增长约 12KB，经链接脚本 4KB 对齐链传导顶到用户区；按项目历史惯例把 `USER_BASE` 由 `0x4023c000` 上移到 `0x40244000`、用户程序 `-Ttext` 同步到 `0x40248000`（落在新用户区内）。`USER_END=0x40400000` 不变，128MB RAM 空间充裕。`run_regression_r.sh` 15/15、`test_round60.py` 16/16 验证用户程序与 golden 零扰动。
+
+### 10.6 流畅度与视觉优化（60.0-P）
+
+- **局部脏区重绘**：`damage_ui()` 只登记「菜单栏 + Dock + 可见窗口」，点击/焦点变化不再整屏重绘，省掉大片纯壁纸区的逐像素混合；拖动沿用旧/新窗口两块脏区。
+- **柔和径向光晕**：`gfx.c:gfx_soft_circle()` 让壁纸光晕 alpha 从中心二次衰减到边缘，去掉实心圆硬边色块。
+- **真实墙钟**：菜单栏时间读 PL031 RTC（`rtc_now`/`rtc_breakdown`），显示 `Fri 22:13` 这样的本地时分，不再写死。
+- **苹果菜单 Classic Desktop**：下拉菜单最后一项切回原桌面，菜单矩形与命中测试共用 `menu_rect()`，开合时单独登记脏区保证局部重绘正确。

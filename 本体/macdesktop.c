@@ -10,6 +10,7 @@
 #include "loongos.h"
 #include "gfx_draw.h"
 #include "macwm.h"
+#include "rtc.h"
 
 extern void gfxterm_stop(void);   /* 退出桌面时关闭键盘捕获（gfxterm.h） */
 
@@ -56,11 +57,40 @@ static int g_drag_win = -1;    /* 正在拖动的窗口下标，-1=无 */
 static int g_drag_dx, g_drag_dy;/* 拖动锚点：鼠标-窗口左上 */
 static int g_drag_ox, g_drag_oy;/* 上一帧窗口位置（局部重绘用） */
 static int g_hover_dock = -1;  /* 当前鼠标悬停的 Dock App，-1=无 */
+static int g_goto_classic = 0; /* 苹果菜单点 Classic Desktop → 1，退出后由调用方进原桌面 */
+
+/* 苹果菜单项数（含末尾 Classic Desktop 切换项） */
+#define APPLE_MENU_N 9
+#define APPLE_ITEM_CLASSIC 8   /* Classic Desktop 在菜单中的下标 */
 
 /* 把矩形外扩 pad 后登记脏区（含阴影，拖动/悬停局部重绘用） */
 static void damage_pad(struct gfx_rect r, int pad) {
     r.x-=pad; r.y-=pad; r.w+=2*pad; r.h+=2*pad;
     gfx_damage(r);
+}
+
+/* 当前下拉菜单矩形（与 draw_overlays / 命中测试共用同一坐标） */
+static struct gfx_rect menu_rect(void) {
+    int mx = (g_menu_kind==1)?8:(g_menu_kind==3)?320:150;
+    int mh = (g_menu_kind==1) ? (APPLE_MENU_N*26+8) : 224;
+    return (struct gfx_rect){mx,MBAR_H,240,mh};
+}
+
+/* 智能脏区：只登记「菜单栏 + Dock + 所有可见窗口」，跳过中间大片纯壁纸。
+   点击/焦点变化/开关窗口时调用。gfx_present 会把每块脏区 clip 后整场景重画，
+   所以壁纸 blend、窗口、菜单栏在脏区内都正确重绘，却省掉整屏 48 万像素混合。 */
+static void damage_ui(void) {
+    int W=gfx_width(), H=gfx_height();
+    gfx_damage((struct gfx_rect){0,0,W,MBAR_H+2});
+    gfx_damage((struct gfx_rect){0,H-DOCK_H-12,W,DOCK_H+12});
+    for (int i=0;i<MAC_NWIN;i++) {
+        struct mac_win *w=&g_ms.wins[i];
+        if(!w->used || w->hidden_by_app) continue;
+        if(w->state!=MW_NORMAL && w->state!=MW_FULL) continue; /* 最小化窗在 Dock 里，已覆盖 */
+        struct gfx_rect r={w->b.x,w->b.y,w->b.w,w->b.h};
+        if(w->state==MW_FULL){r.x=0;r.y=MBAR_H;r.w=W;r.h=H-MBAR_H;}
+        damage_pad(r,10);
+    }
 }
 
 /* App 主题色 / 图标底色 */
@@ -92,13 +122,11 @@ static int mac_isqrt(int v) { int r=0; while((r+1)*(r+1)<=v) r++; return r; }
 static void draw_wallpaper(void) {
     int W = gfx_width(), H = gfx_height();
     gfx_vgrad((struct gfx_rect){0,0,W,H}, C_WALL_TOP, C_WALL_BOT);
-    /* 光晕：从大到小叠半透明圆，制造柔和层次（alpha 低，开销可控） */
-    gfx_filled_circle(W*7/10, H*3/10, H*2/5, C_GLOW2);   /* 紫 */
-    gfx_filled_circle(W*7/10, H*3/10, H*3/10, C_GLOW1);  /* 蓝 */
-    gfx_filled_circle(W*2/10, H*7/10, H*2/5, C_GLOW1);   /* 左下蓝 */
-    gfx_filled_circle(W*2/10, H*7/10, H*1/4, C_GLOW3);   /* 青 */
-    /* 用壁纸底色半透明覆盖一层，柔化光晕边缘、压暗整体 */
-    gfx_blend((struct gfx_rect){0,0,W,H}, C_WALL_BOT, 90);
+    /* 柔和径向光晕：边缘二次衰减，无实心圆硬边。几团错落叠出层次。 */
+    gfx_soft_circle(W*72/100, H*26/100, H*2/5, C_GLOW2, 120); /* 紫 */
+    gfx_soft_circle(W*72/100, H*26/100, H*3/10, C_GLOW1, 110); /* 蓝 */
+    gfx_soft_circle(W*14/100, H*74/100, H*2/5, C_GLOW1, 100);  /* 左下蓝 */
+    gfx_soft_circle(W*10/100, H*82/100, H*1/4, C_GLOW3, 90);   /* 青 */
 }
 
 /* 画苹果符号：用圆+缺口近似（纯几何，不依赖字体） */
@@ -129,8 +157,25 @@ static void draw_status_icons(int W) {
     gfx_rect_draw((struct gfx_rect){bx,y+2,20,9}, C_MBAR_FG, 1);
     gfx_fill((struct gfx_rect){bx+1,y+3,13,7}, C_MBAR_FG);
     gfx_fill((struct gfx_rect){bx+20,y+5,2,4}, C_MBAR_FG);
-    /* 时间（ASCII，放最左）："Tue 12:00" 8 字符=64px，右边缘到 bx-8 */
-    gfx_text(bx-8-gfx_text_w("Tue 12:00"), y, "Tue 12:00", C_MBAR_FG, 0xFFFFFFFF);
+    /* 时间：读 PL031 真实墙钟，格式 "Wed 14:07"（星期缩写+本地时分）。
+       RTC 不可用时回退 "--- --:--"，布局宽度不变。 */
+    char tbuf[12];
+    u64 ep = rtc_now();
+    if (ep) {
+        int yy,mo,dd,hh,mi,ss,wd;
+        rtc_breakdown(ep,&yy,&mo,&dd,&hh,&mi,&ss,&wd);
+        static const char *const wdname[7]={"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+        const char *wn = (wd>=0&&wd<7)?wdname[wd]:"---";
+        tbuf[0]=wn[0]; tbuf[1]=wn[1]; tbuf[2]=wn[2]; tbuf[3]=' ';
+        tbuf[4]='0'+((hh/10)%10); tbuf[5]='0'+(hh%10);
+        tbuf[6]=':';
+        tbuf[7]='0'+((mi/10)%10); tbuf[8]='0'+(mi%10);
+        tbuf[9]=0;
+    } else {
+        tbuf[0]='-';tbuf[1]='-';tbuf[2]='-';tbuf[3]=' ';
+        tbuf[4]='-';tbuf[5]='-';tbuf[6]=':';tbuf[7]='-';tbuf[8]='-';tbuf[9]=0;
+    }
+    gfx_text(bx-8-gfx_text_w(tbuf), y, tbuf, C_MBAR_FG, 0xFFFFFFFF);
 }
 
 /* =========================================================================
@@ -482,15 +527,14 @@ static void draw_overlays(void) {
         gfx_text(W/2-165,128,"Type to search apps...",C_TEXT,0xFFFFFFFF);
     }
     if (!g_menu_drawn) return;
-    int mx = (g_menu_kind==1)?8:(g_menu_kind==3)?320:150;
-    struct gfx_rect m = {mx,MBAR_H,240,224};
+    struct gfx_rect m = menu_rect();
     gfx_blend_roundrect(m, C_PANEL, 8, 250);
     gfx_rect_draw(m, C_BORDER, 1);
     if (g_menu_kind == 1) {
-        static const char *const items[8] = {"About This Mac","System Settings...","Recent Items","Force Quit...","Sleep","Restart...","Shut Down...","Lock Screen"};
-        for (int i=0;i<8;i++) {
-            if(i==3) gfx_fill((struct gfx_rect){m.x+4,m.y+8+i*26,m.w-8,1},0xD0D0D4);
-            gfx_text(m.x+14, m.y+10+i*26, items[i], C_TEXT, 0xFFFFFFFF);
+        static const char *const items[APPLE_MENU_N] = {"About This Mac","System Settings...","Recent Items","Force Quit...","Sleep","Restart...","Shut Down...","Lock Screen","Classic Desktop"};
+        for (int i=0;i<APPLE_MENU_N;i++) {
+            if(i==3 || i==APPLE_ITEM_CLASSIC-1) gfx_fill((struct gfx_rect){m.x+4,m.y+8+i*26,m.w-8,1},0xD0D0D4);
+            gfx_text(m.x+14, m.y+10+i*26, items[i], (i==APPLE_ITEM_CLASSIC)?C_ACCENT:C_TEXT, 0xFFFFFFFF);
         }
     } else if (g_menu_kind == 3) {
         int wins[16], n = mac_window_menu_wins(&g_ms, wins, 16);
@@ -571,7 +615,15 @@ static int menubar_hit(int x) {
 static void on_press(int x, int y) {
     /* 下拉菜单优先吃点击 */
     if (g_menu_drawn) {
-        if (g_menu_kind == 3) {
+        struct gfx_rect oldmenu = menu_rect();  /* 关闭前先记录，供擦除 */
+        if (g_menu_kind == 1) {
+            /* 苹果菜单：按 y 命中各项；最后一项 Classic Desktop → 切到原桌面 */
+            struct gfx_rect m={8,MBAR_H,240,APPLE_MENU_N*26+8};
+            if(hit(m,x,y)){
+                int idx=(y-(m.y+8))/26;
+                if(idx==APPLE_ITEM_CLASSIC){ g_goto_classic=1; }
+            }
+        } else if (g_menu_kind == 3) {
             struct gfx_rect m={320,MBAR_H,240,224};
             if(hit(m,x,y)){
                 int wins[16],n=mac_window_menu_wins(&g_ms,wins,16);
@@ -585,26 +637,26 @@ static void on_press(int x, int y) {
                 }
             }
         }
-        g_menu_drawn=0; gfx_damage(full()); return;
+        g_menu_drawn=0; damage_ui(); gfx_damage(oldmenu); return;  /* 擦掉旧下拉框 */
     }
     /* 菜单栏 */
     if (y < MBAR_H) {
         int m=menubar_hit(x);
         if(m){ g_menu_drawn=1; g_menu_kind=m; mac_dispatch(&g_ms,ME_MENUOPEN,m==1?MMS_APPLE:MMS_APP,0); }
         else if(x>=gfx_width()-150) mac_dispatch(&g_ms,ME_SPOTLIGHT_TOGGLE,0,1);
-        gfx_damage(full()); return;
+        damage_ui(); if(m) gfx_damage(menu_rect()); return;  /* 绘制新下拉框 */
     }
     /* Dock */
     if (y >= gfx_height()-DOCK_H) {
         int wi=dock_win_at(x,y);
-        if(wi>=0){ mac_dispatch(&g_ms,ME_DOCKRESTORE,wi,0); gfx_damage(full()); return; }
+        if(wi>=0){ mac_dispatch(&g_ms,ME_DOCKRESTORE,wi,0); damage_ui(); return; }
         int a=dock_app_at(x,y);
-        if(a>=0){ mac_dispatch(&g_ms,ME_DOCKCLICK,a,0); gfx_damage(full()); return; }
-        gfx_damage(full()); return;
+        if(a>=0){ mac_dispatch(&g_ms,ME_DOCKCLICK,a,0); damage_ui(); return; }
+        damage_ui(); return;
     }
     /* 窗口 */
     int wi=top_win_at(x,y);
-    if (wi<0){ mac_dispatch(&g_ms,ME_CLICKDESKTOP,0,0); gfx_damage(full()); return; }
+    if (wi<0){ mac_dispatch(&g_ms,ME_CLICKDESKTOP,0,0); damage_ui(); return; }
     struct gfx_rect r={g_ms.wins[wi].b.x,g_ms.wins[wi].b.y,g_ms.wins[wi].b.w,g_ms.wins[wi].b.h};
     if(g_ms.wins[wi].state==MW_FULL){r.x=0;r.y=MBAR_H;r.w=gfx_width();r.h=gfx_height()-MBAR_H;}
     int by=g_ms.wins[wi].b.y+TITLE_H/2;
@@ -615,14 +667,16 @@ static void on_press(int x, int y) {
         else { mac_dispatch(&g_ms,ME_FOCUSWIN,wi,0); if(on_titlebar(wi,x,y)){ g_drag_win=wi; g_drag_dx=x-g_ms.wins[wi].b.x; g_drag_dy=y-g_ms.wins[wi].b.y; g_drag_ox=g_ms.wins[wi].b.x; g_drag_oy=g_ms.wins[wi].b.y; } }
     } else mac_dispatch(&g_ms,ME_FOCUSWIN,wi,0);
     (void)by;
-    gfx_damage(full());
+    damage_ui();
 }
 
 /* =========================================================================
  * 主循环
  * ========================================================================= */
 void macdesktop_run(void) {
-    if (!gfx_ready()) { kputs("[macdesktop] 无帧缓冲，保持串口 shell\n"); return; }
+    /* 无帧缓冲时打印与原 desktop 完全相同的日志：golden 基线逐字一致（零扰动）。
+       golden 环境刻意不挂 ramfb，桌面优雅降级为串口 shell，此处必须原样输出。 */
+    if (!gfx_ready()) { kputs("[desktop] 无帧缓冲，保持串口 shell\n"); return; }
     gfx_take_screen();
     gfx_set_redraw(mac_redraw);
     if (!g_inited) {
@@ -654,10 +708,10 @@ void macdesktop_run(void) {
         char c;
         while (desktop_ring_pop_kbd(&c)) {
             if (c=='q'||c=='Q'||c==3) goto done;
-            if (c=='\t') { mac_dispatch(&g_ms,ME_CMDTAB,0,0); gfx_damage(full()); }
+            if (c=='\t') { mac_dispatch(&g_ms,ME_CMDTAB,0,0); damage_ui(); }
             else if (c==' ') { mac_dispatch(&g_ms,ME_SPOTLIGHT_TOGGLE,0,1); gfx_damage(full()); }
-            else if (c=='w'||c=='W') { if(g_ms.focused_win>=0) mac_dispatch(&g_ms,ME_CLOSEWIN,g_ms.focused_win,0); gfx_damage(full()); }
-            else if (c=='m'||c=='M') { if(g_ms.focused_win>=0) mac_dispatch(&g_ms,ME_MINWIN,g_ms.focused_win,0); gfx_damage(full()); }
+            else if (c=='w'||c=='W') { if(g_ms.focused_win>=0) mac_dispatch(&g_ms,ME_CLOSEWIN,g_ms.focused_win,0); damage_ui(); }
+            else if (c=='m'||c=='M') { if(g_ms.focused_win>=0) mac_dispatch(&g_ms,ME_MINWIN,g_ms.focused_win,0); damage_ui(); }
         }
         /* 坐标刷新：mouse_get 返回是否有新坐标；坐标变化即 moved 驱动拖动。
            按键电平不可靠（边沿被 mouse_pop_btn 消费），所以拖动不看 btn。 */
@@ -697,10 +751,20 @@ void macdesktop_run(void) {
             if(pressed)  on_press(g_mx,g_my);
             if(released) g_drag_win=-1;
         }
+        if (g_goto_classic) break;   /* 苹果菜单点 Classic Desktop → 退出，交调用方进原桌面 */
         gfx_present();
     }
 done:
     gfxterm_stop();
     g_inited=1;
     fb_console_reset();
+}
+
+/* 供 kernel 层查询：上次 mac 桌面是否由「Classic Desktop」菜单项退出。
+   返回后清零，避免影响下次进入。 */
+int macdesktop_goto_classic(void)
+{
+    int v = g_goto_classic;
+    g_goto_classic = 0;
+    return v;
 }

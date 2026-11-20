@@ -480,6 +480,32 @@ static int fwc_ramfb_setup(void)
     return 0;
 }
 
+/* 开机默认桌面选择：读 fw_cfg 项 opt/loongos.boot。
+   值为 "classic" → 进原自研桌面(P系列)，其余/缺省 → 进 macOS 桌面。
+   用途：用户正常启动默认进 macOS；回归判据靠 QEMU 传 classic 仍测原桌面，
+   两者互不干扰，golden 零扰动。 */
+static int fwc_boot_classic(void)
+{
+    u8 name[64], hdr[8];
+    fwc_sel(0x0019);                       /* FW_CFG_FILE_DIR */
+    u8 c[4]; for (int i=0;i<4;i++) c[i]=fwc_byte();
+    u32 n = be32_(c);
+    if (n == 0 || n > 256) return 0;
+    u16 sel = 0; u32 sz = 0;
+    for (u32 e=0; e<n; e++) {
+        for (int k=0;k<8;k++) hdr[k]=fwc_byte();
+        for (int k=0;k<56;k++) { u8 ch = fwc_byte(); if (k < 63) name[k] = (char)ch; }
+        name[56] = 0;
+        if (fs_strcmp((char *)name, "opt/loongos.boot") == 0) { sel = be16_(hdr+4); sz = be32_(hdr); }
+    }
+    if (!sel || sz == 0) return 0;         /* 缺省 → macOS */
+    fwc_sel(sel);
+    char v[16]; int i=0;
+    for (; i<15 && i<(int)sz; i++) { u8 b=fwc_byte(); if(b==0||b=='\n'||b=='\r')break; v[i]=(char)b; }
+    v[i]=0;
+    return fs_strcmp(v, "classic") == 0;
+}
+
 static void fb_init(void)
 {
     if (!g_bi || g_bi->magic != BOOTINFO_MAGIC) return;
@@ -4229,8 +4255,19 @@ cnt_done:
 static void cmd_desktop(char *a) { (void)a; desktop_run(); }
 
 /* macOS 风格桌面：独立桌面外壳（macwm.c 逻辑内核 + macdesktop.c 渲染）。
-   刻意不写进 help / golden：它是一条新增的可选命令，不改任何既有基线。 */
-static void cmd_macdesktop(char *a) { (void)a; extern void macdesktop_run(void); macdesktop_run(); }
+   刻意不写进 help / golden：它是一条新增的可选命令，不改任何既有基线。
+   苹果菜单 → Classic Desktop 退出时，自动接着进原自研桌面(P系列)。 */
+extern void macdesktop_run(void);
+extern int  macdesktop_goto_classic(void);
+static void run_mac_desktop(void)
+{
+    macdesktop_run();
+    if (macdesktop_goto_classic()) {
+        extern void desktop_run(void);
+        desktop_run();
+    }
+}
+static void cmd_macdesktop(char *a) { (void)a; run_mac_desktop(); }
 
 /* 鼠标校准：查询当前偏移 / 手动设置 / 清零。图形界面里还有点靶心自动校准。 */
 static void put_sdec(int v)
@@ -5800,13 +5837,18 @@ void kernel_main(unsigned long bootinfo)
         uart_puts("[net ] 活动网卡链路 down，未走 DHCP（net dhcp 可手动重试）\n");
     }
 
-    /* 桌面 P1/P2：开机默认直接进图形桌面。
-       先把当前帧缓冲参数交给绘图层；串口 shell 仍是调试/回归通道 —— 桌面期间
-       只要串口有输入就自动让位（字符不丢，见 desktop.c）；键盘主动退出只有
-       Ctrl+Shift+F1（P2 按用户要求取消 Q / Esc）。 */
+    /* 开机默认桌面：默认进 macOS 风格桌面；fw_cfg opt/loongos.boot=classic
+       时进原自研桌面(P系列，供回归判据使用)。先把帧缓冲参数交给绘图层；
+       串口 shell 仍是调试/回归通道 —— 桌面期间串口有输入就自动让位，
+       键盘退出 Ctrl+Shift+F1。 */
     if (fb_mem)
         gfx_init((void *)fb_mem, (int)fb_w, (int)fb_h, (int)fb_stride);
-    desktop_run();
+    if (fwc_boot_classic()) {
+        extern void desktop_run(void);
+        desktop_run();
+    } else {
+        run_mac_desktop();
+    }
     uart_puts("> ");
     shell_loop();
 }

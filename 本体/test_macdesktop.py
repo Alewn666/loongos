@@ -154,15 +154,11 @@ def main():
     try:
         ser=Ser(SER); q=Qmp(QMP); time.sleep(2.0)
         check("QEMU 启动", "g_ms" in A, "内核含 macwm 状态符号")
-        # 等串口日志出现桌面就绪提示（不高频读 QMP，避免命令堆积超时）
-        ser.wait("图形桌面已就绪".encode(), 30)
-        time.sleep(0.5)
-        # 默认进的是原 desktop，Ctrl+Shift+F1 退回串口
-        q.hmp("sendkey ctrl-shift-f1"); time.sleep(1.0)
-        ser.send("macdesktop")
-        time.sleep(2.0)
+        # 60.0-P：开机默认进 macOS 桌面，等它的就绪日志（不再需要退串口敲 macdesktop）
+        ser.wait("macOS 风格桌面已就绪".encode(), 30)
+        time.sleep(0.8)
         a0 = active(q)
-        check("macdesktop 命令进入桌面", a0 is not None and 0<=a0<10, "active_app=%s" % a0)
+        check("开机默认进 macOS 桌面", a0 is not None and 0<=a0<10, "active_app=%s" % a0)
         check("初始 active_app 有效", a0 is not None and 0<=a0<10, "active_app=%s（启动后最后激活的 App）" % a0)
         # 截图
         png=q.shot("macdesktop_main")
