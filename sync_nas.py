@@ -257,6 +257,7 @@ FILES = [
     ('本体/test_macwm_host.c', '本体/test_macwm_host.c'),
     ('本体/test_macdesktop.py', '本体/test_macdesktop.py'),
     ('本体/docs/第六十轮M_macOS桌面内核集成判据报告.json', '本体/docs/第六十轮M_macOS桌面内核集成判据报告.json'),
+    ('本体/docs/第六十轮N_macOS桌面质感重做判据报告.json', '本体/docs/第六十轮N_macOS桌面质感重做判据报告.json'),
 ]
 
 def md5_local(path):

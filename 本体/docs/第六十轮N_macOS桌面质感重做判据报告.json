@@ -1,0 +1,20 @@
+{
+  "轮次": "60.0-N",
+  "主题": "macOS桌面质感重做(视觉+手感)",
+  "日期": "2026-11-20",
+  "改动": {
+    "gfx.c": "新增gfx_roundrect/gfx_filled_circle/gfx_vgrad/gfx_blend/gfx_blend_roundrect,均过裁剪栈不占静态大数组",
+    "macdesktop.c": "重写渲染:渐变光晕壁纸+毛玻璃菜单栏+居中彩色Dock+圆角阴影窗口+按App内容;手感:拖动/悬停放大/局部重绘",
+    "macwm.c": "未改动(逻辑层稳定)"
+  },
+  "验证": {
+    "test_macwm_host": "57/57",
+    "test_macdesktop": "10/10(QEMU端到端,含拖动实测b.x70->150)",
+    "run_regression_r": "15/15(golden/桌面P2/P3手感/EL0零扰动)",
+    "guard": "四项全过,上界余量12KB"
+  },
+  "布局": "USER_BASE=0x40244000, -Ttext=0x40248000 (沿用60.0-M)",
+  "iso_md5": "15f8b035b45f028d1785521fb412ea57",
+  "进入方式": "串口 macdesktop 命令进入,q退出",
+  "边界": "内核原生非Web演示;窗口内容为几何近似;Ctrl代Command;QEMU TCG非真机KVM"
+}
