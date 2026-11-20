@@ -250,6 +250,13 @@ FILES = [
     ('本体/docs/LoongOS开发者指南.md', '本体/docs/LoongOS开发者指南.md'),
     ('本体/docs/第五十九轮A_开发者API判据报告.json', '本体/docs/第五十九轮A_开发者API判据报告.json'),
     ('本体/docs/第五十九轮A_交付报告.md', '本体/docs/第五十九轮A_交付报告.md'),
+    # 60.0-M：macOS 风格桌面内核原生集成
+    ('本体/macwm.h', '本体/macwm.h'),
+    ('本体/macwm.c', '本体/macwm.c'),
+    ('本体/macdesktop.c', '本体/macdesktop.c'),
+    ('本体/test_macwm_host.c', '本体/test_macwm_host.c'),
+    ('本体/test_macdesktop.py', '本体/test_macdesktop.py'),
+    ('本体/docs/第六十轮M_macOS桌面内核集成判据报告.json', '本体/docs/第六十轮M_macOS桌面内核集成判据报告.json'),
 ]
 
 def md5_local(path):

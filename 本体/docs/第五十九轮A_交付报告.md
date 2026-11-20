@@ -59,7 +59,8 @@ LoongOS / 灵珑系统 —— 第五十九轮 59.0-A 交付报告
 七、交付物
   - 内核 kernel.elf md5 = e8622b5e67a7aad9c7618cfe6e46d8ae
   - ISO  iso/自研内核ISO/loongos.iso md5 = 8e709e09ea33ac1dd463af2738079c23（19,130,368 B）
-  - GitHub：commit be61313 已推送 origin/main，本地=远端一致（HEAD=be61313ec78…）
+  - GitHub：commit bf7d37d 已推送 origin/main，本地=远端一致
+    （核心 be61313 + 报告 8d1764f + 清单 bf7d37d 三笔全部推送成功）
   - 提交前扫描：无明文凭据/口令泄露（password=PASS 为变量引用，非明文）
 
 八、诚实边界 / 未完成项

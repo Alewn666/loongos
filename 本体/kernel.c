@@ -1073,7 +1073,7 @@ static void gic_init(void)
      - -Ttext=0x40240000 仍落在 [0x4023c000, 0x40400000) 内（间隙 32KB→16KB）；
      - USER_END/UARGS_ADDR/EL0 栈/内嵌 ELF blob 全不动；
      - fill_pt 与 cmd_run vaddr 校验用宏自动跟随；golden 地址规范化逐字不变。 */
-#define USER_BASE 0x4023c000UL       /* 用户区 0x4023c000-0x403FFFFF，独立 L3（l3_user）。
+#define USER_BASE 0x40244000UL       /* 用户区 0x40244000-0x403FFFFF，独立 L3（l3_user）。
                                         内核 .bss 可延伸到 0x40200000 起的那几页（PROT_RAM，EL1 专用），
                                         用户区权限只从 USER_BASE 起覆盖，互不干扰。 */
 #define USER_END  0x40400000UL
@@ -3260,6 +3260,7 @@ static void cmd_wc(char *a);
 static void cmd_grep(char *a);
 static void cmd_head(char *a);
 static void cmd_desktop(char *a);
+static void cmd_macdesktop(char *a);
 static void cmd_b64out(char *a);
 static void cmd_b64in(char *a);
 
@@ -4227,6 +4228,10 @@ cnt_done:
 /* 桌面 P1/P2：开机默认进桌面；从终端敲 desktop 可再次进入（Ctrl+Shift+F1 返回终端）。 */
 static void cmd_desktop(char *a) { (void)a; desktop_run(); }
 
+/* macOS 风格桌面：独立桌面外壳（macwm.c 逻辑内核 + macdesktop.c 渲染）。
+   刻意不写进 help / golden：它是一条新增的可选命令，不改任何既有基线。 */
+static void cmd_macdesktop(char *a) { (void)a; extern void macdesktop_run(void); macdesktop_run(); }
+
 /* 鼠标校准：查询当前偏移 / 手动设置 / 清零。图形界面里还有点靶心自动校准。 */
 static void put_sdec(int v)
 {
@@ -4618,7 +4623,7 @@ static const struct cmdent CMDS[] = {
     { "net", cmd_net }, { "ifconfig", cmd_ifconfig }, { "ping", cmd_ping }, { "tcp", cmd_tcp }, { "cpu", cmd_cpu },
     { "touch", cmd_touch }, { "mv", cmd_mv }, { "stat", cmd_stat },
     { "wc", cmd_wc }, { "grep", cmd_grep }, { "head", cmd_head },
-    { "desktop", cmd_desktop }, { "mousecal", cmd_mousecal },
+    { "desktop", cmd_desktop }, { "macdesktop", cmd_macdesktop }, { "mousecal", cmd_mousecal },
     { "b64out", cmd_b64out }, { "b64in", cmd_b64in },   /* 批次2：文件进出通道 */
     { "loong", cmd_loong },    /* LOONG 包管理器：update/list/install（刻意不写进 help / golden） */
     { "res", cmd_res },        /* R 轮资源账诊断（刻意不写进 help，保行为基线逐字一致） */

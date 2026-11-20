@@ -192,3 +192,38 @@ u60_api.c
 | `run_regression_r.sh` | 15 项资源/长稳/网络/安装回归 | 见判据报告 |
 
 > 原则：不接受"串口自报通过"。落盘字节数用 `ls` 独立读、SHA256 独立重算、程序输出必须是真实 ELF 在 EL0 跑出来的。
+
+---
+
+## 10. macOS 风格桌面（60.0-M：内核原生）
+
+LoongOS 在 `desktop.c`（类 Windows 桌面）之外，新增第二套**内核原生**的 macOS 风格桌面，逻辑与 UI 分离，交互规则严格对齐 macOS 原生行为。
+
+### 10.1 进入
+
+在串口 shell 敲 `macdesktop`（`q` 或 Ctrl+Shift+F1 退出）。它是一条**新增可选命令**，不进 help、不改 golden。
+
+### 10.2 模块划分
+
+| 文件 | 职责 |
+| --- | --- |
+| `macwm.h` / `macwm.c` | **交互内核**：纯逻辑、无硬件依赖、宿主可单测。`struct mac_state`（430B）承载 App/窗口/焦点/Dock 全部状态；`mac_dispatch(evt,a,b)` 是唯一状态变更入口 |
+| `macdesktop.c` | **渲染 + 输入适配**：把 `mac_state` 画成三段菜单栏/Dock/窗口（复用 `gfx.c` 原语），把键鼠翻译成 `mac_dispatch` 事件 |
+| `test_macwm_host.c` | 宿主逻辑单测（57 条） |
+| `test_macdesktop.py` | QEMU 端到端（9 项，QMP 读 `g_ms.active_app` 验证焦点联动 + screendump） |
+
+### 10.3 核心交互语义（与 Web 版 wm_core.js 逐条一致）
+
+- **App / 窗口完全解耦**：一 App 拥有 0..N 窗口；红按钮只销毁该窗口，App 仍后台运行、Dock 圆点保留；只有 `quit` 才结束进程。
+- **全局焦点是 `active_app`**（不是活动窗口）：桌面永远属于 Finder，不存在"无焦点"态；三段菜单栏中间段只绑定 `active_app`。
+- **焦点联动三路径**：点窗口→激活其 App；点桌面空白→激活 Finder；Cmd+Tab（本内核以 Ctrl+Tab 代）→按 MRU 切换——三者都同步刷新菜单栏。
+- **红黄绿按钮**：红=关窗不退出；黄=最小化进 Dock 右侧（点击缩略图恢复）；绿=全屏独占一个 Space；zoom 为普通放大不建 Space。
+- **Dock**：图标=App 实例，圆点=运行中；左侧 Finder/启动台常驻不可移除；点未运行→启动，点已运行→不新建进程只切前台；常驻项拖出无效。
+
+### 10.4 扩展一个 App
+
+在 `macwm.h` 的 `enum mac_app` **末尾**追加编号、`macwm.c` 的 `mac_defs[]` 与菜单表加对应项，即可出现在 Dock 与开始菜单；渲染主题色在 `macdesktop.c:app_tint()` 加分支。逻辑事件仍走 `mac_dispatch`，无需改输入层。
+
+### 10.5 内存与地址
+
+新增模块使内核 `.text` 增长约 12KB，经链接脚本 4KB 对齐链传导顶到用户区；按项目历史惯例把 `USER_BASE` 由 `0x4023c000` 上移到 `0x40244000`、用户程序 `-Ttext` 同步到 `0x40248000`（落在新用户区内）。`USER_END=0x40400000` 不变，128MB RAM 空间充裕。`run_regression_r.sh` 15/15、`test_round60.py` 16/16 验证用户程序与 golden 零扰动。

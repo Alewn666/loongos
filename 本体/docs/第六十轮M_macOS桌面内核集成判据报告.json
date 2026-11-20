@@ -1,0 +1,63 @@
+{
+  "round": "60.0-M",
+  "title": "macOS 风格桌面内核原生集成",
+  "date": "2026-11-20",
+  "goal": "把 MacDesktop复刻 的 macOS 交互内核用 C 重写并接进 LoongOS 图形栈，成为系统原生可启动桌面（非 Web 演示）",
+  "architecture": {
+    "logic_core": "macwm.c/.h —— 纯逻辑，无硬件依赖，struct mac_state(430B)，mac_dispatch 单一状态入口",
+    "render_input": "macdesktop.c —— 复用 gfx.c 原语画三段菜单栏/Dock/窗口三色按钮，键鼠翻译成 mac_dispatch 事件",
+    "entry": "串口 shell 的 macdesktop 命令（新增可选命令，不进 help / golden 零扰动）",
+    "decoupling": "逻辑内核(宿主可单测) 与 渲染适配(内核态) 分离"
+  },
+  "interaction_semantics": [
+    "App/窗口解耦：一App 0..N窗口；红关窗不退出、圆点保留；仅quit结束进程",
+    "全局active_app焦点：桌面永远属Finder，无焦点态不存在；菜单栏中间段只绑active_app",
+    "焦点联动三路径：点窗口→激活其App / 点桌面→Finder / Cmd+Tab→MRU切换，均刷新菜单栏",
+    "红黄绿：红关窗黄最小化进Dock绿全屏独占Space；Option+绿=zoom不建Space",
+    "Dock：圆点=运行中，左侧常驻不可移除，点未运行启动/点已运行切前台不新建"
+  ],
+  "memory": {
+    "USER_BASE": "0x4023c000 -> 0x40244000 (上移32KB)",
+    "Ttext": "0x40240000 -> 0x40248000",
+    "reason": "新增模块 text +12KB，经链接脚本4KB对齐链传导顶到用户区；按项目惯例上移用户区让出空间",
+    "upper_margin": "20KB 充裕 OK，四项 guard 全过"
+  },
+  "verification": {
+    "test_macwm_host": {
+      "type": "宿主逻辑单测",
+      "result": "57/57 PASS"
+    },
+    "test_macdesktop": {
+      "type": "QEMU TCG 端到端(QMP读g_ms.active_app+screendump)",
+      "result": "9/9 PASS",
+      "checks": [
+        "进入桌面",
+        "初始焦点有效",
+        "截图成功",
+        "Dock点Safari→active=2",
+        "点桌面→Finder=0",
+        "点窗口→Safari=2",
+        "返回串口",
+        "用户ELF新地址运行"
+      ]
+    },
+    "test_round60": {
+      "type": "59.0-A 开发者API判据(用户程序新地址)",
+      "result": "16/16 PASS"
+    },
+    "run_regression_r": {
+      "type": "15项全套回归",
+      "result": "15/15 PASS",
+      "note": "golden基线(第2项)与EL0用户程序33用例(第6项)零扰动"
+    },
+    "screenshot": "/tmp/loongos_mac_shots/macdesktop_main.png（三段菜单栏+Dock+错开窗口+红黄绿按钮可见）"
+  },
+  "honest_notes": [
+    "这是内核原生桌面，不是浏览器Web演示；Web版 MacDesktop复刻 保留作为原型",
+    "窗口内容区为App名占位（UI从简）；交互逻辑与状态变化严格对齐，视觉非高保真macOS",
+    "快捷键以 Ctrl 代 macOS 的 Command；Spotlight/启动台为逻辑态+简化覆盖层",
+    "真机 KVM 未执行（宿主无 aarch64 KVM），判据环境为 QEMU TCG，不冒充",
+    "菜单栏右侧状态栏中英混排宽度计算略有重叠（纯视觉瑕疵，不影响交互）"
+  ],
+  "iso_md5": "fee08edd5fd68483edecb522615e8c69"
+}

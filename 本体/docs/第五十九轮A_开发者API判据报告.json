@@ -1,7 +1,7 @@
 {
   "mode": "TCG",
   "cmd": "qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a57 -m 256M -kernel /workspace/安卓/loongos/本体/kernel.elf -nographic -no-reboot",
-  "output": "run /home/u60api\n\n[run] 装载 /home/u60api entry=0x0000000040240000 → 进 EL0（syscall: x8=0 write/2 open/3 read/4 close/5 lseek · x8=1 exit）\n\n== LoongOS Developer API demo (59.0-A) ==\n\n  uname: LoongOS 59.0-A aarch64\n\n  wall  = 1795170183 s\n\n  mono  = 7.458239824 s\n\n  uptime= 7 s\n\n  rng   = unavailable\n\n  fs    = used 30 / total 256 B\n\n  heap  = used 6664 peak 7688 B\n\n  pid   = 1 ppid  = 0\n\n  nanosleep(10ms) ok\n\n== API demo done ==\n\n\n\n[run] 程序退出 code=0\n\n[el1] 已从 EL0 撤回内核，shell 继续\n\n> ",
+  "output": "run /home/u60api\n\n[run] 装载 /home/u60api entry=0x0000000040248000 → 进 EL0（syscall: x8=0 write/2 open/3 read/4 close/5 lseek · x8=1 exit）\n\n== LoongOS Developer API demo (59.0-A) ==\n\n  uname: LoongOS 59.0-A aarch64\n\n  wall  = 1795176666 s\n\n  mono  = 7.300645184 s\n\n  uptime= 7 s\n\n  rng   = unavailable\n\n  fs    = used 30 / total 256 B\n\n  heap  = used 6664 peak 7688 B\n\n  pid   = 1 ppid  = 0\n\n  nanosleep(10ms) ok\n\n== API demo done ==\n\n\n\n[run] 程序退出 code=0\n\n[el1] 已从 EL0 撤回内核，shell 继续\n\n> ",
   "checks": [
     {
       "name": "1 内核横幅 + shell 提示符就绪",
@@ -36,17 +36,17 @@
     {
       "name": "7 API 演示程序跑完并体面退出 code=0（无 EL0 fault）",
       "ok": true,
-      "detail": "name: LoongOS 59.0-A aarch64\n\n  wall  = 1795170183 s\n\n  mono  = 7.458239824 s\n\n  uptime= 7 s\n\n  rng   = unavailable\n\n  fs    = used 30 / total 256 B\n\n  heap  = used 6664 peak 7688 B\n\n  pid   = 1 ppid "
+      "detail": "name: LoongOS 59.0-A aarch64\n\n  wall  = 1795176666 s\n\n  mono  = 7.300645184 s\n\n  uptime= 7 s\n\n  rng   = unavailable\n\n  fs    = used 30 / total 256 B\n\n  heap  = used 6664 peak 7688 B\n\n  pid   = 1 ppid "
     },
     {
       "name": "8 uname 返回 LoongOS / 59.0-A / aarch64",
       "ok": true,
-      "detail": "run /home/u60api\n\n[run] 装载 /home/u60api entry=0x0000000040240000 → 进 EL0（syscall: x8=0 write/2 open/3 read/4 close/5 lseek · x8=1 exit）\n\n== LoongOS Developer API demo (59.0-A) ==\n\n  uname: LoongOS 59."
+      "detail": "run /home/u60api\n\n[run] 装载 /home/u60api entry=0x0000000040248000 → 进 EL0（syscall: x8=0 write/2 open/3 read/4 close/5 lseek · x8=1 exit）\n\n== LoongOS Developer API demo (59.0-A) ==\n\n  uname: LoongOS 59."
     },
     {
       "name": "9 clock_gettime(墙钟) 返回合理 Unix 秒（>1577836800=2020）",
       "ok": true,
-      "detail": "1795170183"
+      "detail": "1795176666"
     },
     {
       "name": "10 clock_gettime(单调钟) 返回非 0 秒",

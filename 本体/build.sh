@@ -19,9 +19,9 @@ CROSS=aarch64-linux-gnu-
 CFLAGS="-nostdlib -ffreestanding -fno-builtin -fno-stack-protector -fno-strict-aliasing -mcpu=cortex-a57 -mstrict-align -O2 -Wall ${EXTRA_CFLAGS:-}"
 # 用户程序：独立 ELF，链在用户区（kernel.c 的 run 校验 vaddr 必须在 [USER_BASE,USER_END)）
 # ⚠️ USER_BASE 现为 0x4023c000（第五十八轮 C 为 LOONG 包管理器 0x40238000→0x4023c000），
-#    用户程序链在 -Ttext=0x40240000；该值必须落在 [USER_BASE,USER_END) 内，
+#    用户程序链在 -Ttext=0x40248000；该值必须落在 [USER_BASE,USER_END) 内，
 #    否则 cmd_run 报「入口不在用户区」。改 USER_BASE 时记得同步这里。
-UCFLAGS="-nostdlib -ffreestanding -static -fno-stack-protector -fno-pie -O2 -Wall -Ttext=0x40240000 -Wl,--build-id=none -Wl,-z,max-page-size=0x1000"
+UCFLAGS="-nostdlib -ffreestanding -static -fno-stack-protector -fno-pie -O2 -Wall -Ttext=0x40248000 -Wl,--build-id=none -Wl,-z,max-page-size=0x1000"
 
 # ---- 内核编译单元：唯一事实来源（顺序即链接顺序，勿随意重排）----
 KERN_SRCS="boot.S kernel.c fs.c crypto.c usb_kbd.c \
@@ -29,7 +29,7 @@ KERN_SRCS="boot.S kernel.c fs.c crypto.c usb_kbd.c \
            blkdev.c virtio_blk.c virtio_blk_legacy.c virtio_scsi.c virtio_net.c \
            net.c tcp.c smp.c nvme.c virtio_rng.c pci.c \
            nic.c e1000.c rtl8139.c \
-           gfx.c gfxterm.c desktop.c"
+           gfx.c gfxterm.c desktop.c macwm.c macdesktop.c"
 # 由源码名派生目标文件名（.S / .c → .o）
 OBJS=""
 for s in $KERN_SRCS; do
