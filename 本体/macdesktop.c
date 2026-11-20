@@ -517,7 +517,7 @@ static int dock_items(int *xs, int *apps, int *wins, int cap) {
     for(int i=0;i<mnc && n<cap;i++){
         xs[n]=x; apps[n]=mac_win_app(&g_ms,mins[i]); wins[n]=mins[i]; n++; x+=DOCK_ICON+DOCK_GAP;
     }
-    xs[n]=gfx_width()-DOCK_ICON-8; apps[n]=-1; wins[n]=-2; n++; /* 废纸篓 */
+    xs[n]=x+16; apps[n]=-1; wins[n]=-2; n++; /* 废纸篓：紧跟图标组，+16 分隔与 dock_x0() 的 total 计算一致 */
     return n;
 }
 
@@ -531,9 +531,11 @@ static void draw_dock(void) {
     gfx_blend_roundrect((struct gfx_rect){x0,dy,dw,DOCK_H-8}, C_DOCKBG, 14, 215);
     gfx_roundrect((struct gfx_rect){x0,dy,dw,2}, 0xFFFFFF, 1); /* 顶部高光 */
     for (int i=0;i<n;i++){
+        /* App 区与废纸篓之间的分隔竖线（macOS 风格） */
+        if (wins[i]==-2 && i>0) gfx_fill((struct gfx_rect){xs[i]-9, dock_y0()+2, 1, DOCK_ICON-4}, 0xB0B0B5);
         int x=xs[i], y=dock_y0(), s=DOCK_ICON;
-        /* 悬停放大：图标上移 + 变大 */
-        int hover = (apps[i]==g_hover_dock && wins[i]<0);
+        /* 悬停放大：仅 App 图标（排除废纸篓 wins=-2、最小化缩略 wins>=0），上移 + 变大 */
+        int hover = (apps[i]>=0 && wins[i]==-1 && apps[i]==g_hover_dock);
         if(hover){ y-=8; s+=8; x-=4; }
         if(wins[i]==-2){ /* 废纸篓 */
             gfx_roundrect((struct gfx_rect){x,y,s,s},0x9A9AA0,8);
@@ -605,7 +607,7 @@ static int dock_app_at(int x, int y) {
     int n=dock_items(xs,apps,wins,32);
     for (int i=0;i<n;i++){
         int s=DOCK_ICON, yy=dock_y0();
-        if(apps[i]==g_hover_dock && wins[i]<0){ s+=8; yy-=8; }
+        if(apps[i]>=0 && wins[i]==-1 && apps[i]==g_hover_dock){ s+=8; yy-=8; }
         if(hit((struct gfx_rect){xs[i]-(s-DOCK_ICON)/2,yy,s,s}, x, y)) return apps[i];
     }
     return -1;

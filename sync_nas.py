@@ -267,6 +267,8 @@ FILES = [
     ('本体/font_cjk.h', '本体/font_cjk.h'),
     ('本体/tools/gen_font.py', '本体/tools/gen_font.py'),
     ('本体/docs/第六十轮Q_鼠标关闭与中文适配判据报告.json', '本体/docs/第六十轮Q_鼠标关闭与中文适配判据报告.json'),
+    # 60.0-R：Dock 布局与悬停修复
+    ('本体/docs/第六十轮R_Dock布局修复判据报告.json', '本体/docs/第六十轮R_Dock布局修复判据报告.json'),
 ]
 
 def md5_local(path):

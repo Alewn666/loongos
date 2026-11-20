@@ -1,0 +1,24 @@
+{
+  "轮次": "60.0-R",
+  "主题": "Dock 布局与悬停修复",
+  "日期": "2026-11-21",
+  "复现方式": "QEMU screendump + QMP 坐标注入, 实际上手操作桌面(非串口自报)",
+  "改动": {
+    "底板横跨全屏与图标挤左侧": "真机截图确认 Dock 底板从 x≈140 拉到屏幕最右≈795, 10个App图标挤在 x≈160-590, 废纸篓钉在最右 x≈765, 中间约160px空白毛玻璃。根因: dock_x0() 把废纸篓按'紧跟图标组+16分隔'计入居中total, 但 dock_items() 把废纸篓坐标硬编码 gfx_width()-DOCK_ICON-8(屏幕最右), 二者不一致导致底板拉宽居中失效。修复: 废纸篓坐标改为循环结束后的 x+16 与 dock_x0() total 对齐; Dock 紧凑居中图标均匀; App区与废纸篓之间加竖向分隔线(macOS风格)",
+    "废纸篓被误放大": "放大图确认废纸篓比其它图标大且偏上。根因: 悬停条件 apps[i]==g_hover_dock && wins[i]<0 在'无悬停(g_hover_dock=-1)+废纸篓(apps=-1,wins=-2)'时误成立, 废纸篓常驻放大态。修复: 条件收紧为 apps[i]>=0 && wins[i]==-1 && apps[i]==g_hover_dock, 仅真App图标参与悬停放大; draw_dock() 与 dock_app_at() 同步修改",
+    "布局约定": "开发者指南新增10.8节: Dock所有项由 dock_items() 按序累加x生成, dock_x0() total 必须与之对齐; 新增Dock项要同步两处"
+  },
+  "验证": {
+    "macwm逻辑单测": "57/57(逻辑层macwm.c未改, 原文依赖不受影响)",
+    "test_macdesktop": "10/10(QEMU端到端: Dock点Safari激活/焦点联动/拖动b.x70->150/用户ELF新地址)",
+    "test_boot_desktop": "3/3(开机默认mac + 苹果菜单Classic切原桌面)",
+    "test_round60": "16/16(用户ELF新USER_BASE地址)",
+    "run_regression_r": "15/15(golden逐字一致/桌面P2/P3/鼠标跟随校准/EL0 33用例/网络/多盘安装 全零扰动)",
+    "guard": "四项全过, 上界余量4KB(关注档, 安全), 修改落 .text rodata未增长",
+    "视觉亲验": "Dock紧凑居中图标均匀/废纸篓前分隔线清晰/废纸篓不再误放大; 悬停只有对应图标放大上移; 点击App正确激活置顶窗口无残影花屏"
+  },
+  "布局": "USER_BASE=0x40244000, -Ttext=0x40248000 (沿用)",
+  "iso_md5": "1ff6492cc07c799f71c4422b190df548",
+  "进入方式": "开机默认进macOS桌面; 苹果菜单→Classic Desktop切原桌面; 串口 macdesktop/desktop 互换",
+  "边界": "内核原生非Web; 本轮仅改渲染/命中层(macdesktop.c), 逻辑层未动; QEMU TCG; 上界余量4KB(关注档, 后续大体量新增需重评内存布局)"
+}
