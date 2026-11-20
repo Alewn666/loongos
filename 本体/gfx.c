@@ -157,6 +157,129 @@ void gfx_line(int x0, int y0, int x1, int y1, u32 rgb)
     }
 }
 
+/* =========================================================================
+ * 桌面质感图元：圆角 / 实心圆 / 垂直渐变 / 半透明混合
+ * 全部复用 drawable() 裁剪，不占静态大数组；渐变与圆角按行 gfx_fill 批量写。
+ * 半透明混合是逐像素读改写，只用于菜单栏/Dock/窗口等局部，不做全屏。
+ * ========================================================================= */
+
+static inline u32 getpx(int x, int y)
+{
+    return G_fb[(uint32_t)y * (uint32_t)G_stride + (uint32_t)x];
+}
+
+/* 小整数开方（半径一般 <= 32，线性探测足够，避免 libm） */
+static int isqrt_small(int v)
+{
+    int r = 0;
+    while ((r + 1) * (r + 1) <= v) r++;
+    return r;
+}
+
+/* 圆角实心矩形：每行按圆方程算左右缩进，中部整宽行批量填充 */
+void gfx_roundrect(struct gfx_rect r, u32 rgb, int rad)
+{
+    if (!G_fb) return;
+    r = drawable(r);
+    if (!gfx_rect_valid(r)) return;
+    if (rad < 0) rad = 0;
+    if (rad > r.w / 2) rad = r.w / 2;
+    if (rad > r.h / 2) rad = r.h / 2;
+    if (rad == 0) { gfx_fill(r, rgb); return; }
+    if (r.h > 2 * rad)
+        gfx_fill((struct gfx_rect){r.x, r.y + rad, r.w, r.h - 2 * rad}, rgb);
+    int rr = rad * rad;
+    for (int y = 0; y < rad; y++) {
+        int yy = rad - 1 - y;
+        int off = rad - isqrt_small(rr - yy * yy);
+        int w = r.w - 2 * off;
+        if (w <= 0) continue;
+        gfx_fill((struct gfx_rect){r.x + off, r.y + y, w, 1}, rgb);
+        gfx_fill((struct gfx_rect){r.x + off, r.y + r.h - 1 - y, w, 1}, rgb);
+    }
+}
+
+/* 实心圆（中点整数法，按水平跨度批量填充，用于红黄绿按钮/运行圆点/图标） */
+void gfx_filled_circle(int cx, int cy, int rad, u32 rgb)
+{
+    if (!G_fb || rad < 0) return;
+    int x = rad, y = 0, err = 1 - rad;
+    while (x >= y) {
+        gfx_fill((struct gfx_rect){cx - x, cy + y, 2 * x + 1, 1}, rgb);
+        gfx_fill((struct gfx_rect){cx - x, cy - y, 2 * x + 1, 1}, rgb);
+        gfx_fill((struct gfx_rect){cx - y, cy + x, 2 * y + 1, 1}, rgb);
+        gfx_fill((struct gfx_rect){cx - y, cy - x, 2 * y + 1, 1}, rgb);
+        y++;
+        if (err < 0) err += 2 * y + 1;
+        else { x--; err += 2 * (y - x) + 1; }
+    }
+}
+
+/* 垂直线性渐变：逐行插值后整行批量填充（壁纸/标题栏/按钮立体感） */
+void gfx_vgrad(struct gfx_rect r, u32 top, u32 bottom)
+{
+    if (!G_fb) return;
+    r = drawable(r);
+    if (!gfx_rect_valid(r)) return;
+    int h = r.h;
+    int r0=(int)((top>>16)&255), g0=(int)((top>>8)&255), b0=(int)(top&255);
+    int r1=(int)((bottom>>16)&255), g1=(int)((bottom>>8)&255), b1=(int)(bottom&255);
+    for (int i = 0; i < h; i++) {
+        int t = h > 1 ? (i * 255) / (h - 1) : 0;
+        u32 c = GFX_RGB(r0 + (r1 - r0) * t / 255,
+                        g0 + (g1 - g0) * t / 255,
+                        b0 + (b1 - b0) * t / 255);
+        gfx_fill((struct gfx_rect){r.x, r.y + i, r.w, 1}, c);
+    }
+}
+
+/* 半透明矩形混合：out = src*a + dst*(1-a)，alpha 0..255。局部使用。 */
+void gfx_blend(struct gfx_rect r, u32 rgb, int alpha)
+{
+    if (!G_fb || alpha <= 0) return;
+    if (alpha >= 255) { gfx_fill(r, rgb); return; }
+    r = drawable(r);
+    if (!gfx_rect_valid(r)) return;
+    uint32_t *base = (uint32_t *)(uintptr_t)G_fb;
+    int sr=(int)((rgb>>16)&255), sg=(int)((rgb>>8)&255), sb=(int)(rgb&255);
+    int ia = 255 - alpha;
+    for (int y = r.y; y < r.y + r.h; y++) {
+        uint32_t *p = base + (u64)(u32)y * (u32)G_stride + (u32)r.x;
+        for (int i = 0; i < r.w; i++, p++) {
+            u32 d = *p;
+            int dr=(int)((d>>16)&255), dg=(int)((d>>8)&255), db=(int)(d&255);
+            *p = GFX_RGB((sr*alpha + dr*ia)/255,
+                         (sg*alpha + dg*ia)/255,
+                         (sb*alpha + db*ia)/255);
+        }
+    }
+    __asm__ volatile("" ::: "memory");
+}
+
+/* 圆角半透明矩形（毛玻璃菜单栏/Dock 底板）：逐行算缩进后 blend 单行 */
+void gfx_blend_roundrect(struct gfx_rect r, u32 rgb, int rad, int alpha)
+{
+    if (!G_fb || alpha <= 0) return;
+    r = gfx_intersect(G_clip[G_clip_n - 1], r);
+    r = gfx_clip(r, G_w, G_h);
+    if (!gfx_rect_valid(r)) return;
+    if (rad < 0) rad = 0;
+    if (rad > r.w / 2) rad = r.w / 2;
+    if (rad > r.h / 2) rad = r.h / 2;
+    if (rad == 0) { gfx_blend(r, rgb, alpha); return; }
+    if (r.h > 2 * rad)
+        gfx_blend((struct gfx_rect){r.x, r.y + rad, r.w, r.h - 2 * rad}, rgb, alpha);
+    int rr = rad * rad;
+    for (int y = 0; y < rad; y++) {
+        int yy = rad - 1 - y;
+        int off = rad - isqrt_small(rr - yy * yy);
+        int w = r.w - 2 * off;
+        if (w <= 0) continue;
+        gfx_blend((struct gfx_rect){r.x + off, r.y + y, w, 1}, rgb, alpha);
+        gfx_blend((struct gfx_rect){r.x + off, r.y + r.h - 1 - y, w, 1}, rgb, alpha);
+    }
+}
+
 /* ---- UTF-8 解码（只用于量宽度与逐码点绘制，不攒状态） ---- */
 /* 返回码点、把 *s 推进到下一个字符；非法序列返回 '?' 且只推进 1 字节 */
 static u32 u8_next(const char **s)

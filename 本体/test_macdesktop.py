@@ -130,14 +130,17 @@ def active(q):
 def main():
     print("===== 第六十轮 macOS 桌面内核集成 端到端验收 =====")
     print("    内核 md5=%s" % subprocess.check_output(["md5sum",KERNEL],text=True).split()[0])
-    global ACTIVE_OFF
-    # 用编译期计算 struct mac_state 里 active_app 的偏移（宿主 gcc，与内核同 ABI 布局）
+    global ACTIVE_OFF, WIN0X_OFF
+    # 用编译期计算 struct mac_state 里 active_app / wins[0].b.x 的偏移
+    # （宿主 gcc，与内核同 ABI 布局）
     open("/tmp/off.c","w").write(
         '#include "macwm.h"\n#include <stdio.h>\n#include <stddef.h>\n'
-        'int main(){printf("%zu",offsetof(struct mac_state,active_app));return 0;}\n')
+        'int main(){printf("%zu %zu",offsetof(struct mac_state,active_app),'
+        'offsetof(struct mac_state,wins[0].b.x));return 0;}\n')
     subprocess.check_call(["cc","-I",ROOT,"/tmp/off.c","-o","/tmp/off"])
-    ACTIVE_OFF = int(subprocess.check_output(["/tmp/off"]).decode())
-    print("    active_app 结构偏移 = %d" % ACTIVE_OFF)
+    offs = subprocess.check_output(["/tmp/off"]).decode().split()
+    ACTIVE_OFF, WIN0X_OFF = int(offs[0]), int(offs[1])
+    print("    active_app 偏移=%d  wins[0].b.x 偏移=%d" % (ACTIVE_OFF, WIN0X_OFF))
 
     cmd=["qemu-system-aarch64","-machine","virt,gic-version=2","-cpu","cortex-a57",
          "-m","256","-smp","1","-kernel",KERNEL,"-display","none",
@@ -165,20 +168,36 @@ def main():
         png=q.shot("macdesktop_main")
         check("screendump 截图成功", os.path.getsize(png)>3000, png)
 
-        # Dock 点击 Safari（App 序号 2：Finder=0 启动台=1 Safari=2）→ 激活
-        # Dock 从 x=8 起、每图标 42+6=48 宽；Safari 是第 3 个
-        q.click(8+2*(42+6)+20, H-66+8+20)
+        # Dock 居中：10 App + 1 废纸篓 = 11 项，每项 40+5=45 宽，前后各留 8
+        # total=11*45-5+16=506，x0=(800-506)/2=147；Safari 序号 2
+        dock_x0 = (W - (11*45 - 5 + 16)) // 2
+        safari_x = dock_x0 + 2*45 + 20
+        safari_y = H - 62 + 10 + 20          # dock_y0 + 半图标
+        # Dock 点击 Safari → 激活
+        q.click(safari_x, safari_y)
         time.sleep(0.4)
         check("Dock 点 Safari→激活", active(q)==MA_SAFARI, "active_app=%s"%active(q))
         before = active(q)
-        # 点桌面空白（窗口右下外侧空隙）→ Finder
-        q.click(782, 470)
+        # 点桌面空白（右下窗口之外的空隙）→ Finder
+        q.click(782, 500)
         time.sleep(0.3)
         check("点桌面空白→Finder", active(q)==MA_FINDER, "before=%s active_app=%s"%(before,active(q)))
         # 点 Safari 窗口标题栏 → 重新激活 Safari（焦点联动）
-        q.click(8+2*(42+6)+20, H-66+8+20)
+        # Safari 首窗 b=(70,54,520,340)，标题栏 y=54~80，避开 x=80~132 的三色按钮
+        q.click(300, 66)
         time.sleep(0.3)
         check("点窗口触发 active_app 联动", active(q)==MA_SAFARI, "active_app=%s"%active(q))
+
+        # 拖动窗口：Safari(窗口0) 标题栏按住拖右 80px，b.x 应增大
+        bx_before = q.r32("g_ms", WIN0X_OFF) & 0xFFFF
+        q.abs_move(300, 66); time.sleep(0.1)
+        q.btn(True); time.sleep(0.1)
+        q.abs_move(360, 66); time.sleep(0.1)
+        q.abs_move(380, 70); time.sleep(0.15)
+        q.btn(False); time.sleep(0.3)
+        bx_after = q.r32("g_ms", WIN0X_OFF) & 0xFFFF
+        check("拖标题栏移动窗口", bx_after != bx_before,
+              "b.x %d -> %d" % (bx_before, bx_after))
 
         q.shot("macdesktop_after_clicks")
 

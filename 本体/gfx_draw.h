@@ -35,6 +35,12 @@ void gfx_release_screen(void);
 void gfx_fill(struct gfx_rect r, uint32_t rgb);
 void gfx_rect_draw(struct gfx_rect r, uint32_t rgb, int thickness);
 void gfx_line(int x0, int y0, int x1, int y1, uint32_t rgb);
+/* 桌面质感图元：圆角矩形/实心圆/垂直渐变/半透明混合（均过裁剪栈） */
+void gfx_roundrect(struct gfx_rect r, uint32_t rgb, int rad);
+void gfx_filled_circle(int cx, int cy, int rad, uint32_t rgb);
+void gfx_vgrad(struct gfx_rect r, uint32_t top, uint32_t bottom);
+void gfx_blend(struct gfx_rect r, uint32_t rgb, int alpha);
+void gfx_blend_roundrect(struct gfx_rect r, uint32_t rgb, int rad, int alpha);
 
 /* P3.3 文本插入光标（caret）：架构中立的绘制 helper，ARM 图形终端与 x86
    键盘回显窗口共用。闪烁「相位」由各自架构的时钟驱动（ARM 用 cntpct_el0，
