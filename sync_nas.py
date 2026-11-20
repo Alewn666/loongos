@@ -258,6 +258,10 @@ FILES = [
     ('本体/test_macdesktop.py', '本体/test_macdesktop.py'),
     ('本体/docs/第六十轮M_macOS桌面内核集成判据报告.json', '本体/docs/第六十轮M_macOS桌面内核集成判据报告.json'),
     ('本体/docs/第六十轮N_macOS桌面质感重做判据报告.json', '本体/docs/第六十轮N_macOS桌面质感重做判据报告.json'),
+    # 60.0-P：开机默认 macOS 桌面 + 桌面互换 + 流畅度视觉优化
+    ('本体/test_boot_desktop.py', '本体/test_boot_desktop.py'),
+    ('本体/docs/第六十轮P_默认桌面与优化判据报告.json', '本体/docs/第六十轮P_默认桌面与优化判据报告.json'),
+    ('sync_docs_nas.py', 'sync_docs_nas.py'),
 ]
 
 def md5_local(path):
