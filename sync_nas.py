@@ -262,6 +262,11 @@ FILES = [
     ('本体/test_boot_desktop.py', '本体/test_boot_desktop.py'),
     ('本体/docs/第六十轮P_默认桌面与优化判据报告.json', '本体/docs/第六十轮P_默认桌面与优化判据报告.json'),
     ('sync_docs_nas.py', 'sync_docs_nas.py'),
+    # 60.0-Q：鼠标光标可见 + 窗口关闭残影 + 中文适配
+    ('本体/gfx_draw.h', '本体/gfx_draw.h'),
+    ('本体/font_cjk.h', '本体/font_cjk.h'),
+    ('本体/tools/gen_font.py', '本体/tools/gen_font.py'),
+    ('本体/docs/第六十轮Q_鼠标关闭与中文适配判据报告.json', '本体/docs/第六十轮Q_鼠标关闭与中文适配判据报告.json'),
 ]
 
 def md5_local(path):

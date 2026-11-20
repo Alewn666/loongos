@@ -250,6 +250,63 @@ void gfx_soft_circle(int cx, int cy, int rad, u32 rgb, int max_a)
     }
 }
 
+/* =========================================================================
+ * 鼠标箭头光标：经典 macOS/Windows 白色箭头 + 黑色描边 + 右下投影。
+ * 用 12x19 位图驱动：'X'=黑边, 'o'=白填充, ' '=透明。逐像素读改写（局部小面积）。
+ * 热点在左上角(0,0)，即箭头尖端。深色描边保证浅色窗口上可见，
+ * 白色填充保证深色壁纸/终端上可见，投影增加层次。
+ * ========================================================================= */
+static const char *const CURSOR_BMP[19] = {
+    "X                   ",
+    "XX                  ",
+    "XoX                 ",
+    "XooX                ",
+    "XoooX               ",
+    "XooooX              ",
+    "XoooooX             ",
+    "XooooooX            ",
+    "XoooooooX           ",
+    "XooooooooX          ",
+    "XoooooooooX         ",
+    "XooooooooooX        ",
+    "XoooooXXXXX         ",
+    "XoooXoX             ",
+    "XooXoX              ",
+    "XoXXoX              ",
+    "XX XoX              ",
+    "X  XoX              ",
+    "    XX              ",
+};
+#define CURSOR_W 20
+#define CURSOR_H 19
+
+void gfx_cursor(int x, int y)
+{
+    if (!G_fb) return;
+    struct gfx_rect clip = gfx_clip(G_clip[G_clip_n - 1], G_w, G_h);
+    /* 第一遍：投影。箭头整体右移2下移2，用半透明黑（alpha≈90）读改写。 */
+    for (int pass = 0; pass < 2; pass++) {
+        int off = pass ? 0 : 2;          /* pass0=投影(+2,+2)，pass1=主体(0,0) */
+        for (int row = 0; row < CURSOR_H; row++) {
+            const char *s = CURSOR_BMP[row];
+            for (int col = 0; col < CURSOR_W; col++) {
+                char c = s[col];
+                if (c != 'X' && c != 'o') continue;
+                int xx = x + col + off, yy = y + row + off;
+                if (xx < clip.x || xx >= clip.x + clip.w ||
+                    yy < clip.y || yy >= clip.y + clip.h) continue;
+                if (!pass) {
+                    u32 d = getpx(xx, yy);
+                    int dr=(int)((d>>16)&255), dg=(int)((d>>8)&255), db=(int)(d&255);
+                    px(xx, yy, GFX_RGB(dr*165/255, dg*165/255, db*165/255));
+                } else {
+                    px(xx, yy, (c == 'X') ? 0x14141Cu : 0xFFFFFFu);
+                }
+            }
+        }
+    }
+}
+
 /* 垂直线性渐变：逐行插值后整行批量填充（壁纸/标题栏/按钮立体感） */
 void gfx_vgrad(struct gfx_rect r, u32 top, u32 bottom)
 {

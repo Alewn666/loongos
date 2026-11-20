@@ -44,6 +44,10 @@ void gfx_blend_roundrect(struct gfx_rect r, uint32_t rgb, int rad, int alpha);
 /* 柔和径向光晕：alpha 从中心 max_a 平滑衰减到边缘 0（壁纸光晕用，无硬边） */
 void gfx_soft_circle(int cx, int cy, int rad, uint32_t rgb, int max_a);
 
+/* 鼠标箭头光标：经典白色箭头 + 黑色描边 + 投影，保证在任意深浅背景上都清晰可见。
+   参数 x,y 为箭头尖端（热点）坐标。cx/cy 为可选裁剪提示（传光标所在矩形即可）。 */
+void gfx_cursor(int x, int y);
+
 /* P3.3 文本插入光标（caret）：架构中立的绘制 helper，ARM 图形终端与 x86
    键盘回显窗口共用。闪烁「相位」由各自架构的时钟驱动（ARM 用 cntpct_el0，
    x86 用 PIT g_ticks），这里只负责把相位画成一个 8x16 的方块。

@@ -58,6 +58,9 @@ static int g_drag_dx, g_drag_dy;/* 拖动锚点：鼠标-窗口左上 */
 static int g_drag_ox, g_drag_oy;/* 上一帧窗口位置（局部重绘用） */
 static int g_hover_dock = -1;  /* 当前鼠标悬停的 Dock App，-1=无 */
 static int g_goto_classic = 0; /* 苹果菜单点 Classic Desktop → 1，退出后由调用方进原桌面 */
+/* 光标脏区：箭头位图 20x19 + 右下投影 2px。移动时登记旧/新两块，擦旧画新。 */
+#define CURSOR_BOX_W 22
+#define CURSOR_BOX_H 21
 
 /* 苹果菜单项数（含末尾 Classic Desktop 切换项） */
 #define APPLE_MENU_N 9
@@ -91,6 +94,33 @@ static void damage_ui(void) {
         if(w->state==MW_FULL){r.x=0;r.y=MBAR_H;r.w=W;r.h=H-MBAR_H;}
         damage_pad(r,10);
     }
+}
+
+/* 渲染层字符串等值比较与中文菜单映射。
+ * 逻辑层 macwm.c 的菜单表保持英文（宿主单测 57 项依赖原文），
+ * 只在帧缓冲渲染与菜单栏命中测试处统一转中文，保证两处宽度计算一致。 */
+static int zeq(const char *a, const char *b) {
+    while (*a && *b) { if (*a != *b) return 0; a++; b++; }
+    return *a == *b;
+}
+static const char *zh_menu(const char *s) {
+    static const char *const EN[] = {
+        "File","Edit","View","Go","Window","Help","History","Bookmarks",
+        "Format","Shell","Controls","About This Mac","System Settings...",
+        "Recent Items","Force Quit...","Sleep","Restart...","Shut Down...",
+        "Lock Screen","Classic Desktop","Minimize","Bring All to Front",
+        "Full Screen"
+    };
+    static const char *const ZH[] = {
+        "文件","编辑","显示","前往","窗口","帮助","历史","书签",
+        "格式","终端","控制","关于本机","系统设置",
+        "最近使用的项目","强制退出","睡眠","重新启动","关机",
+        "锁定屏幕","经典桌面","最小化","全部置于顶层",
+        "全屏"
+    };
+    int n = (int)(sizeof(EN)/sizeof(EN[0]));
+    for (int i = 0; i < n; i++) if (zeq(s, EN[i])) return ZH[i];
+    return s;
 }
 
 /* App 主题色 / 图标底色 */
@@ -157,25 +187,29 @@ static void draw_status_icons(int W) {
     gfx_rect_draw((struct gfx_rect){bx,y+2,20,9}, C_MBAR_FG, 1);
     gfx_fill((struct gfx_rect){bx+1,y+3,13,7}, C_MBAR_FG);
     gfx_fill((struct gfx_rect){bx+20,y+5,2,4}, C_MBAR_FG);
-    /* 时间：读 PL031 真实墙钟，格式 "Wed 14:07"（星期缩写+本地时分）。
-       RTC 不可用时回退 "--- --:--"，布局宽度不变。 */
-    char tbuf[12];
+    /* 时间：读 PL031 真实墙钟，中文格式「周三 14:07」。
+       RTC 不可用时回退「周三 --:--」，布局宽度不变。 */
+    char tbuf[16];
     u64 ep = rtc_now();
+    int wd = -1, hh = -1, mi = -1;
     if (ep) {
-        int yy,mo,dd,hh,mi,ss,wd;
+        int yy,mo,dd,ss;
         rtc_breakdown(ep,&yy,&mo,&dd,&hh,&mi,&ss,&wd);
-        static const char *const wdname[7]={"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
-        const char *wn = (wd>=0&&wd<7)?wdname[wd]:"---";
-        tbuf[0]=wn[0]; tbuf[1]=wn[1]; tbuf[2]=wn[2]; tbuf[3]=' ';
-        tbuf[4]='0'+((hh/10)%10); tbuf[5]='0'+(hh%10);
-        tbuf[6]=':';
-        tbuf[7]='0'+((mi/10)%10); tbuf[8]='0'+(mi%10);
-        tbuf[9]=0;
-    } else {
-        tbuf[0]='-';tbuf[1]='-';tbuf[2]='-';tbuf[3]=' ';
-        tbuf[4]='-';tbuf[5]='-';tbuf[6]=':';tbuf[7]='-';tbuf[8]='-';tbuf[9]=0;
     }
-    gfx_text(bx-8-gfx_text_w(tbuf), y, tbuf, C_MBAR_FG, 0xFFFFFFFF);
+    static const char *const wdname[7]={"周日","周一","周二","周三","周四","周五","周六"};
+    const char *wn = (wd>=0&&wd<7)?wdname[wd]:"--";
+    /* 时分 */
+    if (hh>=0) {
+        tbuf[0]='0'+((hh/10)%10); tbuf[1]='0'+(hh%10);
+        tbuf[2]=':';
+        tbuf[3]='0'+((mi/10)%10); tbuf[4]='0'+(mi%10);
+        tbuf[5]=0;
+    } else {
+        tbuf[0]='-'; tbuf[1]='-'; tbuf[2]=':'; tbuf[3]='-'; tbuf[4]='-'; tbuf[5]=0;
+    }
+    int tw=gfx_text_w(tbuf), ww=gfx_text_w(wn);
+    gfx_text(bx-8-tw, y, tbuf, C_MBAR_FG, 0xFFFFFFFF);
+    gfx_text(bx-8-tw-ww-4, y, wn, C_MBAR_FG, 0xFFFFFFFF);
 }
 
 /* =========================================================================
@@ -188,17 +222,18 @@ static void draw_menubar(void) {
     gfx_fill((struct gfx_rect){0,MBAR_H-1,W,1}, 0xC8C8CC); /* 底部分隔线 */
 
     draw_apple(8, 4, C_MBAR_FG);
-    /* App 名（粗感：画两遍错位 1px 模拟加粗） */
-    const char *appname = mac_app_en(g_ms.active_app);
+    /* App 名（中文，粗感：画两遍错位 1px 模拟加粗） */
+    const char *appname = mac_app_cn(g_ms.active_app);
     gfx_text(34, 5, appname, C_MBAR_FG, 0xFFFFFFFF);
     gfx_text(35, 5, appname, C_MBAR_FG, 0xFFFFFFFF);
-    /* 当前 App 的菜单项 */
+    /* 当前 App 的菜单项（中文） */
     const char *menus[16];
     int n = mac_menu_for_active(&g_ms, menus, 16);
     int x = 34 + gfx_text_w(appname) + 18;
     for (int i = 0; i < n; i++) {
-        gfx_text(x, 5, menus[i], (i==0)?C_MBAR_FG:C_MBAR_DIM, 0xFFFFFFFF);
-        x += gfx_text_w(menus[i]) + 13;
+        const char *mzh = zh_menu(menus[i]);
+        gfx_text(x, 5, mzh, (i==0)?C_MBAR_FG:C_MBAR_DIM, 0xFFFFFFFF);
+        x += gfx_text_w(mzh) + 13;
     }
     draw_status_icons(W);
 }
@@ -287,7 +322,7 @@ static void content_finder(struct gfx_rect c) {
     int sw = 118;   /* 侧边栏宽 */
     gfx_fill((struct gfx_rect){c.x,c.y,sw,c.h}, C_SIDEBAR);
     gfx_fill((struct gfx_rect){c.x+sw,c.y,1,c.h}, 0xD0D0D4);
-    static const char *const side[] = {"Recents","AirDrop","Applications","Desktop","Documents","Downloads","Pictures","iCloud Drive"};
+    static const char *const side[] = {"最近使用","隔空投送","应用程序","桌面","文稿","下载","图片","云盘"};
     for (int i=0;i<8;i++) {
         int yy = c.y+30+i*22;
         gfx_fill((struct gfx_rect){c.x+10,yy+3,9,9}, (i&1)?0x007AFF:0x5B9BF3);
@@ -295,10 +330,10 @@ static void content_finder(struct gfx_rect c) {
     }
     /* 工具栏 */
     gfx_fill((struct gfx_rect){c.x+sw,c.y,c.w-sw,34}, 0xF5F5F7);
-    gfx_text(c.x+sw+14,c.y+9,"<   >   iCloud Drive",C_TEXT,0xFFFFFFFF);
+    gfx_text(c.x+sw+14,c.y+9,"<   >   云盘",C_TEXT,0xFFFFFFFF);
     gfx_line(c.x+sw,c.y+34,c.x+c.w,c.y+34,0xD0D0D4);
     /* 文件网格：彩色文件夹 + 图片缩略 */
-    static const char *const names[] = {"Desktop","Documents","Photos","Music","Movies","Projects","Readme","Icons"};
+    static const char *const names[] = {"桌面","文稿","照片","音乐","影片","项目","自述","图标"};
     for (int i=0;i<8;i++) {
         int col=i%4, row=i/4;
         int fx = c.x+sw+24+col*90, fy = c.y+56+row*96;
@@ -313,13 +348,13 @@ static void content_finder(struct gfx_rect c) {
 static void content_safari(struct gfx_rect c) {
     gfx_fill(c, 0xFFFFFF);
     gfx_fill((struct gfx_rect){c.x,c.y,c.w,26}, 0xE8E8EB);
-    gfx_text(c.x+12,c.y+6,"LoongOS",C_TEXT,0xFFFFFFFF);
+    gfx_text(c.x+12,c.y+6,"龙 OS",C_TEXT,0xFFFFFFFF);
     gfx_fill((struct gfx_rect){c.x,c.y+26,c.w,30}, 0xF5F5F7);
     gfx_roundrect((struct gfx_rect){c.x+30,c.y+31,c.w-60,20}, 0xFFFFFF, 6);
     gfx_text(c.x+40,c.y+32,"https://loongos.local",C_TEXT2,0xFFFFFFFF);
     gfx_line(c.x,c.y+56,c.x+c.w,c.y+56,0xD8D8DC);
     /* 网页占位：标题 + 段落条 */
-    gfx_text(c.x+40,c.y+80,"Welcome to LoongOS",0x1d1d1f,0xFFFFFFFF);
+    gfx_text(c.x+40,c.y+80,"欢迎使用 LoongOS",0x1d1d1f,0xFFFFFFFF);
     for (int i=0;i<6;i++)
         gfx_fill((struct gfx_rect){c.x+40,c.y+108+i*20, (i%2)?c.w-120:c.w-80, 8}, 0xE0E0E4);
 }
@@ -329,7 +364,7 @@ static void content_terminal(struct gfx_rect c) {
     gfx_fill(c, 0x1C1C1E);
     gfx_text(c.x+16,c.y+16,"loongos@mac ~ %",0x34C759,0x1C1C1E);
     gfx_text(c.x+16,c.y+38,"uname -a",0xF5F5F7,0x1C1C1E);
-    gfx_text(c.x+16,c.y+60,"LoongOS 60.0 aarch64",0x5AC8FA,0x1C1C1E);
+    gfx_text(c.x+16,c.y+60,"龙 OS 60.0 aarch64 内核",0x5AC8FA,0x1C1C1E);
     gfx_text(c.x+16,c.y+82,"loongos@mac ~ %",0x34C759,0x1C1C1E);
     gfx_fill((struct gfx_rect){c.x+130,c.y+82,8,16},0xF5F5F7); /* 光标 */
 }
@@ -354,17 +389,17 @@ static void content_settings(struct gfx_rect c) {
     gfx_fill(c, 0xFFFFFF);
     int sw=130;
     gfx_fill((struct gfx_rect){c.x,c.y,sw,c.h},0xF2F2F5);
-    static const char *const rows[] = {"Wi-Fi","Bluetooth","Network","Sound","Display","Wallpaper","Battery","General"};
+    static const char *const rows[] = {"无线局域网","蓝牙","网络","声音","显示器","墙纸","电池","通用"};
     for(int i=0;i<8;i++){
         int yy=c.y+18+i*26;
         if(i==0) gfx_fill((struct gfx_rect){c.x,yy-4,sw,24},0xFF9F0A);
         gfx_fill((struct gfx_rect){c.x+10,yy,12,12},(i&1)?0x007AFF:0x8E8E93);
         gfx_text(c.x+28,yy-2,rows[i],(i==0)?C_WHITE:C_TEXT,0xFFFFFFFF);
     }
-    gfx_text(c.x+sw+30,c.y+24,"Wi-Fi",0x1d1d1f,0xFFFFFFFF);
+    gfx_text(c.x+sw+30,c.y+24,"无线局域网",0x1d1d1f,0xFFFFFFFF);
     gfx_roundrect((struct gfx_rect){c.x+sw+30,c.y+58,c.w-sw-60,44},0xF5F5F7,8);
-    gfx_text(c.x+sw+44,c.y+68,"Network Name",C_TEXT,0xFFFFFFFF);
-    gfx_text(c.x+sw+44,c.y+84,"Connected",C_TEXT2,0xFFFFFFFF);
+    gfx_text(c.x+sw+44,c.y+68,"网络名称",C_TEXT,0xFFFFFFFF);
+    gfx_text(c.x+sw+44,c.y+84,"已连接",C_TEXT2,0xFFFFFFFF);
     gfx_filled_circle(c.x+c.w-50,c.y+76,9,0x34C759);
 }
 
@@ -375,19 +410,19 @@ static void content_notes(struct gfx_rect c) {
     gfx_fill((struct gfx_rect){c.x,c.y,sw,c.h},0xF7F7F2);
     for(int i=0;i<5;i++){
         gfx_roundrect((struct gfx_rect){c.x+8,c.y+10+i*44,sw-16,38},(i==0)?0xFFE08A:0xEDEDE8,4);
-        gfx_text(c.x+16,c.y+16+i*44,"Note",C_TEXT,0xFFFFFFFF);
-        gfx_text(c.x+16,c.y+30+i*44,"loongos...",C_TEXT2,0xFFFFFFFF);
+        gfx_text(c.x+16,c.y+16+i*44,"新备忘录",C_TEXT,0xFFFFFFFF);
+        gfx_text(c.x+16,c.y+30+i*44,"龙 OS 使用说明...",C_TEXT2,0xFFFFFFFF);
     }
     gfx_fill((struct gfx_rect){c.x+sw,c.y,1,c.h},0xD0D0D4);
-    gfx_text(c.x+sw+20,c.y+20,"Note",C_TEXT,0xFFFFFFFF);
-    for(int i=0;i<5;i++) gfx_text(c.x+sw+20,c.y+50+i*24,"- line of text",C_TEXT2,0xFFFFFFFF);
+    gfx_text(c.x+sw+20,c.y+20,"备忘录",C_TEXT,0xFFFFFFFF);
+    for(int i=0;i<5;i++) gfx_text(c.x+sw+20,c.y+50+i*24,"- 文本行内容",C_TEXT2,0xFFFFFFFF);
 }
 
 /* 照片/音乐/邮件通用网格占位 */
 static void content_generic(struct gfx_rect c, int app) {
     gfx_fill(c, 0xFFFFFF);
     gfx_fill((struct gfx_rect){c.x,c.y,c.w,32},0xF5F5F7);
-    gfx_text(c.x+14,c.y+9,mac_app_en(app),C_TEXT,0xFFFFFFFF);
+    gfx_text(c.x+14,c.y+9,mac_app_cn(app),C_TEXT,0xFFFFFFFF);
     u32 palette[] = {0xFF3B30,0xFF9500,0xFFCC00,0x34C759,0x007AFF,0x5856D6,0xFF2D55,0x5AC8FA};
     for(int i=0;i<12;i++){
         int col=i%4,row=i/4;
@@ -447,8 +482,8 @@ static void draw_windows(void) {
         gfx_rect_draw((struct gfx_rect){r.x+10,by-6,12,12}, 0xD0D0D4, 1);
         gfx_rect_draw((struct gfx_rect){r.x+30,by-6,12,12}, 0xD0D0D4, 1);
         gfx_rect_draw((struct gfx_rect){r.x+50,by-6,12,12}, 0xD0D0D4, 1);
-        /* 标题文字（居中） */
-        const char *nm = mac_app_en(w->app);
+        /* 标题文字（居中，中文 App 名） */
+        const char *nm = mac_app_cn(w->app);
         int tw = gfx_text_w(nm);
         gfx_text(r.x+(r.w-tw)/2, r.y+6, nm, C_TEXT, 0xFFFFFFFF);
         /* 内容区 */
@@ -523,30 +558,30 @@ static void draw_overlays(void) {
     if (g_ms.spotlight_open) {
         int W=gfx_width();
         gfx_blend_roundrect((struct gfx_rect){W/2-180,90,360,60}, C_PANEL, 12, 245);
-        gfx_text(W/2-165,110,"Spotlight",C_TEXT2,0xFFFFFFFF);
-        gfx_text(W/2-165,128,"Type to search apps...",C_TEXT,0xFFFFFFFF);
+        gfx_text(W/2-165,110,"聚焦搜索",C_TEXT2,0xFFFFFFFF);
+        gfx_text(W/2-165,128,"键入以搜索应用...",C_TEXT,0xFFFFFFFF);
     }
     if (!g_menu_drawn) return;
     struct gfx_rect m = menu_rect();
     gfx_blend_roundrect(m, C_PANEL, 8, 250);
     gfx_rect_draw(m, C_BORDER, 1);
     if (g_menu_kind == 1) {
-        static const char *const items[APPLE_MENU_N] = {"About This Mac","System Settings...","Recent Items","Force Quit...","Sleep","Restart...","Shut Down...","Lock Screen","Classic Desktop"};
+        static const char *const items[APPLE_MENU_N] = {"关于本机","系统设置","最近使用的项目","强制退出","睡眠","重新启动","关机","锁定屏幕","经典桌面"};
         for (int i=0;i<APPLE_MENU_N;i++) {
             if(i==3 || i==APPLE_ITEM_CLASSIC-1) gfx_fill((struct gfx_rect){m.x+4,m.y+8+i*26,m.w-8,1},0xD0D0D4);
             gfx_text(m.x+14, m.y+10+i*26, items[i], (i==APPLE_ITEM_CLASSIC)?C_ACCENT:C_TEXT, 0xFFFFFFFF);
         }
     } else if (g_menu_kind == 3) {
         int wins[16], n = mac_window_menu_wins(&g_ms, wins, 16);
-        for (int i=0;i<n;i++) gfx_text(m.x+14, m.y+8+i*22, mac_app_en(mac_win_app(&g_ms,wins[i])), C_TEXT, 0xFFFFFFFF);
+        for (int i=0;i<n;i++) gfx_text(m.x+14, m.y+8+i*22, mac_app_cn(mac_win_app(&g_ms,wins[i])), C_TEXT, 0xFFFFFFFF);
         int y = m.y+8+n*22+6;
         gfx_fill((struct gfx_rect){m.x+4,y-4,m.w-8,1},0xD0D0D4);
-        static const char *const acts[]={"Minimize","Bring All to Front","Full Screen"};
+        static const char *const acts[]={"最小化","全部置于顶层","全屏"};
         for(int i=0;i<3;i++) gfx_text(m.x+14,y+i*22,acts[i],C_TEXT,0xFFFFFFFF);
     } else {
         const char *menus[16];
         int n = mac_menu_for_active(&g_ms, menus, 16);
-        for (int i=0;i<n;i++) gfx_text(m.x+14, m.y+10+i*26, menus[i], C_TEXT, 0xFFFFFFFF);
+        for (int i=0;i<n;i++) gfx_text(m.x+14, m.y+10+i*26, zh_menu(menus[i]), C_TEXT, 0xFFFFFFFF);
     }
 }
 
@@ -557,6 +592,9 @@ static void mac_redraw(struct gfx_rect r) {
     draw_menubar();
     draw_dock();
     draw_overlays();
+    /* 光标永远画在最上层；每次脏区重绘都会重画，配合主循环的旧/新脏区登记，
+       实现「移动到哪擦到哪、画到哪」，不留拖尾。 */
+    gfx_cursor(g_mx, g_my);
 }
 
 /* =========================================================================
@@ -604,9 +642,9 @@ static int menubar_hit(int x) {
     if(x<28) return 1;
     const char *menus[16];
     int n=mac_menu_for_active(&g_ms,menus,16);
-    int x0=34+gfx_text_w(mac_app_en(g_ms.active_app))+18;
+    int x0=34+gfx_text_w(mac_app_cn(g_ms.active_app))+18;
     int x1=x0;
-    for(int i=0;i<n;i++) x1+=gfx_text_w(menus[i])+13;
+    for(int i=0;i<n;i++) x1+=gfx_text_w(zh_menu(menus[i]))+13;
     if(x>=x0 && x<x1) return 2;
     if(x>=320 && x<560) return 3;
     return 0;
@@ -659,14 +697,16 @@ static void on_press(int x, int y) {
     if (wi<0){ mac_dispatch(&g_ms,ME_CLICKDESKTOP,0,0); damage_ui(); return; }
     struct gfx_rect r={g_ms.wins[wi].b.x,g_ms.wins[wi].b.y,g_ms.wins[wi].b.w,g_ms.wins[wi].b.h};
     if(g_ms.wins[wi].state==MW_FULL){r.x=0;r.y=MBAR_H;r.w=gfx_width();r.h=gfx_height()-MBAR_H;}
-    int by=g_ms.wins[wi].b.y+TITLE_H/2;
+    /* 记录旧矩形（含阴影）——关闭/最小化/全屏后该窗口可能消失或变形，
+       damage_ui() 只登记当前仍可见的窗口，旧区域必须显式登记才能擦掉残影。 */
+    struct gfx_rect oldwin = r;
     if (y < r.y+TITLE_H) {
-        if(x>=g_ms.wins[wi].b.x+10&&x<g_ms.wins[wi].b.x+22) mac_dispatch(&g_ms,ME_CLOSEWIN,wi,0);
-        else if(x>=g_ms.wins[wi].b.x+30&&x<g_ms.wins[wi].b.x+42) mac_dispatch(&g_ms,ME_MINWIN,wi,0);
-        else if(x>=g_ms.wins[wi].b.x+50&&x<g_ms.wins[wi].b.x+62) mac_dispatch(&g_ms,ME_FULLSCREEN,wi,0);
+        if(x>=r.x+10&&x<r.x+22) mac_dispatch(&g_ms,ME_CLOSEWIN,wi,0);
+        else if(x>=r.x+30&&x<r.x+42) mac_dispatch(&g_ms,ME_MINWIN,wi,0);
+        else if(x>=r.x+50&&x<r.x+62) mac_dispatch(&g_ms,ME_FULLSCREEN,wi,0);
         else { mac_dispatch(&g_ms,ME_FOCUSWIN,wi,0); if(on_titlebar(wi,x,y)){ g_drag_win=wi; g_drag_dx=x-g_ms.wins[wi].b.x; g_drag_dy=y-g_ms.wins[wi].b.y; g_drag_ox=g_ms.wins[wi].b.x; g_drag_oy=g_ms.wins[wi].b.y; } }
     } else mac_dispatch(&g_ms,ME_FOCUSWIN,wi,0);
-    (void)by;
+    damage_pad(oldwin,12);   /* ★ 擦掉旧窗口/按钮区域，杜绝关闭残影 */
     damage_ui();
 }
 
@@ -710,15 +750,37 @@ void macdesktop_run(void) {
             if (c=='q'||c=='Q'||c==3) goto done;
             if (c=='\t') { mac_dispatch(&g_ms,ME_CMDTAB,0,0); damage_ui(); }
             else if (c==' ') { mac_dispatch(&g_ms,ME_SPOTLIGHT_TOGGLE,0,1); gfx_damage(full()); }
-            else if (c=='w'||c=='W') { if(g_ms.focused_win>=0) mac_dispatch(&g_ms,ME_CLOSEWIN,g_ms.focused_win,0); damage_ui(); }
-            else if (c=='m'||c=='M') { if(g_ms.focused_win>=0) mac_dispatch(&g_ms,ME_MINWIN,g_ms.focused_win,0); damage_ui(); }
+            else if (c=='w'||c=='W') {
+                if (g_ms.focused_win>=0) {
+                    int fw=g_ms.focused_win;
+                    struct gfx_rect ow={g_ms.wins[fw].b.x,g_ms.wins[fw].b.y,g_ms.wins[fw].b.w,g_ms.wins[fw].b.h};
+                    mac_dispatch(&g_ms,ME_CLOSEWIN,fw,0);
+                    damage_pad(ow,12);
+                }
+                damage_ui();
+            }
+            else if (c=='m'||c=='M') {
+                if (g_ms.focused_win>=0) {
+                    int fw=g_ms.focused_win;
+                    struct gfx_rect ow={g_ms.wins[fw].b.x,g_ms.wins[fw].b.y,g_ms.wins[fw].b.w,g_ms.wins[fw].b.h};
+                    mac_dispatch(&g_ms,ME_MINWIN,fw,0);
+                    damage_pad(ow,12);
+                }
+                damage_ui();
+            }
         }
         /* 坐标刷新：mouse_get 返回是否有新坐标；坐标变化即 moved 驱动拖动。
            按键电平不可靠（边沿被 mouse_pop_btn 消费），所以拖动不看 btn。 */
         int nx, ny, wheel=0, moved=0;
         if (mouse_get(&nx,&ny,0,&wheel)) {
             moved = (nx!=g_mx || ny!=g_my);
-            g_mx=nx; g_my=ny;
+            if (moved) {
+                /* 擦旧画新：旧光标矩形登记脏区让底层内容重绘覆盖旧箭头；
+                   新光标矩形登记脏区让 mac_redraw 在新位置画出箭头。 */
+                gfx_damage((struct gfx_rect){g_mx,g_my,CURSOR_BOX_W,CURSOR_BOX_H});
+                g_mx=nx; g_my=ny;
+                gfx_damage((struct gfx_rect){g_mx,g_my,CURSOR_BOX_W,CURSOR_BOX_H});
+            } else { g_mx=nx; g_my=ny; }
         }
         /* 悬停检测：Dock 区域 */
         int nh=-1;
@@ -738,8 +800,10 @@ void macdesktop_run(void) {
             b->x=(short)(g_mx-g_drag_dx);
             b->y=(short)(g_my-g_drag_dy);
             /* 约束在屏内，标题栏不钻进菜单栏 */
-            if(b->x<0)b->x=0; if(b->x>gfx_width()-60)b->x=gfx_width()-60;
-            if(b->y<MBAR_H)b->y=MBAR_H; if(b->y>gfx_height()-TITLE_H)b->y=gfx_height()-TITLE_H;
+            if (b->x < 0) b->x = 0;
+            if (b->x > gfx_width() - 60) b->x = gfx_width() - 60;
+            if (b->y < MBAR_H) b->y = MBAR_H;
+            if (b->y > gfx_height() - TITLE_H) b->y = gfx_height() - TITLE_H;
             struct gfx_rect newr={b->x,b->y,b->w,b->h};
             damage_pad(oldr,10); damage_pad(newr,10);
             g_drag_ox=b->x; g_drag_oy=b->y;
