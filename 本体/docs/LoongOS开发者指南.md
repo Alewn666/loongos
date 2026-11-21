@@ -257,3 +257,13 @@ LoongOS 在 `desktop.c`（类 Windows 桌面）之外，新增第二套**内核�
 - **验证**：悬停只有对应图标放大、废纸篓恢复常大小；点击 App 正确激活并置顶窗口、无残影；逻辑 57/57、端到端 10/10、启动切换 3/3、全套回归 15/15（含 golden 零扰动）全通过；guard 四项 OK，余量 4KB。
 
 > **布局约定**：Dock 所有项（App 图标 / 最小化缩略图 / 废纸篓）统一由 `dock_items()` 按序累加 x 生成，`dock_x0()` 的 total 必须与之一致；任何新增 Dock 项都要同步这两处，否则居中错位。
+
+### 10.9 真机调试载板（60.0-S，硬件方向）
+
+用户有一张免费 PCB 打样券，希望做一块 LoongOS 能用上的板子。目标硬件为网心云 OEC/OEC-turbo（RK3566）。
+
+- **定位诚实说明**：LoongOS 当前仍是 QEMU virt 裸机内核——串口 PL011 硬编码 `0x09000000`、UEFI 启动、ramfb 显示、virtio/NVMe 存储，与 RK3566 真机（16550 UART2@`0xFE660000`、BootROM→U-Boot、VOP/HDMI、eMMC/SATA）全不匹配，内核镜像无法直接烧进 OEC 运行。这是软件移植鸿沟，非 PCB 能填平。
+- **板子价值**：物理层 UART TX/RX/GND、复位、MASKROM 短接、SPI 屏信号跨芯片通用。做了「LoongOS × OEC 真机调试载板」——CH340C USB-TTL（1500000/8N1，接 UART2）、一键 MASKROM 刷机（短接 1V8/GND 替代捏电容）、一键复位、SPI 屏排针、电源/收发 LED。2 层 100×100mm，KiCad 7 设计，freerouting 自动布线（386 段走线+16 过孔+GND 覆铜），Gerber 可直接打样。
+- **飞线方案**：OEC 主板精确点位图有防盗链，故板子按「信号名」飞线（J2 六脚按名焊到主板对应点），不赌猜测坐标；焊接前用万用表确认点位。
+- **交付**：`/workspace/LoongOS-OEC-调试载板/`（README 设计说明、原理图、BOM、布线预览、可复现构建脚本 gen_pcb.py/import_route.py/build_all.sh、Gerber.zip）。
+- **LoongOS 真机移植路径**：① 串口 PL011→RK3566 16550（基址 0xFE660000、1.5Mbps）打通串口 shell（最小里程碑）；② UEFI stub→U-Boot 加载、链接地址改 SDRAM、处理 MMU；③ virtio/NVMe→eMMC/SDMMC；④ ramfb→VOP/HDMI 或 SPI 屏；⑤ GIC/SMP 适配。完整移植是数周至数月的系统工程，本板解决第①步的调试通道。
